@@ -196,17 +196,17 @@ impl<V: PostingValue> BOWIndexBuilder<V> {
     pub fn build(mut self, in_memory: bool) -> BoxResult<(SparseBuilderIndex<V>, DocMetadata)> {
         // Build the underlying index
         self.indexer.build()?;
-        let index = self.indexer.to_index(in_memory);
 
-        // Write document metadata
+        // Write document metadata and vocabulary BEFORE creating the index,
+        // so that SparseBuilderIndex::new can auto-detect them from disk
         let doc_meta = DocMetadata::from_lengths(self.doc_lengths);
         doc_meta.save(&self.folder)?;
 
-        // Save vocabulary if we have an analyzer
         if let Some(analyzer) = &self.analyzer {
             analyzer.save_vocab(&self.folder)?;
         }
 
+        let index = self.indexer.to_index(in_memory);
         Ok((index, doc_meta))
     }
 }

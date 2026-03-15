@@ -36,7 +36,8 @@ class TestBOWIndexBuilder:
             values = rng.randint(1, 5, n).astype(np.float32)
             builder.add(doc_id, terms, values)
 
-        index, doc_meta = builder.build(True)
+        builder.build(True)
+        doc_meta = impact_index.DocMetadata.load(d)
         assert doc_meta.num_docs() == 50
         assert doc_meta.avg_dl() > 0
         assert doc_meta.min_dl() > 0
@@ -54,9 +55,9 @@ class TestBOWIndexBuilder:
             values = rng.randint(1, 5, n).astype(np.float32)
             builder.add(doc_id, terms, values)
 
-        index, doc_meta = builder.build(True)
+        index = builder.build(True)
         scoring = impact_index.BM25Scoring(k1=1.2, b=0.75)
-        scored = index.with_scoring(scoring, doc_meta)
+        scored = index.with_scoring(scoring)
 
         results = scored.search_wand({0: 1.0}, 10)
         assert len(results) <= 10
@@ -81,9 +82,9 @@ class TestBOWIndexBuilder:
         query = builder.analyze_query("running cats")
         assert len(query) > 0
 
-        index, doc_meta = builder.build(True)
+        index = builder.build(True)
         scoring = impact_index.BM25Scoring()
-        scored = index.with_scoring(scoring, doc_meta)
+        scored = index.with_scoring(scoring)
         results = scored.search_wand(query, 10)
         assert len(results) > 0
 
@@ -114,8 +115,7 @@ class TestBOWIndexBuilder:
 
         # Search with loaded analyzer's query
         index = impact_index.Index.load(d, True)
-        doc_meta = impact_index.DocMetadata.load(d)
-        scored = index.with_scoring(impact_index.BM25Scoring(), doc_meta)
+        scored = index.with_scoring(impact_index.BM25Scoring())
         results = scored.search_wand(query, 10)
         assert len(results) > 0
 
