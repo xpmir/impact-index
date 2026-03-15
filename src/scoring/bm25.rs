@@ -100,17 +100,15 @@ struct BM25TermScorer {
 impl ScoringFunction for BM25TermScorer {
     fn score(&self, tf: f32, docid: DocId) -> f32 {
         let dl = self.doc_lengths[docid as usize] as f32;
-        let tf_norm =
-            (self.k1 + 1.0) * tf / (self.k1 * (1.0 - self.b + self.b * dl / self.avg_dl) + tf);
-        self.idf * tf_norm
+        let norm = self.k1 * (1.0 - self.b + self.b * dl / self.avg_dl);
+        self.idf * tf / (norm + tf)
     }
 
     fn max_score(&self, max_tf: f32) -> f32 {
         // Use min_dl for the tightest upper bound
         let dl = self.min_dl as f32;
-        let tf_norm = (self.k1 + 1.0) * max_tf
-            / (self.k1 * (1.0 - self.b + self.b * dl / self.avg_dl) + max_tf);
-        self.idf * tf_norm
+        let norm = self.k1 * (1.0 - self.b + self.b * dl / self.avg_dl);
+        self.idf * max_tf / (norm + max_tf)
     }
 }
 
@@ -127,9 +125,9 @@ mod tests {
         // df=10, N=100: idf = ln(1 + (100 - 10 + 0.5) / (10 + 0.5))
         let scorer = scoring.term_scorer(10, 5.0);
         let expected_idf = ((100.0 - 10.0 + 0.5) / (10.0 + 0.5) + 1.0f64).ln() as f32;
-        // Score with tf=1, dl=avgdl => tf_norm = (k1+1)*1 / (k1 + 1) = 1
+        // Score with tf=1, dl=avgdl => tf / (k1 + tf) = 1 / (1.2 + 1) = 1/2.2
         let score = scorer.score(1.0, 0);
-        let expected = expected_idf * (1.2 + 1.0) * 1.0 / (1.2 * 1.0 + 1.0);
+        let expected = expected_idf * 1.0 / (1.2 * 1.0 + 1.0);
         assert!(
             (score - expected).abs() < 1e-5,
             "score={}, expected={}",

@@ -57,6 +57,25 @@ impl Stemmer for SnowballStemmer {
     }
 }
 
+/// Lucene-compatible Porter stemmer.
+///
+/// Direct port of `org.apache.lucene.analysis.en.PorterStemmer`.
+/// Use this for exact Lucene/Pyserini compatibility.
+pub struct PorterStemmer;
+
+impl PorterStemmer {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Stemmer for PorterStemmer {
+    fn stem(&self, word: &str) -> String {
+        let mut s = super::lucene_porter::LucenePorterStemmer::new();
+        s.stem(word)
+    }
+}
+
 /// Identity stemmer (no-op).
 pub struct NoStemmer;
 
@@ -76,6 +95,33 @@ mod tests {
         assert_eq!(stemmer.stem("running"), "run");
         assert_eq!(stemmer.stem("jumps"), "jump");
         assert_eq!(stemmer.stem("easily"), "easili");
+    }
+
+    #[test]
+    fn test_porter_english() {
+        let stemmer = PorterStemmer::new();
+        assert_eq!(stemmer.stem("running"), "run");
+        assert_eq!(stemmer.stem("jumps"), "jump");
+        // Lucene Porter: matches Lucene's PorterStemFilter
+        assert_eq!(stemmer.stem("generously"), "gener");
+        assert_eq!(stemmer.stem("document"), "document");
+        assert_eq!(stemmer.stem("element"), "element");
+        assert_eq!(stemmer.stem("community"), "commun");
+        assert_eq!(stemmer.stem("day"), "dai");
+        assert_eq!(stemmer.stem("use"), "us");
+    }
+
+    #[test]
+    fn test_porter_vs_snowball() {
+        let porter = PorterStemmer::new();
+        let snowball = SnowballStemmer::new("english").unwrap();
+        // Key words where Lucene Porter differs from Snowball
+        assert_ne!(porter.stem("community"), snowball.stem("community"));
+        assert_ne!(porter.stem("day"), snowball.stem("day"));
+        assert_ne!(porter.stem("use"), snowball.stem("use"));
+        // But these match:
+        assert_eq!(porter.stem("document"), snowball.stem("document"));
+        assert_eq!(porter.stem("element"), snowball.stem("element"));
     }
 
     #[test]

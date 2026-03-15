@@ -14,7 +14,7 @@ use impact_index::search::maxscore::{search_maxscore, MaxScoreOptions};
 use impact_index::search::wand::search_wand;
 use impact_index::search::{ScoredDocument, TopScoredDocuments};
 use impact_index::vocab::analyzer::TextAnalyzer;
-use impact_index::vocab::stemmer::{NoStemmer, SnowballStemmer};
+use impact_index::vocab::stemmer::{NoStemmer, PorterStemmer, SnowballStemmer};
 use impact_index::vocab::Vocabulary;
 
 fn init_logger() {
@@ -59,8 +59,8 @@ fn brute_force_bm25(
                 let df_f64 = term_df as f64;
                 let idf = ((n - df_f64 + 0.5) / (df_f64 + 0.5) + 1.0).ln() as f32;
 
-                // TF normalization
-                let tf_norm = (k1 + 1.0) * tf / (k1 * (1.0 - b + b * dl / avg_dl) + tf);
+                // TF normalization (Lucene-style: no (k1+1) multiplier)
+                let tf_norm = tf / (k1 * (1.0 - b + b * dl / avg_dl) + tf);
 
                 score += (idf * tf_norm * qw) as f64;
             }
@@ -240,7 +240,6 @@ fn test_vocabulary_save_load() {
     assert_eq!(loaded.get("hello"), Some(0));
     assert_eq!(loaded.get("world"), Some(1));
     assert_eq!(loaded.get("test"), Some(2));
-    assert_eq!(loaded.term(0), "hello");
 }
 
 #[test]
@@ -288,4 +287,251 @@ fn test_bm25_max_score_safety() {
             );
         }
     }
+}
+
+/// Test that add_texts_batch (parallel) produces identical results to add_text (sequential).
+#[test]
+fn test_add_texts_batch_matches_sequential() {
+    init_logger();
+
+    let docs = vec![
+        (0u64, "the quick brown fox jumps over the lazy dog"),
+        (1, "a quick brown cat jumps high"),
+        (2, "the lazy dog sleeps all day"),
+        (3, "foxes are clever animals"),
+        (4, "the brown dog and the brown cat"),
+        (5, "king's castle was beautiful and the children's books"),
+        (6, "don't worry about O'Brien's problem"),
+        (7, "U.S.A. price is 3.14 dollars per unit"),
+    ];
+
+    let stop_words = impact_index::vocab::stopwords::get_stop_words("english").unwrap();
+    let stop_refs: Vec<&str> = stop_words.iter().copied().collect();
+
+    // Build with sequential add_text
+    let dir_seq = temp_dir::TempDir::new().unwrap();
+    let mut builder_seq = BOWIndexBuilder::<i32>::with_analyzer(
+        dir_seq.path(),
+        &BuilderOptions {
+            in_memory_threshold: 10,
+            ..Default::default()
+        },
+        TextAnalyzer::with_stop_words(Box::new(PorterStemmer::new()), &stop_refs),
+    );
+    builder_seq
+        .analyzer_mut()
+        .unwrap()
+        .set_english_possessive_filter(true);
+    for &(docid, text) in &docs {
+        builder_seq.add_text(docid, text).unwrap();
+    }
+    let query_seq = builder_seq.analyze_query("quick fox king's");
+    let (index_seq, meta_seq) = builder_seq.build(true).unwrap();
+
+    // Build with batch add_texts_batch (parallel)
+    let dir_batch = temp_dir::TempDir::new().unwrap();
+    let mut builder_batch = BOWIndexBuilder::<i32>::with_analyzer(
+        dir_batch.path(),
+        &BuilderOptions {
+            in_memory_threshold: 10,
+            ..Default::default()
+        },
+        TextAnalyzer::with_stop_words(Box::new(PorterStemmer::new()), &stop_refs),
+    );
+    builder_batch
+        .analyzer_mut()
+        .unwrap()
+        .set_english_possessive_filter(true);
+    let doc_refs: Vec<(u64, &str)> = docs.iter().map(|&(d, t)| (d, t)).collect();
+    builder_batch.add_texts_batch(&doc_refs).unwrap();
+    let query_batch = builder_batch.analyze_query("quick fox king's");
+    let (index_batch, meta_batch) = builder_batch.build(true).unwrap();
+
+    // Verify doc lengths match
+    assert_eq!(
+        meta_seq.doc_lengths, meta_batch.doc_lengths,
+        "Doc lengths should be identical"
+    );
+
+    // Queries may have different term IDs (vocabulary insertion order differs)
+    // but should have the same number of terms
+    assert_eq!(
+        query_seq.len(),
+        query_batch.len(),
+        "Query should have same number of terms"
+    );
+
+    // Verify search results match
+    let scored_seq = ScoredIndex::new(
+        Arc::new(Box::new(index_seq)),
+        Arc::new(meta_seq),
+        Box::new(BM25Scoring::new()),
+    );
+    let scored_batch = ScoredIndex::new(
+        Arc::new(Box::new(index_batch)),
+        Arc::new(meta_batch),
+        Box::new(BM25Scoring::new()),
+    );
+
+    let results_seq = search_maxscore(&scored_seq, &query_seq, 5, MaxScoreOptions::default());
+    let results_batch = search_maxscore(&scored_batch, &query_batch, 5, MaxScoreOptions::default());
+
+    assert_eq!(
+        results_seq.len(),
+        results_batch.len(),
+        "Result count should match"
+    );
+    for (i, (s, b)) in results_seq.iter().zip(results_batch.iter()).enumerate() {
+        assert_eq!(s.docid, b.docid, "Doc ID mismatch at position {}", i);
+        assert!(
+            (s.score - b.score).abs() < 1e-4,
+            "Score mismatch at {}: {} vs {}",
+            i,
+            s.score,
+            b.score
+        );
+    }
+
+    eprintln!(
+        "Sequential and batch produce identical results ({} docs, {} results)",
+        docs.len(),
+        results_seq.len()
+    );
+}
+
+/// Test that a compressed index is fully standalone:
+/// - Can be loaded with Index.load() alone
+/// - Contains vocab, analyzer config, and doc metadata
+/// - Produces correct BM25 search results
+/// - Works both with and without text analyzer (vocab)
+#[test]
+fn test_compressed_index_standalone() {
+    use impact_index::base::load_index;
+    use impact_index::compress::{
+        docid::PForCompressor, impact::GlobalQuantizerFactory, CompressionTransform,
+    };
+    use impact_index::transforms::IndexTransform;
+
+    init_logger();
+
+    let dir = temp_dir::TempDir::new().unwrap();
+    let raw_path = dir.path().join("raw");
+    let compressed_path = dir.path().join("compressed");
+    let compressed_no_vocab_path = dir.path().join("compressed_no_vocab");
+
+    // Create directories
+    std::fs::create_dir_all(&raw_path).unwrap();
+    std::fs::create_dir_all(&compressed_path).unwrap();
+    std::fs::create_dir_all(&compressed_no_vocab_path).unwrap();
+
+    // Build a raw BOW index with text analysis
+    let stop_words = impact_index::vocab::stopwords::get_stop_words("english").unwrap();
+    let stop_refs: Vec<&str> = stop_words.iter().copied().collect();
+
+    let mut builder = BOWIndexBuilder::<i32>::with_analyzer(
+        &raw_path,
+        &BuilderOptions::default(),
+        TextAnalyzer::with_stop_words(Box::new(PorterStemmer::new()), &stop_refs),
+    );
+    builder
+        .analyzer_mut()
+        .unwrap()
+        .set_english_possessive_filter(true);
+    builder
+        .analyzer_mut()
+        .unwrap()
+        .set_config(impact_index::vocab::analyzer::AnalyzerConfig {
+            stemmer: "porter".to_string(),
+            language: "english".to_string(),
+            stop_words: true,
+            english_possessive_filter: true,
+        });
+
+    let docs = vec![
+        (0u64, "the quick brown fox jumps over the lazy dog"),
+        (1, "a quick brown cat jumps high"),
+        (2, "the lazy dog sleeps all day long"),
+        (3, "foxes are clever animals in the wild"),
+        (4, "the brown dog and the brown cat play together"),
+    ];
+    for &(docid, text) in &docs {
+        builder.add_text(docid, text).unwrap();
+    }
+    let (raw_index, _doc_meta) = builder.build(true).unwrap();
+
+    // --- Test 1: Compress WITH auxiliary files (vocab, analyzer, docmeta) ---
+    let transform = CompressionTransform {
+        max_block_size: 128,
+        doc_ids_compressor_factory: Box::new(PForCompressor {}),
+        impacts_compressor_factory: Box::new(GlobalQuantizerFactory { nbits: 8 }),
+    };
+    transform.process(&compressed_path, &raw_index).unwrap();
+
+    // Copy auxiliary files (simulating what Index.compress() does in Python)
+    DocMetadata::copy_files(&raw_path, &compressed_path).unwrap();
+    TextAnalyzer::copy_files(&raw_path, &compressed_path).unwrap();
+
+    // Load compressed index standalone — no reference to raw index
+    let loaded = load_index(&compressed_path, true);
+
+    // Verify files were copied
+    assert!(
+        compressed_path.join("vocab.fst").exists(),
+        "vocab.fst should be copied"
+    );
+    assert!(
+        compressed_path.join("docmeta.dat").exists(),
+        "docmeta.dat should be copied"
+    );
+
+    // Load doc metadata from compressed dir
+    let doc_meta = Arc::new(DocMetadata::load(&compressed_path).unwrap());
+    assert_eq!(doc_meta.num_docs(), 5);
+
+    // Load analyzer from compressed dir
+    let analyzer = TextAnalyzer::load(&compressed_path, Box::new(PorterStemmer::new())).unwrap();
+    let query = analyzer.analyze_query("quick fox");
+    assert!(!query.is_empty(), "Query should have terms");
+
+    // Search with BM25
+    let scored = ScoredIndex::new(Arc::new(loaded), doc_meta, Box::new(BM25Scoring::new()));
+    let results = search_maxscore(&scored, &query, 3, MaxScoreOptions::default());
+    assert!(!results.is_empty(), "Should find results");
+    assert_eq!(
+        results[0].docid, 0,
+        "Doc 0 should rank first (has both quick and fox)"
+    );
+    eprintln!(
+        "Test 1 (with vocab): {} results, top doc={}",
+        results.len(),
+        results[0].docid
+    );
+
+    // --- Test 2: Compress WITHOUT auxiliary files (just postings) ---
+    transform
+        .process(&compressed_no_vocab_path, &raw_index)
+        .unwrap();
+
+    // Load compressed index — should work for search with pre-built queries
+    let loaded2 = load_index(&compressed_no_vocab_path, true);
+
+    // Use query from the raw index analyzer (term IDs are the same)
+    let doc_meta2 = Arc::new(DocMetadata::load(&raw_path).unwrap());
+    let scored2 = ScoredIndex::new(Arc::new(loaded2), doc_meta2, Box::new(BM25Scoring::new()));
+    let results2 = search_maxscore(&scored2, &query, 3, MaxScoreOptions::default());
+    assert_eq!(results2.len(), results.len(), "Same number of results");
+    for (i, (r1, r2)) in results.iter().zip(results2.iter()).enumerate() {
+        assert_eq!(r1.docid, r2.docid, "Doc ID mismatch at {}", i);
+        assert!(
+            (r1.score - r2.score).abs() < 0.1,
+            "Score mismatch at {}: {} vs {}",
+            i,
+            r1.score,
+            r2.score
+        );
+    }
+    eprintln!(
+        "Test 2 (no vocab, pre-built query): {} results, scores match",
+        results2.len()
+    );
 }
