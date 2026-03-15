@@ -84,10 +84,117 @@ pub struct IndexInformation {
     pub terms: Vec<TermIndexInformation>,
 }
 
+const FORWARD_INDEX_MAGIC: u32 = 0x46494458; // "FIDX"
+const FORWARD_INDEX_VERSION: u32 = 1;
+
 impl IndexInformation {
     /// Creates a new index information
     pub fn new() -> IndexInformation {
         IndexInformation { terms: Vec::new() }
+    }
+
+    /// Write in compact binary format.
+    ///
+    /// Per-term: 20 bytes (num_pages:u32, max_value:f32, max_doc_id:u64, length:u32)
+    /// Per-page: 20 bytes (docid_position:u64, length:u32, max_value:f32, max_doc_id:u64)
+    /// (value_position is same as docid_position for forward index, omitted)
+    pub fn write_binary(
+        &self,
+        value_type: crate::base::ValueType,
+        writer: &mut dyn std::io::Write,
+    ) -> std::io::Result<()> {
+        use byteorder::{LittleEndian, WriteBytesExt};
+
+        writer.write_u32::<LittleEndian>(FORWARD_INDEX_MAGIC)?;
+        writer.write_u32::<LittleEndian>(FORWARD_INDEX_VERSION)?;
+        writer.write_u32::<LittleEndian>(self.terms.len() as u32)?;
+        writer.write_u32::<LittleEndian>(value_type as u32)?;
+
+        for term in &self.terms {
+            writer.write_u32::<LittleEndian>(term.pages.len() as u32)?;
+            writer.write_f32::<LittleEndian>(term.max_value)?;
+            writer.write_u64::<LittleEndian>(term.max_doc_id)?;
+            writer.write_u32::<LittleEndian>(term.length as u32)?;
+
+            for page in &term.pages {
+                writer.write_u64::<LittleEndian>(page.docid_position)?;
+                writer.write_u32::<LittleEndian>(page.length as u32)?;
+                writer.write_f32::<LittleEndian>(page.max_value)?;
+                writer.write_u64::<LittleEndian>(page.max_doc_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Read from compact binary format.
+    pub fn read_binary(
+        reader: &mut dyn std::io::Read,
+    ) -> std::io::Result<(crate::base::ValueType, Self)> {
+        use byteorder::{LittleEndian, ReadBytesExt};
+
+        let magic = reader.read_u32::<LittleEndian>()?;
+        if magic != FORWARD_INDEX_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Not a forward index binary file",
+            ));
+        }
+        let version = reader.read_u32::<LittleEndian>()?;
+        if version != FORWARD_INDEX_VERSION {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Unsupported forward index version: {}", version),
+            ));
+        }
+        let num_terms = reader.read_u32::<LittleEndian>()? as usize;
+        let value_type_u32 = reader.read_u32::<LittleEndian>()?;
+        let value_type = match value_type_u32 {
+            0 => crate::base::ValueType::F16,
+            1 => crate::base::ValueType::BF16,
+            2 => crate::base::ValueType::F32,
+            3 => crate::base::ValueType::F64,
+            4 => crate::base::ValueType::I32,
+            5 => crate::base::ValueType::I64,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Unknown value type: {}", value_type_u32),
+                ))
+            }
+        };
+
+        let mut terms = Vec::with_capacity(num_terms);
+        for _ in 0..num_terms {
+            let num_pages = reader.read_u32::<LittleEndian>()? as usize;
+            let max_value = reader.read_f32::<LittleEndian>()?;
+            let max_doc_id = reader.read_u64::<LittleEndian>()?;
+            let length = reader.read_u32::<LittleEndian>()? as usize;
+
+            let mut pages = Vec::with_capacity(num_pages);
+            for _ in 0..num_pages {
+                let docid_position = reader.read_u64::<LittleEndian>()?;
+                let page_length = reader.read_u32::<LittleEndian>()? as usize;
+                let page_max_value = reader.read_f32::<LittleEndian>()?;
+                let page_max_doc_id = reader.read_u64::<LittleEndian>()?;
+
+                pages.push(TermIndexPageInformation {
+                    docid_position,
+                    value_position: docid_position, // same for forward index
+                    length: page_length,
+                    max_value: page_max_value,
+                    max_doc_id: page_max_doc_id,
+                });
+            }
+
+            terms.push(TermIndexInformation {
+                pages,
+                max_value,
+                max_doc_id,
+                length,
+            });
+        }
+
+        Ok((value_type, IndexInformation { terms }))
     }
 }
 

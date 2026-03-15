@@ -17,7 +17,7 @@ use tokio::task;
 use crate::bow::BOWIndexBuilder;
 use crate::builder::BuilderOptions;
 use crate::compress;
-use crate::compress::docid::EliasFanoCompressor;
+use crate::compress::docid::{BitPackingCompressor, EliasFanoCompressor, PForCompressor};
 use crate::compress::CompressionTransform;
 use crate::docmeta::DocMetadata;
 use crate::docstore;
@@ -25,7 +25,7 @@ use crate::scoring::bm25::BM25Scoring;
 use crate::scoring::ScoredIndex;
 use crate::transforms::split::SplitIndexTransform;
 use crate::vocab::analyzer::TextAnalyzer;
-use crate::vocab::stemmer::SnowballStemmer;
+use crate::vocab::stemmer::{PorterStemmer, SnowballStemmer};
 
 use bmp::index::posting_list::PostingListIterator;
 use bmp::query::MAX_TERM_WEIGHT;
@@ -146,6 +146,8 @@ pub struct PyIndexView {}
 #[pyclass(name = "Index", extends=PyIndexView)]
 pub struct PySparseIndex {
     index: Arc<Box<dyn SparseIndex>>,
+    /// Source directory path (for transparent auxiliary file copying)
+    source_path: Option<PathBuf>,
 }
 
 impl PySparseIndex {
@@ -291,19 +293,116 @@ impl PySparseIndex {
         Ok(())
     }
 
+    /// Get the text analyzer for this index (stemmer, stop words, vocabulary).
+    ///
+    /// Loads the analyzer configuration and vocabulary from the index directory.
+    fn analyzer(&self) -> PyResult<PyTextAnalyzer> {
+        let source = self.source_path.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "Cannot load analyzer: index has no source path. \
+                 Use Index.load() to load from a directory.",
+            )
+        })?;
+        PyTextAnalyzer::from_index(source.to_str().unwrap())
+    }
+
     /// Create a scored index that applies a scoring model to raw postings.
-    fn with_scoring(
-        &self,
-        py: Python<'_>,
-        scoring: &PyBM25Scoring,
-        doc_meta: &PyDocMetadata,
-    ) -> PyResult<Py<PyAny>> {
+    ///
+    /// Document metadata (lengths) is loaded automatically from the index
+    /// directory.
+    fn with_scoring(&self, py: Python<'_>, scoring: &PyBM25Scoring) -> PyResult<Py<PyAny>> {
+        let source = self.source_path.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "Cannot load doc metadata: index has no source path. \
+                 Use Index.load() to load from a directory.",
+            )
+        })?;
+
+        let doc_meta = Arc::new(crate::docmeta::DocMetadata::load(source).map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!(
+                "Failed to load doc metadata from '{}': {}",
+                source.display(),
+                e
+            ))
+        })?);
+
         let model = Box::new(BM25Scoring::with_params(scoring.k1, scoring.b));
-        let scored = ScoredIndex::new(self.index.clone(), doc_meta.inner.clone(), model);
+        let scored = ScoredIndex::new(self.index.clone(), doc_meta, model);
         let scored_box: Arc<Box<dyn SparseIndex>> = Arc::new(Box::new(scored));
 
         let base = PyClassInitializer::from(PyIndexView {});
         let sub = base.add_subclass(PyScoredIndex { index: scored_box });
+        Ok(Py::new(py, sub)?.into_any())
+    }
+
+    /// Compress the index with SIMD bitpacking and quantization.
+    ///
+    /// Creates a compressed index at the given path with block-max metadata
+    /// for efficient pruning during search. Returns the compressed index.
+    ///
+    /// Args:
+    ///     output_folder: Directory to write the compressed index to.
+    ///     block_size: Number of postings per block (default: 128).
+    ///     nbits: Quantization bits for impact values. Default 0 means
+    ///         lossless integer bitpacking (best for BM25 with integer TF).
+    ///         Set to 8 or 16 for quantized float compression.
+    ///     in_memory: Load the compressed index in memory (default: True).
+    #[pyo3(signature = (output_folder, block_size=128, nbits=0, in_memory=true))]
+    fn compress(
+        &self,
+        py: Python<'_>,
+        output_folder: &str,
+        block_size: usize,
+        nbits: u32,
+        in_memory: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let impacts_factory: Box<dyn compress::ImpactCompressorFactory> = if nbits == 0 {
+            // Lossless integer bitpacking (best for BM25 integer TF counts)
+            Box::new(compress::impact::BitPackedIntCompressor {})
+        } else {
+            // Quantized float compression
+            Box::new(compress::impact::GlobalQuantizerFactory { nbits })
+        };
+        let transform = CompressionTransform {
+            max_block_size: block_size,
+            doc_ids_compressor_factory: Box::new(PForCompressor {}),
+            impacts_compressor_factory: impacts_factory,
+        };
+        let path = Path::new(output_folder);
+        transform
+            .process(path, &**self.index)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
+
+        // Transparently copy auxiliary files (vocab, analyzer, docmeta)
+        // so the compressed index is fully standalone
+        let src = self.source_path.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "Cannot copy auxiliary files: index has no source path. \
+                 Use Index.load() to load from a directory.",
+            )
+        })?;
+        if src != path {
+            crate::docmeta::DocMetadata::copy_files(src, path).map_err(|e| {
+                pyo3::exceptions::PyIOError::new_err(format!(
+                    "Failed to copy doc metadata from '{}': {}",
+                    src.display(),
+                    e
+                ))
+            })?;
+            crate::vocab::analyzer::TextAnalyzer::copy_files(src, path).map_err(|e| {
+                pyo3::exceptions::PyIOError::new_err(format!(
+                    "Failed to copy analyzer files from '{}': {}",
+                    src.display(),
+                    e
+                ))
+            })?;
+        }
+
+        let base = PyClassInitializer::from(PyIndexView {});
+        let sub = base.add_subclass(PySparseIndex {
+            index: Arc::new(load_index(path, in_memory)),
+            source_path: Some(path.to_path_buf()),
+        });
         Ok(Py::new(py, sub)?.into_any())
     }
 
@@ -313,6 +412,7 @@ impl PySparseIndex {
         let base = PyClassInitializer::from(PyIndexView {});
         let sub = base.add_subclass(PySparseIndex {
             index: Arc::new(load_index(Path::new(folder), in_memory)),
+            source_path: Some(PathBuf::from(folder)),
         });
         Ok(Py::new(py, sub)?.into_any())
     }
@@ -523,6 +623,7 @@ impl PyIndexBuilder {
                 let index = $indexer.to_index(in_memory);
                 let sub = base.add_subclass(PySparseIndex {
                     index: Arc::new(Box::new(index)),
+                    source_path: None,
                 });
                 Ok(Py::new(py, sub)?.into_any())
             }};
@@ -560,6 +661,44 @@ impl PyEliasFanoCompressor {
             Self {},
             PyDocIdCompressor {
                 inner: Arc::new(Box::new(EliasFanoCompressor {})),
+            },
+        )
+    }
+}
+
+/// SIMD bitpacking for document ID compression (faster than Elias-Fano).
+#[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
+#[pyclass(name="BitPackingCompressor", extends=PyDocIdCompressor)]
+pub struct PyBitPackingCompressor {}
+
+// gen_stub_pymethods skipped: (Self, Parent) return in #[new] unsupported
+#[pymethods]
+impl PyBitPackingCompressor {
+    #[new]
+    fn new() -> (Self, PyDocIdCompressor) {
+        (
+            Self {},
+            PyDocIdCompressor {
+                inner: Arc::new(Box::new(BitPackingCompressor {})),
+            },
+        )
+    }
+}
+
+/// PFOR-delta doc ID compressor (better compression than BitPacking with outliers).
+#[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
+#[pyclass(name="PForCompressor", extends=PyDocIdCompressor)]
+pub struct PyPForCompressor {}
+
+// gen_stub_pymethods skipped: (Self, Parent) return in #[new] unsupported
+#[pymethods]
+impl PyPForCompressor {
+    #[new]
+    fn new() -> (Self, PyDocIdCompressor) {
+        (
+            Self {},
+            PyDocIdCompressor {
+                inner: Arc::new(Box::new(PForCompressor {})),
             },
         )
     }
@@ -605,6 +744,27 @@ impl PyGlobalQuantizerFactory {
             PyGlobalQuantizerFactory {},
             PyImpactCompressorFactory {
                 inner: Arc::new(Box::new(compress::impact::GlobalQuantizerFactory { nbits })),
+            },
+        )
+    }
+}
+
+/// SIMD bitpacked integer compressor for raw TF counts.
+///
+/// For BM25 indices with integer term frequencies, uses ~2-3 bits per value
+/// (adaptive per block) vs 8 bits for quantized floats.
+#[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
+#[pyclass(name="BitPackedIntCompressor", extends=PyImpactCompressorFactory)]
+pub struct PyBitPackedIntCompressor {}
+
+#[pymethods]
+impl PyBitPackedIntCompressor {
+    #[new]
+    fn new() -> (Self, PyImpactCompressorFactory) {
+        (
+            PyBitPackedIntCompressor {},
+            PyImpactCompressorFactory {
+                inner: Arc::new(Box::new(compress::impact::BitPackedIntCompressor {})),
             },
         )
     }
@@ -1100,14 +1260,25 @@ enum BOWBuilderEnum {
 // gen_stub_pymethods skipped: (Self, Parent) return in #[new] unsupported
 #[pymethods]
 impl PyBOWIndexBuilder {
+    /// Create a new BOWIndexBuilder.
+    ///
+    /// Args:
+    ///     folder: Directory to store the index.
+    ///     options: Builder options (block size, checkpoint frequency).
+    ///     dtype: Data type for term frequencies ("int32", "int64", "float32").
+    ///     stemmer: Stemmer to use ("snowball" or None).
+    ///     language: Language for the stemmer (default: "english").
+    ///     stop_words: Stop words to filter. Either a list of strings, or
+    ///         ``True`` to use the default Lucene stop words for the language.
     #[new]
-    #[pyo3(signature = (folder, options=None, dtype=None, stemmer=None, language=None))]
+    #[pyo3(signature = (folder, options=None, dtype=None, stemmer=None, language=None, stop_words=None))]
     fn new(
         folder: &str,
         options: Option<&PyBuilderOptions>,
         dtype: Option<&str>,
         stemmer: Option<&str>,
         language: Option<&str>,
+        stop_words: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let builder_options = match options {
             Some(o) => o.0.clone(),
@@ -1115,19 +1286,77 @@ impl PyBOWIndexBuilder {
         };
         let path = Path::new(folder);
         let dtype_str = dtype.unwrap_or("int32");
+        let lang = language.unwrap_or("english");
+
+        // Resolve stop words: True = use language default, list = explicit, None = no stop words
+        let resolved_stop_words: Vec<String> = match stop_words {
+            Some(obj) => {
+                if let Ok(true) = obj.extract::<bool>() {
+                    // True: use default stop words for the language
+                    crate::vocab::stopwords::get_stop_words(lang)
+                        .ok_or_else(|| {
+                            pyo3::exceptions::PyValueError::new_err(format!(
+                                "No built-in stop words for language '{}'",
+                                lang
+                            ))
+                        })?
+                        .into_iter()
+                        .map(|s| s.to_string())
+                        .collect()
+                } else if let Ok(list) = obj.extract::<Vec<String>>() {
+                    list
+                } else {
+                    return Err(pyo3::exceptions::PyTypeError::new_err(
+                        "stop_words must be True, a list of strings, or None",
+                    ));
+                }
+            }
+            None => Vec::new(),
+        };
+
+        let stop_word_refs: Vec<&str> = resolved_stop_words.iter().map(|s| s.as_str()).collect();
+
+        let make_analyzer = |stemmer_name: &str,
+                             stemmer_box: Box<dyn crate::vocab::stemmer::Stemmer>,
+                             english: bool|
+         -> TextAnalyzer {
+            let mut a = if stop_word_refs.is_empty() {
+                TextAnalyzer::new(stemmer_box)
+            } else {
+                TextAnalyzer::with_stop_words(stemmer_box, &stop_word_refs)
+            };
+            // Enable English possessive filter for English stemmers
+            if english {
+                a.set_english_possessive_filter(true);
+            }
+            // Store config for later retrieval
+            a.set_config(crate::vocab::analyzer::AnalyzerConfig {
+                stemmer: stemmer_name.to_string(),
+                language: lang.to_string(),
+                stop_words: !stop_word_refs.is_empty(),
+                english_possessive_filter: english,
+            });
+            a
+        };
+
+        let is_english = lang == "english";
 
         let analyzer = match stemmer {
             Some("snowball") => {
-                let lang = language.unwrap_or("english");
                 let s = SnowballStemmer::new(lang).map_err(|e| {
                     pyo3::exceptions::PyValueError::new_err(format!("Invalid stemmer: {}", e))
                 })?;
-                Some(TextAnalyzer::new(Box::new(s)))
+                Some(make_analyzer("snowball", Box::new(s), is_english))
             }
+            Some("porter") => Some(make_analyzer(
+                "porter",
+                Box::new(PorterStemmer::new()),
+                true,
+            )),
             Some("none") | None => None,
             Some(other) => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Unknown stemmer '{}', expected 'snowball' or None",
+                    "Unknown stemmer '{}', expected 'snowball', 'porter', or None",
                     other
                 )));
             }
@@ -1203,6 +1432,34 @@ impl PyBOWIndexBuilder {
         }
     }
 
+    /// Add a batch of (docid, text) pairs with parallel text analysis.
+    ///
+    /// Tokenization and stemming are parallelized using rayon. Much faster
+    /// than calling add_text() in a loop from Python.
+    ///
+    /// Documents must be sorted by ascending docid.
+    fn add_texts(&mut self, documents: Vec<(DocId, String)>) -> PyResult<()> {
+        let mut inner = self.inner.blocking_lock();
+        let builder = inner.as_mut().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Builder already consumed by build()")
+        })?;
+
+        let doc_refs: Vec<(DocId, &str)> =
+            documents.iter().map(|(d, t)| (*d, t.as_str())).collect();
+
+        match builder {
+            BOWBuilderEnum::I32(b) => b
+                .add_texts_batch(&doc_refs)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{}", e))),
+            BOWBuilderEnum::I64(b) => b
+                .add_texts_batch(&doc_refs)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{}", e))),
+            BOWBuilderEnum::F32(b) => b
+                .add_texts_batch(&doc_refs)
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{}", e))),
+        }
+    }
+
     fn add_text(&mut self, docid: DocId, text: &str) -> PyResult<()> {
         let mut inner = self.inner.blocking_lock();
         let builder = inner.as_mut().ok_or_else(|| {
@@ -1246,24 +1503,17 @@ impl PyBOWIndexBuilder {
 
         macro_rules! build_bow {
             ($builder:expr) => {{
-                let (index, doc_meta) = $builder.build(in_memory).map_err(|e| {
+                let folder = $builder.folder().to_path_buf();
+                let (index, _doc_meta) = $builder.build(in_memory).map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!("Build failed: {}", e))
                 })?;
 
                 let base = PyClassInitializer::from(PyIndexView {});
-                let py_index = base.add_subclass(PySparseIndex {
+                let sub = base.add_subclass(PySparseIndex {
                     index: Arc::new(Box::new(index)),
+                    source_path: Some(folder),
                 });
-                let py_index = Py::new(py, py_index)?.into_any();
-                let py_meta = Py::new(
-                    py,
-                    PyDocMetadata {
-                        inner: Arc::new(doc_meta),
-                    },
-                )?
-                .into_any();
-
-                Ok(pyo3::IntoPyObject::into_pyobject((py_index, py_meta), py)?.into())
+                Ok(Py::new(py, sub)?.into_any())
             }};
         }
 
@@ -1291,11 +1541,17 @@ impl PyTextAnalyzer {
     ///
     /// Args:
     ///     folder: Path to the index directory
-    ///     stemmer: Stemmer to use ("snowball" or None)
+    ///     stemmer: Stemmer to use ("snowball", "porter", or None)
     ///     language: Language for snowball stemmer (default "english")
+    ///     stop_words: Stop words list, or None
     #[staticmethod]
-    #[pyo3(signature = (folder, stemmer=None, language=None))]
-    fn load(folder: &str, stemmer: Option<&str>, language: Option<&str>) -> PyResult<Self> {
+    #[pyo3(signature = (folder, stemmer=None, language=None, stop_words=None))]
+    fn load(
+        folder: &str,
+        stemmer: Option<&str>,
+        language: Option<&str>,
+        stop_words: Option<Vec<String>>,
+    ) -> PyResult<Self> {
         let path = Path::new(folder);
 
         let stemmer_box: Box<dyn crate::vocab::stemmer::Stemmer> = match stemmer {
@@ -1306,21 +1562,86 @@ impl PyTextAnalyzer {
                 })?;
                 Box::new(s)
             }
+            Some("porter") => Box::new(PorterStemmer::new()),
             Some("none") | None => Box::new(crate::vocab::stemmer::NoStemmer),
             Some(other) => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Unknown stemmer '{}', expected 'snowball' or None",
+                    "Unknown stemmer '{}', expected 'snowball', 'porter', or None",
                     other
                 )));
             }
         };
 
-        let analyzer = TextAnalyzer::load(path, stemmer_box).map_err(|e| {
+        let stop_word_refs: Vec<&str> = match &stop_words {
+            Some(words) => words.iter().map(|s| s.as_str()).collect(),
+            None => Vec::new(),
+        };
+
+        let analyzer = if stop_word_refs.is_empty() {
+            TextAnalyzer::load(path, stemmer_box)
+        } else {
+            TextAnalyzer::load_with_stop_words(path, stemmer_box, &stop_word_refs)
+        }
+        .map_err(|e| {
             pyo3::exceptions::PyIOError::new_err(format!(
                 "Failed to load text analyzer from '{}': {}",
                 folder, e
             ))
         })?;
+
+        Ok(Self { inner: analyzer })
+    }
+
+    /// Load a text analyzer from a saved config (auto-configures stemmer, stop words).
+    ///
+    /// The index directory must contain `vocab.cbor` and `analyzer.cbor` files.
+    /// All settings (stemmer, stop words, possessive filter) are restored
+    /// from the saved configuration.
+    #[staticmethod]
+    #[pyo3(name = "from_index")]
+    fn from_index(folder: &str) -> PyResult<Self> {
+        let path = Path::new(folder);
+        let config = TextAnalyzer::load_config(path);
+
+        // Recreate stemmer from config
+        let stemmer_box: Box<dyn crate::vocab::stemmer::Stemmer> = match config.stemmer.as_str() {
+            "snowball" => {
+                let s = SnowballStemmer::new(&config.language).map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!("Invalid stemmer: {}", e))
+                })?;
+                Box::new(s)
+            }
+            "porter" => Box::new(PorterStemmer::new()),
+            _ => Box::new(crate::vocab::stemmer::NoStemmer),
+        };
+
+        // Recreate stop words from config
+        let stop_words = if config.stop_words {
+            crate::vocab::stopwords::get_stop_words(&config.language)
+                .unwrap_or_default()
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        let stop_word_refs: Vec<&str> = stop_words.iter().map(|s| s.as_str()).collect();
+
+        let mut analyzer = if stop_word_refs.is_empty() {
+            TextAnalyzer::load(path, stemmer_box)
+        } else {
+            TextAnalyzer::load_with_stop_words(path, stemmer_box, &stop_word_refs)
+        }
+        .map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!(
+                "Failed to load text analyzer from '{}': {}",
+                folder, e
+            ))
+        })?;
+
+        analyzer.set_english_possessive_filter(config.english_possessive_filter);
+        analyzer.set_config(config);
 
         Ok(Self { inner: analyzer })
     }
@@ -1346,8 +1667,11 @@ fn impact_index(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PySparseIndexIterator>()?;
 
     module.add_class::<PyEliasFanoCompressor>()?;
+    module.add_class::<PyBitPackingCompressor>()?;
+    module.add_class::<PyPForCompressor>()?;
     module.add_class::<PyImpactQuantizer>()?;
     module.add_class::<PyGlobalQuantizerFactory>()?;
+    module.add_class::<PyBitPackedIntCompressor>()?;
     module.add_class::<PyCompressionTransform>()?;
     module.add_class::<PySplitIndexTransform>()?;
     module.add_class::<PyBmpSearcher>()?;
@@ -1362,6 +1686,20 @@ fn impact_index(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyScoredIndex>()?;
     module.add_class::<PyBOWIndexBuilder>()?;
     module.add_class::<PyTextAnalyzer>()?;
+
+    // Functions
+    #[pyfn(module)]
+    #[pyo3(name = "get_stop_words")]
+    fn py_get_stop_words(language: &str) -> PyResult<Vec<String>> {
+        crate::vocab::stopwords::get_stop_words(language)
+            .map(|words| words.into_iter().map(|s| s.to_string()).collect())
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "No stop words for language '{}'",
+                    language
+                ))
+            })
+    }
 
     Ok(())
 }

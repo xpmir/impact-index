@@ -32,7 +32,7 @@ impl ApproxEq for ScoredDocument {
     }
 }
 
-fn vec_compare<T>(observed: &Vec<T>, expected: &Vec<T>)
+fn vec_compare<T>(observed: &Vec<T>, expected: &Vec<T>, delta: f64)
 where
     T: ApproxEq + Display,
 {
@@ -44,7 +44,7 @@ where
     );
     for i in 0..expected.len() {
         assert!(
-            observed[i].approx_eq(&expected[i], 1e-2),
+            observed[i].approx_eq(&expected[i], delta),
             "{}th element differ: {} vs {}",
             i,
             observed[i],
@@ -142,7 +142,7 @@ fn test_heap() {
     let expected = scored_documents[0..top_k].to_vec();
     let observed = top.into_sorted_vec();
 
-    vec_compare(&observed, &expected);
+    vec_compare(&observed, &expected, 1e-2);
 }
 
 fn search_maxscore_default<'a>(
@@ -157,6 +157,12 @@ enum IndexType {
     InMemory,
     Disk,
     Split2,
+    BitPacked,
+    PFor,
+    /// BitPacking + 16-bit quantized impacts (block_size=128) — the recommended config
+    BitPacked16,
+    /// BitPacking + 8-bit quantized impacts (block_size=128)
+    BitPacked8,
 }
 
 #[rstest]
@@ -170,6 +176,13 @@ enum IndexType {
 #[case(IndexType::InMemory, 500, 500, 5., 8, 10, Some(1), 0, vec![])]
 #[case(IndexType::Disk, 500, 500, 5., 8, 10, Some(1), 0, vec![])]
 #[case(IndexType::Split2, 500, 500, 5., 8, 10, Some(1), 0, vec![])]
+#[case(IndexType::BitPacked, 500, 500, 5., 8, 10, Some(1), 0, vec![])]
+// BitPacking + 16-bit quantized impacts (recommended production config)
+#[case(IndexType::BitPacked16, 500, 500, 5., 8, 10, Some(1), 0, vec![])]
+// BitPacking + 8-bit quantized impacts (fast path)
+#[case(IndexType::BitPacked8, 500, 500, 5., 8, 10, Some(1), 0, vec![])]
+// PFOR-delta compression
+#[case(IndexType::PFor, 500, 500, 5., 8, 10, Some(1), 0, vec![])]
 fn test_search(
     #[case] index_type: IndexType,
     #[case] vocabulary_size: usize,
@@ -228,6 +241,60 @@ fn test_search(
                 .expect("Could not build the new index");
             load_index(&split_index_path, true)
         }
+        IndexType::BitPacked => {
+            use impact_index::compress::docid::BitPackingCompressor;
+            let transform = CompressionTransform {
+                max_block_size: 128,
+                doc_ids_compressor_factory: Box::new(BitPackingCompressor {}),
+                impacts_compressor_factory: Box::new(Identity {}),
+            };
+            let compressed_path = data.dir.path().join("bitpacked");
+            transform
+                .process(&compressed_path, &data.indexer.to_index(true))
+                .expect("Could not build compressed index");
+            load_index(&compressed_path, true)
+        }
+        IndexType::BitPacked16 => {
+            use impact_index::compress::docid::BitPackingCompressor;
+            use impact_index::compress::impact::GlobalQuantizerFactory;
+            let transform = CompressionTransform {
+                max_block_size: 128,
+                doc_ids_compressor_factory: Box::new(BitPackingCompressor {}),
+                impacts_compressor_factory: Box::new(GlobalQuantizerFactory { nbits: 16 }),
+            };
+            let compressed_path = data.dir.path().join("bitpacked16");
+            transform
+                .process(&compressed_path, &data.indexer.to_index(true))
+                .expect("Could not build compressed index");
+            load_index(&compressed_path, true)
+        }
+        IndexType::BitPacked8 => {
+            use impact_index::compress::docid::BitPackingCompressor;
+            use impact_index::compress::impact::GlobalQuantizerFactory;
+            let transform = CompressionTransform {
+                max_block_size: 128,
+                doc_ids_compressor_factory: Box::new(BitPackingCompressor {}),
+                impacts_compressor_factory: Box::new(GlobalQuantizerFactory { nbits: 8 }),
+            };
+            let compressed_path = data.dir.path().join("bitpacked8");
+            transform
+                .process(&compressed_path, &data.indexer.to_index(true))
+                .expect("Could not build compressed index");
+            load_index(&compressed_path, true)
+        }
+        IndexType::PFor => {
+            use impact_index::compress::docid::PForCompressor;
+            let transform = CompressionTransform {
+                max_block_size: 128,
+                doc_ids_compressor_factory: Box::new(PForCompressor {}),
+                impacts_compressor_factory: Box::new(Identity {}),
+            };
+            let compressed_path = data.dir.path().join("pfor");
+            transform
+                .process(&compressed_path, &data.indexer.to_index(true))
+                .expect("Could not build compressed index");
+            load_index(&compressed_path, true)
+        }
     };
 
     // Builds a query from a document
@@ -270,7 +337,13 @@ fn test_search(
         );
     }
 
-    vec_compare(&observed, &expected);
+    // Quantized indices have lossy compression — use wider tolerance
+    let delta = match index_type {
+        IndexType::BitPacked8 => 5e-2,
+        IndexType::BitPacked16 => 1e-2,
+        _ => 1e-2,
+    };
+    vec_compare(&observed, &expected, delta);
 }
 
 /// Test that compares the output of legacy and streaming BMP conversion.

@@ -49,8 +49,9 @@ pub struct BuilderOptions {
 
     /// Maximum number of in-memory postings per term before flushing to disk.
     ///
-    /// Default is 16384. With a 32k vocabulary, this uses roughly 4 GB of memory.
-    #[derivative(Default(value = "16384"))]
+    /// Default is 128, matching the optimal block size for block-max pruning.
+    /// With buffered I/O, small blocks have minimal overhead.
+    #[derivative(Default(value = "128"))]
     pub in_memory_threshold: usize,
 
     /// Ratio of `in_memory_threshold` used as flush threshold during checkpoints.
@@ -88,7 +89,9 @@ struct TermsImpacts<V: PostingValue> {
     checkpoint_doc_id: Option<DocId>,
     options: BuilderOptions,
     folder: PathBuf,
-    postings_file: std::fs::File,
+    postings_file: std::io::BufWriter<std::fs::File>,
+    /// Track file position manually to avoid flushing BufWriter on stream_position()
+    postings_file_position: u64,
     information: IndexInformation,
     postings_information: Vec<PostingsInformation<V>>,
 }
@@ -113,9 +116,13 @@ impl<V: PostingValue> TermsImpacts<V> {
             checkpoint_doc_id: None,
             options: options.clone(),
             folder: folder.to_path_buf(),
-            postings_file: file_options
-                .open(path)
-                .expect("Error while creating postings file."),
+            postings_file: std::io::BufWriter::with_capacity(
+                1 << 20, // 1 MB buffer
+                file_options
+                    .open(path)
+                    .expect("Error while creating postings file."),
+            ),
+            postings_file_position: 0,
             postings_information: Vec::new(),
             information: IndexInformation::new(),
         };
@@ -130,16 +137,20 @@ impl<V: PostingValue> TermsImpacts<V> {
                     .expect("Error while opening checkpoint file");
 
                 // Use zstd decompression
-                let decoder = zstd::stream::Decoder::new(BufReader::new(ckpt_file))
+                let mut decoder = zstd::stream::Decoder::new(BufReader::new(ckpt_file))
                     .expect("Error creating zstd decoder");
 
+                // Read binary IndexInformation first, then CBOR for the rest
                 let pos: u64;
-                (
-                    _self.information,
-                    _self.postings_information,
-                    pos,
-                    _self.checkpoint_doc_id,
-                ) = ciborium::de::from_reader(decoder).expect("error while reading checkpoint");
+                let (_value_type, info) =
+                    IndexInformation::read_binary(&mut decoder).unwrap_or_else(|_| {
+                        // Fall back to old all-CBOR format
+                        panic!("Cannot read checkpoint: incompatible format. Delete checkpoint.cbor and re-index.");
+                    });
+                _self.information = info;
+                (_self.postings_information, pos, _self.checkpoint_doc_id) =
+                    ciborium::de::from_reader(decoder)
+                        .expect("error while reading checkpoint postings");
 
                 // Note that we don't truncate the file since we will overwrite
                 // everything from there
@@ -147,6 +158,7 @@ impl<V: PostingValue> TermsImpacts<V> {
                     .postings_file
                     .seek(std::io::SeekFrom::Start(pos))
                     .expect("Error while moving in the posting file");
+                _self.postings_file_position = pos;
 
                 info!(
                     "Read checkpoint (current doc ID {})",
@@ -176,8 +188,8 @@ impl<V: PostingValue> TermsImpacts<V> {
             .flush()
             .expect("error when flushing the posting file");
 
-        let info_path = self.folder.join(format!("checkpoint.cbor"));
-        let tmp_info_path = self.folder.join(format!("checkpoint.cbor.tmp"));
+        let info_path = self.folder.join("checkpoint.cbor");
+        let tmp_info_path = self.folder.join("checkpoint.cbor.tmp");
         let info_file = File::options()
             .write(true)
             .create(true)
@@ -185,25 +197,29 @@ impl<V: PostingValue> TermsImpacts<V> {
             .open(&tmp_info_path)
             .expect("Error while creating checkpoint file");
 
-        // Use zstd compression (level 3 is a good speed/ratio balance)
+        // Use zstd compression
         let encoder = zstd::stream::Encoder::new(BufWriter::new(info_file), 3)
             .expect("Error creating zstd encoder");
         let mut encoder = encoder.auto_finish();
 
-        let pos = self.postings_file.stream_position().expect("");
-        ciborium::ser::into_writer(
-            &(&self.information, &self.postings_information, pos, doc_id),
-            &mut encoder,
-        )
-        .expect("Error while serializing");
+        let pos = self.postings_file_position;
+
+        // Write IndexInformation as compact binary (the bulk of the data)
+        let value_type = crate::base::value_type_of::<V>();
+        self.information
+            .write_binary(value_type, &mut encoder)
+            .expect("Error writing binary metadata in checkpoint");
+
+        // Write remaining state as CBOR (in-memory postings + position + doc_id)
+        ciborium::ser::into_writer(&(&self.postings_information, pos, doc_id), &mut encoder)
+            .expect("Error while serializing checkpoint");
 
         // Ensure encoder is flushed before rename
         drop(encoder);
 
-        // Move file to checkpoint
+        // Atomic rename
         fs::rename(tmp_info_path, info_path).expect("Error when moving checkpoint.cbor in place");
 
-        // And then set the last checkpoint
         self.checkpoint_doc_id = Some(doc_id);
     }
     /// Adds a term for a given document
@@ -275,8 +291,8 @@ impl<V: PostingValue> TermsImpacts<V> {
             return Ok(());
         }
 
-        // Get the stream position
-        let position = self.postings_file.stream_position()?;
+        // Use tracked position (avoids flushing BufWriter for stream_position)
+        let position = self.postings_file_position;
         debug!(
             "Flush {} at {} (length {})",
             term_ix, position, len_postings
@@ -300,10 +316,12 @@ impl<V: PostingValue> TermsImpacts<V> {
             .push(postings_info.information);
 
         // outputs the postings for this term
+        let record_size = (std::mem::size_of::<DocId>() + V::BYTE_SIZE) as u64;
         for ti in postings_info.postings.iter() {
             self.postings_file.write_u64::<BigEndian>(ti.docid)?;
             ti.value.write_be(&mut self.postings_file)?;
         }
+        self.postings_file_position += record_size * len_postings as u64;
 
         Ok(())
     }
@@ -405,19 +423,32 @@ impl<V: PostingValue> Indexer<V> {
             self.impacts.flush_all()?;
             self.built = true;
 
-            let info_path = self.folder.join(format!("information.cbor"));
+            // Write compact binary metadata
+            let value_type = crate::base::value_type_of::<V>();
+            let bin_path = self.folder.join("information.bin");
+            let bin_file = File::options()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&bin_path)
+                .expect("Error creating information.bin");
+            self.impacts
+                .information
+                .write_binary(value_type, &mut std::io::BufWriter::new(bin_file))
+                .expect("Error writing binary metadata");
+
+            // Write stub CBOR (just value type, empty terms) for backward compat.
+            // Real data is in information.bin.
+            let info_path = self.folder.join("information.cbor");
             let info_file = File::options()
-                .read(true)
                 .write(true)
                 .create(true)
                 .truncate(true)
                 .open(info_path)
                 .expect("Error while creating file");
-
-            // Store both the value type and the index information
-            let value_type = crate::base::value_type_of::<V>();
-            ciborium::ser::into_writer(&(value_type, &self.impacts.information), info_file)
-                .expect("Error while serializing");
+            let stub = IndexInformation::new(); // empty
+            ciborium::ser::into_writer(&(value_type, &stub), info_file)
+                .expect("Error while serializing stub");
 
             // Remove old checkpoint
             for s in ["checkpoint.cbor", "checkpoint.cbor.tmp"] {
@@ -481,15 +512,16 @@ impl<V: PostingValue> SparseBuilderIndex<V> {
 /// * `path` - Directory containing `information.cbor` and `postings.dat`
 /// * `in_memory` - If `true`, loads postings into memory; otherwise uses mmap
 pub fn load_forward_index<V: PostingValue>(path: &Path, in_memory: bool) -> SparseBuilderIndex<V> {
-    let info_path = path.join(format!("information.cbor"));
-    let info_file = File::options()
-        .read(true)
-        .open(info_path)
-        .expect("Error while creating file");
-
-    // Try to read (ValueType, IndexInformation) first, fall back to just IndexInformation
-    // for backward compatibility with old format
-    let ti: IndexInformation = {
+    // Prefer binary format (compact), fall back to CBOR
+    let bin_path = path.join("information.bin");
+    let ti: IndexInformation = if bin_path.exists() {
+        let mut reader =
+            std::io::BufReader::new(File::open(&bin_path).expect("Error opening information.bin"));
+        let (_vtype, info) =
+            IndexInformation::read_binary(&mut reader).expect("Error reading binary metadata");
+        info
+    } else {
+        // Fall back to CBOR
         let mut buf = Vec::new();
         let mut file = File::options()
             .read(true)
@@ -502,13 +534,11 @@ pub fn load_forward_index<V: PostingValue>(path: &Path, in_memory: bool) -> Spar
         {
             info
         } else {
-            // Old format: just IndexInformation
             ciborium::de::from_reader(&buf[..]).expect("Error loading term index information")
         }
     };
 
-    let postings_path = path.join(format!("postings.dat"));
-
+    let postings_path = path.join("postings.dat");
     SparseBuilderIndex::new(ti.terms, &postings_path, in_memory)
 }
 
@@ -517,29 +547,38 @@ pub fn load_forward_index<V: PostingValue>(path: &Path, in_memory: bool) -> Spar
 /// Reads the `ValueType` tag from metadata and dispatches to the correct
 /// typed `SparseBuilderIndex<V>`, returning a `Box<dyn SparseIndex>`.
 pub fn load_forward_index_dynamic(path: &Path, in_memory: bool) -> Box<dyn SparseIndex> {
-    let info_path = path.join("information.cbor");
-    let mut buf = Vec::new();
-    let mut file = File::options()
-        .read(true)
-        .open(info_path)
-        .expect("Error reading info");
-    std::io::Read::read_to_end(&mut file, &mut buf).expect("Error reading info");
-
-    // Try new format with ValueType tag
-    if let Ok((vtype, _info)) =
-        ciborium::de::from_reader::<(ValueType, IndexInformation), _>(&buf[..])
-    {
-        match vtype {
-            ValueType::F32 => Box::new(load_forward_index::<f32>(path, in_memory)),
-            ValueType::F64 => Box::new(load_forward_index::<f64>(path, in_memory)),
-            ValueType::F16 => Box::new(load_forward_index::<half::f16>(path, in_memory)),
-            ValueType::BF16 => Box::new(load_forward_index::<half::bf16>(path, in_memory)),
-            ValueType::I32 => Box::new(load_forward_index::<i32>(path, in_memory)),
-            ValueType::I64 => Box::new(load_forward_index::<i64>(path, in_memory)),
-        }
+    // Get value type: prefer binary, fall back to CBOR
+    let bin_path = path.join("information.bin");
+    let vtype = if bin_path.exists() {
+        let mut reader =
+            std::io::BufReader::new(File::open(&bin_path).expect("Error opening information.bin"));
+        let (vtype, _info) =
+            IndexInformation::read_binary(&mut reader).expect("Error reading binary metadata");
+        vtype
     } else {
-        // Old format: assume f32
-        Box::new(load_forward_index::<f32>(path, in_memory))
+        let mut buf = Vec::new();
+        let mut file = File::options()
+            .read(true)
+            .open(path.join("information.cbor"))
+            .expect("Error reading info");
+        std::io::Read::read_to_end(&mut file, &mut buf).expect("Error reading info");
+
+        if let Ok((vtype, _info)) =
+            ciborium::de::from_reader::<(ValueType, IndexInformation), _>(&buf[..])
+        {
+            vtype
+        } else {
+            ValueType::F32
+        }
+    };
+
+    match vtype {
+        ValueType::F32 => Box::new(load_forward_index::<f32>(path, in_memory)),
+        ValueType::F64 => Box::new(load_forward_index::<f64>(path, in_memory)),
+        ValueType::F16 => Box::new(load_forward_index::<half::f16>(path, in_memory)),
+        ValueType::BF16 => Box::new(load_forward_index::<half::bf16>(path, in_memory)),
+        ValueType::I32 => Box::new(load_forward_index::<i32>(path, in_memory)),
+        ValueType::I64 => Box::new(load_forward_index::<i64>(path, in_memory)),
     }
 }
 

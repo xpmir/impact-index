@@ -1,24 +1,36 @@
 //! Vocabulary management for mapping between string terms and term indices.
 //!
-//! Provides [`Vocabulary`] for bidirectional term <-> [`TermIndex`] mapping,
-//! with CBOR-based serialization.
+//! Provides [`Vocabulary`] for bidirectional term <-> [`TermIndex`] mapping.
+//! Uses FST for compact on-disk storage (~26 MB for 2.6M terms).
 
 pub mod analyzer;
+pub mod lucene_porter;
 pub mod stemmer;
+pub mod stopwords;
 
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::BufWriter;
 use std::path::Path;
-
-use serde::{Deserialize, Serialize};
 
 use crate::base::TermIndex;
 
 /// Bidirectional mapping between string terms and [`TermIndex`].
-#[derive(Serialize, Deserialize, Clone)]
+///
+/// During building, uses a HashMap for O(1) insert/lookup.
+/// On disk, uses a single FST file (term→id mapping).
 pub struct Vocabulary {
     term_to_id: HashMap<String, TermIndex>,
-    id_to_term: Vec<String>,
+    num_terms: usize,
+}
+
+impl Clone for Vocabulary {
+    fn clone(&self) -> Self {
+        Self {
+            term_to_id: self.term_to_id.clone(),
+            num_terms: self.num_terms,
+        }
+    }
 }
 
 impl Vocabulary {
@@ -26,7 +38,7 @@ impl Vocabulary {
     pub fn new() -> Self {
         Self {
             term_to_id: HashMap::new(),
-            id_to_term: Vec::new(),
+            num_terms: 0,
         }
     }
 
@@ -35,8 +47,8 @@ impl Vocabulary {
         if let Some(&id) = self.term_to_id.get(term) {
             id
         } else {
-            let id = self.id_to_term.len();
-            self.id_to_term.push(term.to_string());
+            let id = self.num_terms;
+            self.num_terms += 1;
             self.term_to_id.insert(term.to_string(), id);
             id
         }
@@ -47,36 +59,63 @@ impl Vocabulary {
         self.term_to_id.get(term).copied()
     }
 
-    /// Reverse lookup: get the term string for an index.
-    pub fn term(&self, id: TermIndex) -> &str {
-        &self.id_to_term[id]
-    }
-
     /// Number of terms in the vocabulary.
     pub fn len(&self) -> usize {
-        self.id_to_term.len()
+        self.num_terms
     }
 
     /// Whether the vocabulary is empty.
     pub fn is_empty(&self) -> bool {
-        self.id_to_term.is_empty()
+        self.num_terms == 0
     }
 
-    /// Save vocabulary to a CBOR file.
+    /// Save vocabulary as a single FST file.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        let file = File::options()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
-        ciborium::ser::into_writer(self, file)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        // Build FST: sorted (term, id) pairs
+        let mut entries: Vec<(&str, u64)> = self
+            .term_to_id
+            .iter()
+            .map(|(term, &id)| (term.as_str(), id as u64))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+
+        let fst_path = path.with_extension("fst");
+        let wtr = BufWriter::new(File::create(&fst_path)?);
+        let mut builder = fst::MapBuilder::new(wtr)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        for (term, id) in &entries {
+            builder
+                .insert(term.as_bytes(), *id)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        }
+        builder
+            .finish()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+        Ok(())
     }
 
-    /// Load vocabulary from a CBOR file.
+    /// Load vocabulary from FST file.
     pub fn load(path: &Path) -> std::io::Result<Self> {
-        let file = File::open(path)?;
-        ciborium::de::from_reader(file)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+        let fst_path = path.with_extension("fst");
+        let fst_data = std::fs::read(&fst_path)?;
+        let fst_map = fst::Map::new(fst_data)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+
+        let entries = fst_map
+            .stream()
+            .into_str_vec()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+
+        let num_terms = entries.len();
+        let mut term_to_id = HashMap::with_capacity(num_terms);
+        for (term, id) in entries {
+            term_to_id.insert(term, id as TermIndex);
+        }
+
+        Ok(Self {
+            term_to_id,
+            num_terms,
+        })
     }
 }

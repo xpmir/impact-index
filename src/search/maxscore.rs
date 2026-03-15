@@ -64,6 +64,16 @@ impl MaxScoreTermIterator<'_> {
         );
         Some(&self.impact)
     }
+
+    /// Block-max value scaled by query weight
+    fn max_block_value(&self) -> f64 {
+        (self.iterator.max_block_value() * self.query_weight) as f64
+    }
+
+    /// Maximum doc ID in the current block
+    fn max_block_doc_id(&self) -> DocId {
+        self.iterator.max_block_doc_id()
+    }
 }
 
 /// Options for the MaxScore search algorithm.
@@ -97,7 +107,7 @@ pub fn search_maxscore<'a>(
 
     let mut results = TopScoredDocuments::new(top_k);
     let mut active = Vec::new();
-    let mut theta: f64;
+    let mut theta: f64 = 0.;
 
     for (&ix, &weight) in query.iter() {
         // Discard a term if the index does not match
@@ -145,35 +155,89 @@ pub fn search_maxscore<'a>(
             .iter()
             .fold(DocId::MAX as DocId, |cur, t| cur.min(t.impact.docid));
 
-        // score document
-        let mut score = 0f64;
-        passive.retain_mut(|t| {
-            if let Some(impact) = t.seek_gek(candidate) {
-                if candidate == impact.docid {
-                    score += impact.value as f64;
+        // Block-max pruning: compute block-level upper bound for the candidate
+        let block_ub: f64 = active
+            .iter()
+            .filter(|t| t.impact.docid == candidate)
+            .map(|t| t.max_block_value())
+            .sum::<f64>()
+            + sum_pass;
+
+        if block_ub <= theta {
+            // The block containing the candidate cannot beat theta.
+            // Compute safe skip target: min of (block_end+1) and the smallest
+            // docid among active terms NOT at the candidate (they may produce
+            // candidates in the skipped range that need the skipped terms).
+            let block_end = active
+                .iter()
+                .filter(|t| t.impact.docid == candidate)
+                .map(|t| t.max_block_doc_id())
+                .min()
+                .unwrap();
+
+            let skip_to = active
+                .iter()
+                .filter(|t| t.impact.docid != candidate)
+                .map(|t| t.impact.docid)
+                .fold(block_end + 1, |acc, d| acc.min(d));
+
+            debug!(
+                "Block-max pruning: block_ub={} <= theta={}, skipping to {}",
+                block_ub, theta, skip_to
+            );
+
+            // Advance active terms at the candidate to skip_to
+            active.retain_mut(|t| {
+                if t.impact.docid == candidate {
+                    t.seek_gek(skip_to).is_some()
+                } else {
+                    true
+                }
+            });
+        } else {
+            // Score active terms first (they contribute the most)
+            let mut score = 0f64;
+            active.retain_mut(|t| {
+                if t.impact.docid == candidate {
+                    score += t.impact.value as f64;
+                    if !t.next() {
+                        return false;
+                    }
                 }
                 true
-            } else {
-                false
-            }
-        });
+            });
 
-        active.retain_mut(|t| {
-            if t.impact.docid == candidate {
-                score += t.impact.value as f64;
-                if !t.next() {
-                    return false;
+            // Score passive terms with early termination:
+            // passive is ordered by increasing max_value (from when they were
+            // moved from active). We iterate in reverse (highest max_value first)
+            // so we can exit early when remaining terms can't push score above theta.
+            let mut remaining_pass_ub = sum_pass;
+            let mut i = passive.len();
+            while i > 0 {
+                i -= 1;
+                // Check if score + remaining passive UB can beat theta
+                if score + remaining_pass_ub <= theta {
+                    // Early exit: remaining passive terms can't help
+                    break;
+                }
+                remaining_pass_ub -= passive[i].max_value;
+
+                if let Some(impact) = passive[i].seek_gek(candidate) {
+                    if candidate == impact.docid {
+                        score += impact.value as f64;
+                    }
+                } else {
+                    // Iterator exhausted — remove it and adjust sum_pass
+                    let removed = passive.remove(i);
+                    sum_pass -= removed.max_value;
                 }
             }
 
-            true
-        });
-
-        // check against heap, update if needed
-        theta = results.add(candidate, score as f32).max(0.) as f64;
+            // check against heap, update if needed
+            theta = results.add(candidate, score as f32).max(0.) as f64;
+        }
 
         // try to expand passive set
-
         if let Some(t) = active.last() {
             if t.max_value + sum_pass < theta {
                 sum_pass += t.max_value;

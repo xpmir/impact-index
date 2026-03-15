@@ -304,6 +304,8 @@ pub fn load_index(path: &Path, in_memory: bool) -> Box<dyn SparseIndex> {
 ///
 /// Serializes the loader as CBOR into `index.cbor` within the given directory.
 pub fn save_index(loader: Box<dyn IndexLoader>, path: &Path) -> Result<(), std::io::Error> {
+    use std::io::BufWriter;
+
     let info_path = path.join(INDEX_CBOR);
     let info_path_s = info_path.display().to_string();
 
@@ -314,8 +316,11 @@ pub fn save_index(loader: Box<dyn IndexLoader>, path: &Path) -> Result<(), std::
         .open(info_path)
         .expect(&format!("Error while creating file {}", info_path_s));
 
-    ciborium::ser::into_writer(&loader, info_file)
+    eprintln!("Writing index metadata to {}...", info_path_s);
+    let writer = BufWriter::new(info_file);
+    ciborium::ser::into_writer(&loader, writer)
         .expect("Error saving compressed term index information");
+    eprintln!("Done writing index metadata.");
 
     Ok(())
 }

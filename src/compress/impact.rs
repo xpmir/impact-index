@@ -7,15 +7,19 @@
 use core::f32;
 use std::io::Write;
 
+use bitpacking::{BitPacker, BitPacker4x};
 use bitstream_io::{BigEndian, BitRead, BitReader, BitWrite, BitWriter};
 use byteorder::{ReadBytesExt, WriteBytesExt};
 
 use super::{Compressor, ImpactCompressor, ImpactCompressorFactory, TermBlockInformation};
 use crate::{
     base::{ImpactValue, TermIndex},
+    index::SparseIndexView,
     utils::buffer::{Slice, SliceReader},
 };
 use serde::{Deserialize, Serialize};
+
+const BLOCK_LEN: usize = 128;
 
 // ---
 // --- Quantizer
@@ -83,30 +87,6 @@ impl ImpactCompressorFactory for GlobalQuantizerFactory {
     }
 }
 
-struct QuantizerIterator<'a> {
-    nbits: u32,
-    index: usize,
-    count: usize,
-    min: ImpactValue,
-    step: ImpactValue,
-    bit_reader: BitReader<Box<SliceReader<'a>>, bitstream_io::BigEndian>,
-}
-
-impl<'a> Iterator for QuantizerIterator<'a> {
-    type Item = ImpactValue;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.index < self.count {
-            self.index += 1;
-            let quantized = self.bit_reader.read::<u32>(self.nbits).unwrap();
-            let x = (quantized as ImpactValue) * self.step + self.min + self.step / 2.;
-            Some(x)
-        } else {
-            None
-        }
-    }
-}
-
 #[typetag::serde]
 impl ImpactCompressor for Quantizer {}
 
@@ -150,17 +130,60 @@ impl<'a> Compressor<ImpactValue> for Quantizer {
         _term_index: TermIndex,
         info: &TermBlockInformation,
     ) -> Box<dyn Iterator<Item = ImpactValue> + Send + 'b> {
+        // Bulk-decode all quantized values at once to avoid per-posting BitReader overhead
         let slice_reader = Box::new(SliceReader::new(slice));
-        let bit_reader = BitReader::endian(slice_reader, BigEndian);
+        let mut bit_reader = BitReader::endian(slice_reader, BigEndian);
+        let min = self.min;
+        let step = self.step;
 
-        Box::new(QuantizerIterator::<'b> {
-            nbits: self.nbits,
-            index: 0,
-            count: info.length,
-            bit_reader: bit_reader,
-            min: self.min,
-            step: self.step,
-        })
+        let values: Vec<ImpactValue> = (0..info.length)
+            .map(|_| {
+                let quantized = bit_reader.read::<u32>(self.nbits).unwrap();
+                (quantized as ImpactValue) * step + min + step / 2.
+            })
+            .collect();
+
+        Box::new(values.into_iter())
+    }
+
+    fn decode_into_bytes(
+        &self,
+        data: &[u8],
+        _term_index: TermIndex,
+        info: &TermBlockInformation,
+        buffer: &mut Vec<ImpactValue>,
+    ) {
+        let min = self.min;
+        let step = self.step;
+        let half_step = step / 2.0;
+
+        buffer.clear();
+        buffer.reserve(info.length);
+
+        // Fast path for byte-aligned bit widths: read directly from bytes
+        match self.nbits {
+            16 => {
+                for i in 0..info.length {
+                    let offset = i * 2;
+                    let quantized = u16::from_be_bytes([data[offset], data[offset + 1]]) as u32;
+                    buffer.push((quantized as ImpactValue) * step + min + half_step);
+                }
+            }
+            8 => {
+                for i in 0..info.length {
+                    let quantized = data[i] as u32;
+                    buffer.push((quantized as ImpactValue) * step + min + half_step);
+                }
+            }
+            _ => {
+                // Generic path via BitReader for arbitrary bit widths
+                let mut bit_reader = BitReader::endian(data, BigEndian);
+                for _ in 0..info.length {
+                    let quantized = bit_reader.read::<u32>(self.nbits).unwrap();
+                    buffer.push((quantized as ImpactValue) * step + min + half_step);
+                }
+            }
+        }
     }
 }
 
@@ -231,6 +254,125 @@ impl<'a> Iterator for IdentityIterator<'a> {
             Some(view.read_f32::<byteorder::BigEndian>().expect("read error"))
         } else {
             None
+        }
+    }
+}
+
+// ---
+// --- BitPacked integer compressor (for raw TF counts)
+// ---
+
+/// Compresses impact values as raw integers with SIMD bitpacking.
+///
+/// For BM25 indices where values are integer term frequencies (typically 1-5),
+/// this uses ~2-3 bits per value vs 8 bits for quantized floats.
+///
+/// Format per full block (128 values):
+/// - `[num_bits: u8]`
+/// - `[bitpacked 128 u32 values: 16 * num_bits bytes]`
+///
+/// Tail blocks (< 128): `[0xFF marker] [u32 LE values]`
+///
+/// Values are stored as `round(value)` — lossless for integer TF counts.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+pub struct BitPackedIntCompressor {}
+
+#[typetag::serde]
+impl ImpactCompressor for BitPackedIntCompressor {}
+
+impl ImpactCompressorFactory for BitPackedIntCompressor {
+    fn create(&self, _index: &dyn SparseIndexView) -> Box<dyn ImpactCompressor> {
+        Box::new(BitPackedIntCompressor {})
+    }
+    fn clone(&self) -> Box<dyn ImpactCompressorFactory> {
+        Box::new(Clone::clone(self))
+    }
+}
+
+impl Compressor<ImpactValue> for BitPackedIntCompressor {
+    fn write(
+        &self,
+        writer: &mut dyn Write,
+        values: &[ImpactValue],
+        _term_index: TermIndex,
+        _info: &TermBlockInformation,
+    ) {
+        let ints: Vec<u32> = values.iter().map(|&v| v.round() as u32).collect();
+
+        if ints.len() == BLOCK_LEN {
+            let bitpacker = BitPacker4x::new();
+            let num_bits = bitpacker.num_bits(&ints);
+            writer.write_all(&[num_bits]).expect("write num_bits");
+            if num_bits > 0 {
+                let mut compressed = vec![0u8; BLOCK_LEN * 4];
+                let written = bitpacker.compress(&ints, &mut compressed, num_bits);
+                writer
+                    .write_all(&compressed[..written])
+                    .expect("write packed");
+            }
+        } else {
+            writer.write_all(&[0xFF]).expect("write marker");
+            for &v in &ints {
+                writer.write_all(&v.to_le_bytes()).expect("write val");
+            }
+        }
+    }
+
+    fn read<'a>(
+        &self,
+        slice: Box<dyn Slice + 'a>,
+        _term_index: TermIndex,
+        info: &TermBlockInformation,
+    ) -> Box<dyn Iterator<Item = ImpactValue> + Send + 'a> {
+        let mut buffer = Vec::new();
+        self.decode_block(slice.data(), info, &mut buffer);
+        Box::new(buffer.into_iter())
+    }
+
+    fn decode_into_bytes(
+        &self,
+        data: &[u8],
+        _term_index: TermIndex,
+        info: &TermBlockInformation,
+        buffer: &mut Vec<ImpactValue>,
+    ) {
+        self.decode_block(data, info, buffer);
+    }
+}
+
+impl BitPackedIntCompressor {
+    fn decode_block(
+        &self,
+        data: &[u8],
+        info: &TermBlockInformation,
+        buffer: &mut Vec<ImpactValue>,
+    ) {
+        buffer.clear();
+        let marker = data[0];
+
+        if marker != 0xFF && info.length == BLOCK_LEN {
+            let num_bits = marker;
+            let mut decompressed = [0u32; BLOCK_LEN];
+            if num_bits > 0 {
+                let bitpacker = BitPacker4x::new();
+                bitpacker.decompress(&data[1..], &mut decompressed, num_bits);
+            }
+            buffer.reserve(BLOCK_LEN);
+            for &v in &decompressed {
+                buffer.push(v as ImpactValue);
+            }
+        } else {
+            buffer.reserve(info.length);
+            for i in 0..info.length {
+                let offset = 1 + i * 4;
+                let v = u32::from_le_bytes([
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ]);
+                buffer.push(v as ImpactValue);
+            }
         }
     }
 }

@@ -25,8 +25,9 @@ use crate::{
     index::SparseIndexInformation,
     utils::buffer::{Buffer, MemoryBuffer, MmapBuffer, Slice},
 };
-use indicatif::ProgressIterator;
+use indicatif::{ProgressBar, ProgressIterator, ProgressStyle};
 use log::{debug, info};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 pub mod docid;
@@ -95,6 +96,47 @@ pub trait Compressor<T>: Sync + Send {
         term_index: TermIndex,
         info: &TermBlockInformation,
     ) -> Box<dyn Iterator<Item = T> + Send + 'a>;
+
+    /// Decode compressed values into a reusable buffer.
+    ///
+    /// The buffer is cleared and filled with decoded values.
+    /// Default implementation falls back to `read().collect()`.
+    fn decode_into(
+        &self,
+        slice: Box<dyn Slice + '_>,
+        term_index: TermIndex,
+        info: &TermBlockInformation,
+        buffer: &mut Vec<T>,
+    ) {
+        buffer.clear();
+        buffer.extend(self.read(slice, term_index, info));
+    }
+
+    /// Decode from a raw byte slice (zero-allocation fast path).
+    ///
+    /// Default implementation wraps bytes in a Slice and calls decode_into.
+    fn decode_into_bytes(
+        &self,
+        data: &[u8],
+        term_index: TermIndex,
+        info: &TermBlockInformation,
+        buffer: &mut Vec<T>,
+    ) {
+        // Default: wrap in a Slice and delegate
+        struct ByteSlice<'a>(&'a [u8]);
+        impl<'a> Slice for ByteSlice<'a> {
+            fn data(&self) -> &[u8] {
+                self.0
+            }
+            fn read(&mut self, index: usize, buf: &mut [u8]) -> std::io::Result<usize> {
+                let src = &self.0[index..];
+                let len = buf.len().min(src.len());
+                buf[..len].copy_from_slice(&src[..len]);
+                Ok(len)
+            }
+        }
+        self.decode_into(Box::new(ByteSlice(data)), term_index, info, buffer);
+    }
 }
 
 /// A serializable compressor for document IDs.
@@ -140,6 +182,271 @@ pub struct CompressedIndexInformation {
     values_compressor: Box<dyn ImpactCompressor>,
 }
 
+const COMPRESSED_INDEX_MAGIC: u32 = 0x49445832; // "IDX2"
+const COMPRESSED_INDEX_VERSION: u32 = 3;
+
+/// Write a u64 as variable-length integer (1-9 bytes).
+fn write_vint(writer: &mut dyn Write, mut v: u64) -> std::io::Result<()> {
+    while v >= 0x80 {
+        writer.write_all(&[(v as u8) | 0x80])?;
+        v >>= 7;
+    }
+    writer.write_all(&[v as u8])
+}
+
+/// Read a variable-length integer.
+fn read_vint(reader: &mut dyn std::io::Read) -> std::io::Result<u64> {
+    let mut result: u64 = 0;
+    let mut shift = 0;
+    loop {
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte)?;
+        result |= ((byte[0] & 0x7F) as u64) << shift;
+        if byte[0] & 0x80 == 0 {
+            return Ok(result);
+        }
+        shift += 7;
+    }
+}
+
+impl CompressedIndexInformation {
+    /// Write metadata in compact binary format.
+    ///
+    /// Format v2: per-block stores only byte lengths (not absolute positions).
+    /// Per-term stores stream starting offsets. Positions reconstructed at load
+    /// via prefix sum.
+    ///
+    /// Per-term:  20 bytes (num_blocks:u32, max_value:f32, max_doc_id:u64, length:u32)
+    /// Per-block: 24 bytes (docid_len:u32, impact_len:u32, length:u16, _pad:u16,
+    ///                       max_value:f32, min_doc_id:u64, max_doc_id:u64)
+    fn write_binary(&self, writer: &mut dyn Write) -> std::io::Result<()> {
+        use byteorder::{LittleEndian, WriteBytesExt};
+
+        // Header
+        writer.write_u32::<LittleEndian>(COMPRESSED_INDEX_MAGIC)?;
+        writer.write_u32::<LittleEndian>(COMPRESSED_INDEX_VERSION)?;
+        writer.write_u32::<LittleEndian>(self.terms.len() as u32)?;
+
+        // Compressor header (CBOR, small, only once)
+        let mut compressor_buf = Vec::new();
+        ciborium::ser::into_writer(
+            &(&self.doc_ids_compressor, &self.values_compressor),
+            &mut compressor_buf,
+        )
+        .expect("Failed to serialize compressors");
+        writer.write_u32::<LittleEndian>(compressor_buf.len() as u32)?;
+        writer.write_all(&compressor_buf)?;
+
+        for term in &self.terms {
+            // Term header
+            write_vint(writer, term.pages.len() as u64)?;
+            writer.write_f32::<LittleEndian>(term.max_value)?;
+            write_vint(writer, term.max_doc_id)?;
+            write_vint(writer, term.length as u64)?;
+
+            // Compute min block value for quantization range
+            let min_block_val = term
+                .pages
+                .iter()
+                .map(|b| b.max_value)
+                .fold(f32::INFINITY, f32::min);
+            writer.write_f32::<LittleEndian>(min_block_val)?;
+            // Quantization: block max_value encoded as 1 byte in [min_block_val, term.max_value]
+            let range = term.max_value - min_block_val;
+
+            // Block records: VInt + delta doc IDs + 1-byte quantized max_value
+            let mut prev_doc_id: u64 = 0;
+            for block in &term.pages {
+                let docid_len =
+                    (block.docid_position_range.1 - block.docid_position_range.0) as u64;
+                let impact_len =
+                    (block.impact_position_range.1 - block.impact_position_range.0) as u64;
+                write_vint(writer, docid_len)?;
+                write_vint(writer, impact_len)?;
+                write_vint(writer, block.length as u64)?;
+                // 1-byte quantized max_value (rounded UP for safe upper bound)
+                let q = if range > 0.0 {
+                    (((block.max_value - min_block_val) / range * 255.0).ceil() as u32).min(255)
+                        as u8
+                } else {
+                    255u8
+                };
+                writer.write_all(&[q])?;
+                // Delta-encode doc IDs
+                write_vint(writer, block.min_doc_id - prev_doc_id)?;
+                write_vint(writer, block.max_doc_id - block.min_doc_id)?;
+                prev_doc_id = block.max_doc_id;
+            }
+        }
+        Ok(())
+    }
+
+    /// Read metadata from compact binary format.
+    /// Reconstructs absolute byte positions via prefix sum.
+    fn read_binary(reader: &mut dyn std::io::Read) -> std::io::Result<Self> {
+        use byteorder::{LittleEndian, ReadBytesExt};
+
+        let magic = reader.read_u32::<LittleEndian>()?;
+        if magic != COMPRESSED_INDEX_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Not a compressed index binary file",
+            ));
+        }
+        let _version = reader.read_u32::<LittleEndian>()?;
+        let num_terms = reader.read_u32::<LittleEndian>()? as usize;
+
+        // Compressor header
+        let compressor_len = reader.read_u32::<LittleEndian>()? as usize;
+        let mut compressor_buf = vec![0u8; compressor_len];
+        reader.read_exact(&mut compressor_buf)?;
+        let (doc_ids_compressor, values_compressor): (
+            Box<dyn DocIdCompressor>,
+            Box<dyn ImpactCompressor>,
+        ) = ciborium::de::from_reader(&compressor_buf[..])
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+
+        // Read terms and blocks (VInt + delta encoded)
+        let mut terms = Vec::with_capacity(num_terms);
+        let mut docid_pos: u64 = 0;
+        let mut impact_pos: u64 = 0;
+
+        for _ in 0..num_terms {
+            let num_blocks = read_vint(reader)? as usize;
+            let max_value = reader.read_f32::<LittleEndian>()?;
+            let max_doc_id = read_vint(reader)?;
+            let length = read_vint(reader)? as usize;
+            let min_block_val = reader.read_f32::<LittleEndian>()?;
+            let range = max_value - min_block_val;
+
+            let mut pages = Vec::with_capacity(num_blocks);
+            let mut prev_doc_id: u64 = 0;
+            for _ in 0..num_blocks {
+                let docid_len = read_vint(reader)?;
+                let impact_len = read_vint(reader)?;
+                let block_length = read_vint(reader)? as usize;
+                // Dequantize 1-byte max_value
+                let mut q_byte = [0u8; 1];
+                reader.read_exact(&mut q_byte)?;
+                let block_max_value = min_block_val + (q_byte[0] as f32 / 255.0) * range;
+                let min_doc_id = prev_doc_id + read_vint(reader)?;
+                let block_max_doc_id = min_doc_id + read_vint(reader)?;
+                prev_doc_id = block_max_doc_id;
+
+                pages.push(TermBlockInformation {
+                    docid_position_range: (docid_pos, docid_pos + docid_len),
+                    impact_position_range: (impact_pos, impact_pos + impact_len),
+                    length: block_length,
+                    max_value: block_max_value,
+                    min_doc_id,
+                    max_doc_id: block_max_doc_id,
+                });
+
+                docid_pos += docid_len;
+                impact_pos += impact_len;
+            }
+
+            terms.push(TermBlocksInformation {
+                pages,
+                max_value,
+                max_doc_id,
+                length,
+            });
+        }
+
+        Ok(CompressedIndexInformation {
+            terms,
+            doc_ids_compressor,
+            values_compressor,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compress::docid::EliasFanoCompressor;
+    use crate::compress::impact::Identity;
+
+    #[test]
+    fn test_binary_metadata_roundtrip() {
+        let info = CompressedIndexInformation {
+            terms: vec![
+                TermBlocksInformation {
+                    pages: vec![
+                        TermBlockInformation {
+                            docid_position_range: (0, 100),
+                            impact_position_range: (0, 200),
+                            length: 128,
+                            max_value: 3.14,
+                            min_doc_id: 0,
+                            max_doc_id: 500,
+                        },
+                        TermBlockInformation {
+                            docid_position_range: (100, 180),
+                            impact_position_range: (200, 350),
+                            length: 64,
+                            max_value: 2.71,
+                            min_doc_id: 501,
+                            max_doc_id: 999,
+                        },
+                    ],
+                    max_value: 3.14,
+                    max_doc_id: 999,
+                    length: 192,
+                },
+                TermBlocksInformation {
+                    pages: vec![TermBlockInformation {
+                        docid_position_range: (180, 220),
+                        impact_position_range: (350, 400),
+                        length: 32,
+                        max_value: 1.0,
+                        min_doc_id: 10,
+                        max_doc_id: 800,
+                    }],
+                    max_value: 1.0,
+                    max_doc_id: 800,
+                    length: 32,
+                },
+            ],
+            doc_ids_compressor: Box::new(EliasFanoCompressor {}),
+            values_compressor: Box::new(Identity {}),
+        };
+
+        // Write
+        let mut buf = Vec::new();
+        info.write_binary(&mut buf).unwrap();
+
+        // Read back
+        let mut cursor = std::io::Cursor::new(&buf);
+        let loaded = CompressedIndexInformation::read_binary(&mut cursor).unwrap();
+
+        // Verify
+        assert_eq!(loaded.terms.len(), 2);
+        assert_eq!(loaded.terms[0].pages.len(), 2);
+        assert_eq!(loaded.terms[0].pages[0].length, 128);
+        assert_eq!(loaded.terms[0].pages[0].docid_position_range, (0, 100));
+        assert_eq!(loaded.terms[0].pages[0].impact_position_range, (0, 200));
+        assert!((loaded.terms[0].pages[0].max_value - 3.14).abs() < 1e-5);
+        assert_eq!(loaded.terms[0].pages[0].min_doc_id, 0);
+        assert_eq!(loaded.terms[0].pages[0].max_doc_id, 500);
+
+        // Second block of first term
+        assert_eq!(loaded.terms[0].pages[1].docid_position_range, (100, 180));
+        assert_eq!(loaded.terms[0].pages[1].impact_position_range, (200, 350));
+
+        // Second term
+        assert_eq!(loaded.terms[1].pages[0].docid_position_range, (180, 220));
+        assert_eq!(loaded.terms[1].pages[0].impact_position_range, (350, 400));
+
+        // Size check: should be much smaller than CBOR
+        eprintln!(
+            "Binary metadata size: {} bytes (2 terms, 3 blocks)",
+            buf.len()
+        );
+    }
+}
+
 pub struct CompressedIndex {
     information: CompressedIndexInformation,
 
@@ -160,13 +467,17 @@ pub struct CompressedIndexIterator<'a> {
     /// Current info
     info: Option<&'a TermBlockInformation>,
 
-    /// Current iterator on document IDs
-    docid_iterator: Option<Box<dyn Iterator<Item = DocId> + Send + 'a>>,
+    /// Reusable buffer for decoded doc IDs
+    docids: Vec<DocId>,
 
-    /// Current iterator on impacts
-    impact_iterator: Option<Box<dyn Iterator<Item = ImpactValue> + Send + 'a>>,
+    /// Reusable buffer for decoded impact values
+    impacts: Vec<ImpactValue>,
 
+    /// Current position within the decoded arrays
     index: usize,
+
+    /// Whether the current block has been decoded
+    block_loaded: bool,
 
     // Term index (for reference)
     term_index: TermIndex,
@@ -186,29 +497,20 @@ impl<'a> CompressedIndexIterator<'a> {
         let info = iter.next();
 
         Self {
-            // The index
             sparse_index: &index,
-
-            // Iterator over term index page information
             info_iter: iter,
-
-            // Current term index page information
             info: info,
-
-            // Current docid/impact iterators
-            docid_iterator: None,
-            impact_iterator: None,
-
-            // The current impact index
+            docids: Vec::with_capacity(128),
+            impacts: Vec::with_capacity(128),
             index: 0,
-
-            // Just for information purpose
+            block_loaded: false,
             term_index: term_index,
         }
     }
 
     /// Move the iterator to the first block where a document of
-    /// at least `min_doc_id` is present
+    /// at least `min_doc_id` is present.
+    /// Does NOT decode the block — that happens lazily.
     fn move_iterator(&mut self, min_doc_id: DocId) -> bool {
         // Loop until the condition is met
         while let Some(info) = self.info {
@@ -232,80 +534,111 @@ impl<'a> CompressedIndexIterator<'a> {
         false
     }
 
-    /// Initialize the iterators for a given block
-    fn read_block(&mut self, info: &TermBlockInformation) {
-        let slice = self.sparse_index.docid_buffer.slice(
-            info.docid_position_range.0 as usize,
-            info.docid_position_range.1 as usize,
-        );
-        let docid_iterator =
-            self.sparse_index
-                .information
-                .doc_ids_compressor
-                .read(slice, self.term_index, info);
-        self.docid_iterator = Some(docid_iterator);
+    /// Decode the current block into reusable buffers.
+    ///
+    /// Fast path: if the buffer supports direct byte access (in-memory),
+    /// pass raw &[u8] slices to avoid Box<dyn Slice> heap allocations.
+    fn decode_block(&mut self) {
+        if let Some(info) = self.info {
+            // Try fast path: direct byte access (no Box allocation)
+            let docid_bytes = self.sparse_index.docid_buffer.as_bytes();
+            let impact_bytes = self.sparse_index.impact_buffer.as_bytes();
 
-        let slice = self.sparse_index.impact_buffer.slice(
-            info.impact_position_range.0 as usize,
-            info.impact_position_range.1 as usize,
-        );
-        let value_iterator =
-            self.sparse_index
-                .information
-                .values_compressor
-                .read(slice, self.term_index, info);
-        self.impact_iterator = Some(value_iterator);
+            if let (Some(db), Some(ib)) = (docid_bytes, impact_bytes) {
+                let docid_slice =
+                    &db[info.docid_position_range.0 as usize..info.docid_position_range.1 as usize];
+                self.sparse_index
+                    .information
+                    .doc_ids_compressor
+                    .decode_into_bytes(docid_slice, self.term_index, info, &mut self.docids);
+
+                let impact_slice = &ib
+                    [info.impact_position_range.0 as usize..info.impact_position_range.1 as usize];
+                self.sparse_index
+                    .information
+                    .values_compressor
+                    .decode_into_bytes(impact_slice, self.term_index, info, &mut self.impacts);
+            } else {
+                // Fallback: Box<dyn Slice> path
+                let slice = self.sparse_index.docid_buffer.slice(
+                    info.docid_position_range.0 as usize,
+                    info.docid_position_range.1 as usize,
+                );
+                self.sparse_index
+                    .information
+                    .doc_ids_compressor
+                    .decode_into(slice, self.term_index, info, &mut self.docids);
+
+                let slice = self.sparse_index.impact_buffer.slice(
+                    info.impact_position_range.0 as usize,
+                    info.impact_position_range.1 as usize,
+                );
+                self.sparse_index.information.values_compressor.decode_into(
+                    slice,
+                    self.term_index,
+                    info,
+                    &mut self.impacts,
+                );
+            }
+
+            self.index = 0;
+            self.block_loaded = true;
+        }
     }
 
-    /// Moves to the next block
+    /// Ensure the current block is decoded
+    #[inline]
+    fn ensure_block_loaded(&mut self) {
+        if !self.block_loaded && self.info.is_some() {
+            self.decode_block();
+        }
+    }
+
+    /// Binary search for first doc >= min_doc_id from current position
+    #[inline]
+    fn find_geq(&self, min_doc_id: DocId) -> Option<usize> {
+        let search_slice = &self.docids[self.index..];
+        let pos = search_slice.partition_point(|&d| d < min_doc_id);
+        if pos < search_slice.len() {
+            Some(self.index + pos)
+        } else {
+            None
+        }
+    }
+
+    /// Moves to the next block (invalidates decoded data without deallocating)
     fn next_block(&mut self) {
         self.info = self.info_iter.next();
-        self.docid_iterator = None;
-        self.impact_iterator = None;
+        // Clear but keep capacity for reuse — no allocation on next decode
+        self.docids.clear();
+        self.impacts.clear();
         self.index = 0;
+        self.block_loaded = false;
     }
 }
 
 impl<'a> Iterator for CompressedIndexIterator<'a> {
     type Item = TermImpact;
 
-    /// Iterate to the next doc id
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(info) = self.info {
-            // We are over, load the next block
-            if self.index >= info.length {
-                self.next_block();
-            }
-            if self.info.is_none() {
-                debug!("[{}] EOF for blocks", self.term_index);
-            }
+        // Move to next block if current is exhausted
+        if self.block_loaded && self.index >= self.docids.len() {
+            self.next_block();
         }
 
-        if let Some(info) = self.info {
-            if self.docid_iterator.is_none() {
-                self.read_block(info);
-                debug!("[{}] Loaded block data: {}", self.term_index, info);
-            }
+        if self.info.is_none() {
+            return None;
+        }
 
-            if let Some(docid) = self
-                .docid_iterator
-                .as_deref_mut()
-                .expect("Iterator is over, but shouldn't be")
-                .next()
-            {
-                let value = self
-                    .impact_iterator
-                    .as_deref_mut()
-                    .expect("Impact iterator is over... but not the doc ID one")
-                    .next()
-                    .expect("");
-                Some(TermImpact {
-                    docid: docid,
-                    value: value,
-                })
-            } else {
-                None
-            }
+        self.ensure_block_loaded();
+
+        if self.index < self.docids.len() {
+            let impact = TermImpact {
+                docid: self.docids[self.index],
+                value: self.impacts[self.index],
+            };
+            self.index += 1;
+            Some(impact)
         } else {
             None
         }
@@ -372,13 +705,9 @@ impl<'a> BlockTermImpactIterator for CompressedBlockTermImpactIterator<'a> {
         }
     }
 
-    /// Returns the current document ID
+    /// Returns the current posting using binary search within the decoded block.
     fn current(&self) -> TermImpact {
         let min_docid = self.current_min_docid.expect("Should not be null");
-        {
-            let iterator = self.iterator.borrow();
-            debug!("[{}] Searching for next {}", iterator.term_index, min_docid);
-        }
 
         let mut current_value = self.current_value.borrow_mut();
 
@@ -388,42 +717,17 @@ impl<'a> BlockTermImpactIterator for CompressedBlockTermImpactIterator<'a> {
             .unwrap()
         {
             let mut iterator = self.iterator.borrow_mut();
-            debug!(
-                "[{}] Current DOC ID value is {}",
-                iterator.term_index,
-                if let Some(cv) = current_value.as_ref() {
-                    cv.docid as i64
-                } else {
-                    -1
-                },
-            );
+            iterator.ensure_block_loaded();
 
-            *current_value = None;
-            while let Some(v) = iterator.next() {
-                if v.docid >= min_docid {
-                    debug!(
-                        "[{}] Returning {} ({})",
-                        iterator.term_index, v.docid, v.value
-                    );
-
-                    *current_value = Some(v);
-                    break;
-                }
-                debug!(
-                    "[{}] Skipping {} ({}) / {}",
-                    iterator.term_index, v.docid, v.value, min_docid
-                );
+            if let Some(pos) = iterator.find_geq(min_docid) {
+                *current_value = Some(TermImpact {
+                    docid: iterator.docids[pos],
+                    value: iterator.impacts[pos],
+                });
+                iterator.index = pos + 1;
+            } else {
+                panic!("Did not find current impact for min_docid={}", min_docid);
             }
-
-            assert!(current_value.is_some(), "Did not find current impact");
-        } else {
-            let iterator = self.iterator.borrow();
-            debug!(
-                "[{}] Current value was good {} >= {}",
-                iterator.term_index,
-                current_value.expect("").docid,
-                min_docid
-            );
         }
 
         return current_value.expect("No current value");
@@ -509,146 +813,204 @@ pub struct CompressionTransform {
     pub impacts_compressor_factory: Box<dyn ImpactCompressorFactory>,
 }
 
+/// Result of compressing one term's posting list in parallel.
+struct CompressedTermResult {
+    info: TermBlocksInformation,
+    docid_bytes: Vec<u8>,
+    impact_bytes: Vec<u8>,
+}
+
+/// Chunk size for parallel compression (number of terms per batch).
+const COMPRESSION_CHUNK_SIZE: usize = 10_000;
+
 impl IndexTransform for CompressionTransform {
-    /// Compress the impact values
+    /// Compress the impact values using chunked parallel processing.
     ///
-    /// # Arguments
-    ///
+    /// Terms are processed in chunks to limit memory usage: each chunk is
+    /// compressed in parallel with rayon, written to disk, then freed.
     fn process(&self, path: &Path, index: &dyn SparseIndexView) -> Result<(), std::io::Error> {
+        use std::io::BufWriter;
+
         // Create the directory if needed
         if !path.is_dir() {
             info!("Creating path {}", path.display());
             create_dir(path)?;
         }
 
-        // File for impact values
-        let mut impact_writer = File::options()
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(path.join("impacts.dat"))
-            .expect("Could not create the values file");
+        let doc_ids_compressor = self.doc_ids_compressor_factory.create(index);
+        let values_compressor = self.impacts_compressor_factory.create(index);
+        let max_block_size = self.max_block_size;
 
-        // File for document IDs
-        let mut docid_writer = File::options()
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(path.join("docids.dat"))
-            .expect("Could not create the document IDs file");
+        let pb = ProgressBar::new(index.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})",
+                )
+                .progress_chars("=> "),
+        );
 
-        // Global information
-        let mut index_loader = CompressedIndexLoader {
-            information: CompressedIndexInformation {
-                terms: Vec::new(),
-                doc_ids_compressor: self.doc_ids_compressor_factory.create(index),
-                values_compressor: self.impacts_compressor_factory.create(index),
-            },
-        };
+        let mut impact_writer = BufWriter::new(
+            File::options()
+                .write(true)
+                .truncate(true)
+                .create(true)
+                .open(path.join("impacts.dat"))
+                .expect("Could not create the values file"),
+        );
 
-        let mut impact_position = 0;
-        let mut docid_position = 0;
+        let mut docid_writer = BufWriter::new(
+            File::options()
+                .write(true)
+                .truncate(true)
+                .create(true)
+                .open(path.join("docids.dat"))
+                .expect("Could not create the document IDs file"),
+        );
 
-        // Iterate over terms
-        for term_index in (0..index.len()).progress() {
-            // Read everything
-            let mut it = index.iterator(term_index);
-            let mut flag = true;
+        let mut terms_info = Vec::with_capacity(index.len());
+        let mut docid_offset: u64 = 0;
+        let mut impact_offset: u64 = 0;
 
-            let mut term_information = TermBlocksInformation {
-                pages: Vec::new(),
-                max_value: 0f32,
-                max_doc_id: 0,
-                length: 0,
-            };
+        // Process terms in chunks to limit memory usage
+        for chunk_start in (0..index.len()).step_by(COMPRESSION_CHUNK_SIZE) {
+            let chunk_end = (chunk_start + COMPRESSION_CHUNK_SIZE).min(index.len());
 
-            let mut max_doc_id = 0;
+            // Compress this chunk in parallel
+            let chunk_results: Vec<CompressedTermResult> = (chunk_start..chunk_end)
+                .into_par_iter()
+                .map(|term_index| {
+                    let mut docid_buf: Vec<u8> = Vec::new();
+                    let mut impact_buf: Vec<u8> = Vec::new();
 
-            while flag {
-                // Read up to max_block_size records
-                let mut impacts = Vec::new();
-                let mut docids = Vec::<DocId>::new();
-                flag = false;
+                    let mut it = index.iterator(term_index);
+                    let mut flag = true;
+                    let mut term_information = TermBlocksInformation {
+                        pages: Vec::new(),
+                        max_value: 0f32,
+                        max_doc_id: 0,
+                        length: 0,
+                    };
+                    let mut max_doc_id = 0;
+                    let mut docid_position: u64 = 0;
+                    let mut impact_position: u64 = 0;
 
-                let mut min_doc_id: DocId = DocId::MAX;
+                    while flag {
+                        let mut impacts = Vec::new();
+                        let mut docids = Vec::<DocId>::new();
+                        flag = false;
+                        let mut min_doc_id: DocId = DocId::MAX;
 
-                while let Some(ti) = it.next() {
-                    if min_doc_id == DocId::MAX {
-                        min_doc_id = ti.docid;
+                        while let Some(ti) = it.next() {
+                            if min_doc_id == DocId::MAX {
+                                min_doc_id = ti.docid;
+                            }
+                            assert!(
+                                (ti.docid > max_doc_id) || (max_doc_id == 0),
+                                "{} is not greater than {}",
+                                ti.docid,
+                                max_doc_id
+                            );
+                            max_doc_id = ti.docid;
+                            docids.push(ti.docid);
+                            impacts.push(ti.value);
+                            if docids.len() == max_block_size {
+                                flag = true;
+                                break;
+                            }
+                        }
+
+                        if docids.is_empty() {
+                            break;
+                        }
+
+                        let mut block_info = TermBlockInformation {
+                            docid_position_range: (docid_position, 0),
+                            impact_position_range: (impact_position, 0),
+                            length: impacts.len(),
+                            max_value: impacts.iter().fold(0f32, |cur, x| cur.max(*x)),
+                            min_doc_id,
+                            max_doc_id,
+                        };
+
+                        assert!(max_doc_id >= min_doc_id);
+
+                        doc_ids_compressor.write(&mut docid_buf, &docids, term_index, &block_info);
+                        values_compressor.write(&mut impact_buf, &impacts, term_index, &block_info);
+
+                        docid_position = docid_buf.len() as u64;
+                        block_info.docid_position_range.1 = docid_position;
+
+                        impact_position = impact_buf.len() as u64;
+                        block_info.impact_position_range.1 = impact_position;
+
+                        term_information.max_value =
+                            term_information.max_value.max(block_info.max_value);
+                        term_information.max_doc_id =
+                            term_information.max_doc_id.max(block_info.max_doc_id);
+                        term_information.length += block_info.length;
+                        term_information.pages.push(block_info);
                     }
-                    assert!(
-                        (ti.docid > max_doc_id) || (max_doc_id == 0),
-                        "{} is not greater than {}",
-                        ti.docid,
-                        max_doc_id
-                    );
-                    max_doc_id = ti.docid;
 
-                    docids.push(ti.docid);
-                    impacts.push(ti.value);
-                    if docids.len() == self.max_block_size {
-                        flag = true;
-                        break;
+                    pb.inc(1);
+
+                    CompressedTermResult {
+                        info: term_information,
+                        docid_bytes: docid_buf,
+                        impact_bytes: impact_buf,
                     }
+                })
+                .collect();
+
+            // Write this chunk sequentially, fixing up byte positions
+            for mut result in chunk_results {
+                for page in result.info.pages.iter_mut() {
+                    page.docid_position_range.0 += docid_offset;
+                    page.docid_position_range.1 += docid_offset;
+                    page.impact_position_range.0 += impact_offset;
+                    page.impact_position_range.1 += impact_offset;
                 }
 
-                // Stop if no more IDs
-                if docids.len() == 0 {
-                    break;
-                }
+                docid_writer.write_all(&result.docid_bytes)?;
+                impact_writer.write_all(&result.impact_bytes)?;
 
-                let mut block_term_information = TermBlockInformation {
-                    docid_position_range: (docid_position, 0),
-                    impact_position_range: (impact_position, 0),
-                    length: impacts.len(),
-                    max_value: impacts.iter().fold(0f32, |cur, x| cur.max(*x)),
-                    min_doc_id: min_doc_id,
-                    max_doc_id: max_doc_id,
-                };
+                docid_offset += result.docid_bytes.len() as u64;
+                impact_offset += result.impact_bytes.len() as u64;
 
-                // Write
-                assert!(
-                    max_doc_id >= min_doc_id,
-                    "Maximum doc id ({}) should be greater than minimum ({})",
-                    max_doc_id,
-                    min_doc_id
-                );
-                index_loader.information.doc_ids_compressor.write(
-                    &mut docid_writer,
-                    &docids,
-                    term_index,
-                    &block_term_information,
-                );
-                index_loader.information.values_compressor.write(
-                    &mut impact_writer,
-                    &impacts,
-                    term_index,
-                    &block_term_information,
-                );
-
-                // Sets the end of the byte streams
-                docid_position = docid_writer.stream_position()?;
-                block_term_information.docid_position_range.1 = docid_position;
-
-                impact_position = impact_writer.stream_position()?;
-                block_term_information.impact_position_range.1 = impact_position;
-
-                // Update global term statistics
-                term_information.max_value = term_information
-                    .max_value
-                    .max(block_term_information.max_value);
-                term_information.max_doc_id = term_information
-                    .max_doc_id
-                    .max(block_term_information.max_doc_id);
-                term_information.length += block_term_information.length;
-                term_information.pages.push(block_term_information);
+                terms_info.push(result.info);
             }
-
-            index_loader.information.terms.push(term_information);
         }
 
-        // Serialize the overall structure
-        save_index(Box::new(index_loader), path)
+        pb.finish();
+
+        let information = CompressedIndexInformation {
+            terms: terms_info,
+            doc_ids_compressor,
+            values_compressor,
+        };
+
+        // Write compact binary metadata
+        let meta_path = path.join("index.bin");
+        eprintln!("Writing binary metadata to {}...", meta_path.display());
+        let meta_file = std::io::BufWriter::new(
+            File::options()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&meta_path)?,
+        );
+        information.write_binary(&mut std::io::BufWriter::new(meta_file))?;
+
+        // Write a minimal CBOR stub (just type tag + compressors, no term data)
+        // so load_index dispatches to CompressedIndexLoader which reads index.bin
+        let stub = CompressedIndexLoader {
+            information: CompressedIndexInformation {
+                terms: Vec::new(),
+                doc_ids_compressor: information.doc_ids_compressor,
+                values_compressor: information.values_compressor,
+            },
+        };
+        save_index(Box::new(stub), path)
     }
 }
 
@@ -659,13 +1021,23 @@ struct CompressedIndexLoader {
 
 #[typetag::serde]
 impl IndexLoader for CompressedIndexLoader {
-    /// Loads a block-based index
+    /// Loads a block-based index. Prefers binary metadata (index.bin) if available.
     fn into_index(self: Box<Self>, path: &Path, in_memory: bool) -> Box<dyn SparseIndex> {
-        // No load the view
-        let docid_path = path.join(format!("docids.dat"));
-        let impact_path = path.join(format!("impacts.dat"));
+        // Try loading binary metadata (compact), fall back to CBOR (from self)
+        let bin_path = path.join("index.bin");
+        let information = if bin_path.exists() {
+            let mut reader =
+                std::io::BufReader::new(File::open(&bin_path).expect("Failed to open index.bin"));
+            CompressedIndexInformation::read_binary(&mut reader)
+                .expect("Failed to read binary metadata")
+        } else {
+            self.information
+        };
+
+        let docid_path = path.join("docids.dat");
+        let impact_path = path.join("impacts.dat");
         Box::new(CompressedIndex {
-            information: self.information,
+            information,
             docid_buffer: if in_memory {
                 Box::new(MemoryBuffer::new(&docid_path))
             } else {

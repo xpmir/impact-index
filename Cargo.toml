@@ -1,6 +1,6 @@
 [package]
 name = "impact-index"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 authors = ["Benjamin Piwowarski <benjamin@piwowarski.fr>"]
 license = "GPL-2.0-or-later"
@@ -29,6 +29,10 @@ required-features = ["stub-gen"]
 [[bench]]
 name = "sparse"
 harness = false
+
+[[bin]]
+name = "profile_search"
+path = "src/bin/profile_search.rs"
 
 # [[bench.dependencies.helpers]]
 # path = "libs/helpers"
@@ -75,7 +79,10 @@ zstd = "0.13"
 serde_json = "1.0.120"
 bmp = { path = "BMP" }
 half = { version = "2", features = ["serde", "bytemuck"] }
+rayon = "1"
+bitpacking = "0.9"
 rust-stemmers = "1.2"
+unicode-segmentation = "1.12"
 protobuf = "^2.27"
 # FST for term map (same as BMP uses)
 fst = "0.4.7"

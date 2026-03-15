@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use ndarray::Array1;
+use rayon::prelude::*;
 
 use crate::base::{BoxResult, DocId, PostingValue, TermIndex};
 use crate::builder::{BuilderOptions, Indexer, SparseBuilderIndex};
@@ -42,6 +43,16 @@ impl<V: PostingValue> BOWIndexBuilder<V> {
             analyzer: Some(analyzer),
             folder: folder.to_path_buf(),
         }
+    }
+
+    /// Get the index directory path.
+    pub fn folder(&self) -> &Path {
+        &self.folder
+    }
+
+    /// Get a mutable reference to the analyzer (if present).
+    pub fn analyzer_mut(&mut self) -> Option<&mut TextAnalyzer> {
+        self.analyzer.as_mut()
     }
 
     /// Returns the document ID from the last checkpoint, or `None`.
@@ -108,6 +119,65 @@ impl<V: PostingValue> BOWIndexBuilder<V> {
 
         self.indexer.add(docid, &terms_array, &values_array)?;
         Ok(doc_length)
+    }
+
+    /// Add a batch of (docid, text) pairs with parallel text analysis.
+    ///
+    /// Tokenization and stemming are done in parallel using rayon. Vocabulary
+    /// growth and index insertion remain sequential (they require mutable state).
+    /// This is useful when called from Python where individual `add_text` calls
+    /// are GIL-bound.
+    ///
+    /// Documents must be sorted by ascending docid within the batch.
+    pub fn add_texts_batch(&mut self, documents: &[(DocId, &str)]) -> Result<(), std::io::Error> {
+        let analyzer = self
+            .analyzer
+            .as_ref()
+            .expect("add_texts_batch requires a TextAnalyzer");
+
+        // Phase 1: Parallel tokenization + stemming (read-only on analyzer)
+        // We tokenize and stem but don't insert into vocabulary yet.
+        // Each result is (docid, Vec<(stemmed_token, tf)>)
+        let analyzed: Vec<(DocId, Vec<(String, f32)>)> = documents
+            .par_iter()
+            .map(|&(docid, text)| {
+                let tokens = analyzer.tokenize_and_stem(text);
+                (docid, tokens)
+            })
+            .collect();
+
+        // Phase 2: Sequential vocabulary insertion + index building
+        let analyzer = self.analyzer.as_mut().unwrap();
+        for (docid, tokens) in analyzed {
+            let mut term_indices = Vec::with_capacity(tokens.len());
+            let mut tf_values = Vec::with_capacity(tokens.len());
+            let mut doc_length: u32 = 0;
+
+            for (stemmed, tf) in &tokens {
+                let idx = analyzer.vocab_mut().get_or_insert(stemmed);
+                term_indices.push(idx);
+                tf_values.push(*tf);
+                doc_length += *tf as u32;
+            }
+
+            // Record doc length
+            let didx = docid as usize;
+            if didx >= self.doc_lengths.len() {
+                self.doc_lengths.resize(didx + 1, 0);
+            }
+            self.doc_lengths[didx] = doc_length;
+
+            // Add to indexer
+            let terms_array = Array1::from_vec(term_indices);
+            let values_v: Vec<V> = tf_values
+                .iter()
+                .map(|&v| convert_f32_to_v::<V>(v))
+                .collect();
+            let values_array = Array1::from_vec(values_v);
+            self.indexer.add(docid, &terms_array, &values_array)?;
+        }
+
+        Ok(())
     }
 
     /// Analyze a query text using the builder's analyzer.

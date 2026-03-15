@@ -49,6 +49,12 @@ impl Slice for MemorySlice<'_> {
 
 pub trait Buffer: Send + Sync {
     fn slice(&'_ self, start: usize, end: usize) -> Box<dyn Slice + '_>;
+
+    /// Direct access to the underlying byte buffer (if available).
+    /// Returns None for memory-mapped buffers that don't hold contiguous data.
+    fn as_bytes(&self) -> Option<&[u8]> {
+        None
+    }
 }
 
 /// Stores the data in memory
@@ -76,6 +82,10 @@ impl Buffer for MemoryBuffer {
         Box::new(MemorySlice {
             _data: &self.data[start..end],
         })
+    }
+
+    fn as_bytes(&self) -> Option<&[u8]> {
+        Some(&self.data)
     }
 }
 
