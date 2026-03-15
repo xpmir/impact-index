@@ -61,12 +61,14 @@ builder.add_text(0, "the quick brown fox jumps over the lazy dog")
 builder.add_text(1, "a quick brown cat jumps high")
 builder.add_text(2, "the lazy dog sleeps all day")
 
-# Build and score with BM25
-query = builder.analyze_query("quick fox")
-index, doc_meta = builder.build(in_memory=True)
-scored = index.with_scoring(impact_index.BM25Scoring(k1=0.9, b=0.4), doc_meta)
+# Build index (doc metadata and analyzer saved automatically)
+index = builder.build(in_memory=True)
 
-# Search with MaxScore (fastest)
+# BM25 scoring (doc lengths loaded automatically from index)
+scored = index.with_scoring(impact_index.BM25Scoring(k1=0.9, b=0.4))
+
+# Query analysis (analyzer loaded automatically from index)
+query = index.analyzer().analyze_query("quick fox")
 results = scored.search_maxscore(query, top_k=10)
 for doc in results:
     print(f"Document {doc.docid}: {doc.score:.4f}")
@@ -77,17 +79,17 @@ for doc in results:
 Compress for smaller index size and block-max pruning:
 
 ```python
-# One-liner: SIMD bitpacking + 8-bit quantization, block_size=128
+# Compress (standalone — includes vocab, docmeta, analyzer)
 compressed = index.compress("/path/to/compressed")
 
 # Search the compressed index (same API)
-scored = compressed.with_scoring(impact_index.BM25Scoring(), doc_meta)
+scored = compressed.with_scoring(impact_index.BM25Scoring())
 results = scored.search_maxscore(query, top_k=10)
 ```
 
-The default settings (`block_size=128`, `nbits=8`) are optimized:
-- **block_size=128** aligns with SIMD registers (BitPacker4x) and enables effective block-max pruning
-- **nbits=8** uses a fast path with direct byte reads (no bit-level overhead). `nbits=16` also has a fast path via direct `u16` reads
+The default settings (`block_size=128`, `nbits=0`) are optimized:
+- **block_size=128** aligns with SIMD registers and enables block-max pruning
+- **nbits=0** lossless integer bitpacking for TF counts (~2-3 bits/value). Use `nbits=8` for neural IR with float impacts
 
 ## Neural IR (Impact Scores)
 

@@ -145,18 +145,15 @@ If you already have term indices and term-frequency values:
     builder.add(1, np.array([2, 5, 8], dtype=np.uintp),
                 np.array([1, 4, 1], dtype=np.int32))
 
-    # Build returns (Index, DocMetadata)
-    index, doc_meta = builder.build(in_memory=True)
+    # Build returns searchable Index (doc metadata stored automatically)
+    index = builder.build(in_memory=True)
 
-    # Create a BM25-scored index
-    scored = index.with_scoring(
-        impact_index.BM25Scoring(k1=1.2, b=0.75),
-        doc_meta,
-    )
+    # Create a BM25-scored index (doc lengths loaded automatically)
+    scored = index.with_scoring(impact_index.BM25Scoring(k1=1.2, b=0.75))
 
-    # Search with standard algorithms — query weights are boost factors
+    # Search with MaxScore (fastest algorithm)
     query = {0: 1.0, 5: 1.0}
-    results = scored.search_wand(query, top_k=10)
+    results = scored.search_maxscore(query, top_k=10)
     for doc in results:
         print(f"Document {doc.docid}: {doc.score}")
 
@@ -173,21 +170,23 @@ vocabulary management:
     builder = impact_index.BOWIndexBuilder(
         "/path/to/index",
         dtype="int32",
-        stemmer="snowball",
-        language="english",
+        stemmer="porter",  # Lucene-compatible Porter stemmer
+        stop_words=True,   # Lucene default English stop words
     )
 
     builder.add_text(0, "the quick brown fox jumps over the lazy dog")
     builder.add_text(1, "a quick brown cat jumps high")
     builder.add_text(2, "the lazy dog sleeps all day")
 
-    # Analyze query (does NOT grow vocabulary — unknown terms are skipped)
-    query = builder.analyze_query("quick fox")
+    # Build index (doc metadata and analyzer config saved automatically)
+    index = builder.build(in_memory=True)
 
-    index, doc_meta = builder.build(in_memory=True)
+    # BM25 scoring (doc lengths loaded automatically from index)
+    scored = index.with_scoring(impact_index.BM25Scoring())
 
-    scored = index.with_scoring(impact_index.BM25Scoring(), doc_meta)
-    results = scored.search_wand(query, top_k=10)
+    # Query analysis (analyzer loaded automatically from index)
+    query = index.analyzer().analyze_query("quick fox")
+    results = scored.search_maxscore(query, top_k=10)
 
 Stop words
 ~~~~~~~~~~
@@ -230,27 +229,23 @@ russian, spanish, swedish, turkish.
     Without them, high-frequency terms like "the" create very long
     posting lists that slow down search significantly.
 
-Loading document metadata separately
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Loading a saved index
+~~~~~~~~~~~~~~~~~~~~~
 
-If you have already built an index and saved document metadata, you can
-load it later:
+The index automatically detects and loads auxiliary components
+(doc metadata, analyzer config, vocabulary) from the directory:
 
 .. code-block:: python
 
     import impact_index
 
     index = impact_index.Index.load("/path/to/index", in_memory=True)
-    doc_meta = impact_index.DocMetadata.load("/path/to/index")
 
-    scored = index.with_scoring(impact_index.BM25Scoring(), doc_meta)
-
-When applying transforms (compression, splitting) that write to a new
-directory, copy the document metadata files using:
-
-.. code-block:: python
-
-    impact_index.DocMetadata.copy_files("/path/to/source", "/path/to/target")
+    # Doc metadata and analyzer are loaded automatically
+    scored = index.with_scoring(impact_index.BM25Scoring())
+    analyzer = index.analyzer()
+    query = analyzer.analyze_query("quick fox")
+    results = scored.search_maxscore(query, top_k=10)
 
 
 .. _compression:
@@ -258,9 +253,8 @@ directory, copy the document metadata files using:
 Compression and Transforms
 --------------------------
 
-Compressed indices use SIMD bitpacking for doc IDs and quantization for
-impact values, with 128-posting blocks that enable block-max pruning
-during search.
+Compressed indices use PFOR-delta for doc IDs and adaptive bitpacking
+for values, with 128-posting blocks that enable block-max pruning.
 
 Quick compression
 ~~~~~~~~~~~~~~~~~
@@ -273,22 +267,26 @@ The simplest way to compress an index:
 
     index = impact_index.Index.load("/path/to/raw_index", in_memory=True)
 
-    # Compress with defaults (block_size=128, nbits=8)
+    # Compress with defaults (PFOR doc IDs, lossless integer TF, block_size=128)
     compressed = index.compress("/path/to/compressed")
 
-    # Or with custom settings
-    compressed = index.compress("/path/to/compressed", block_size=128, nbits=16)
+    # The compressed index is standalone — includes vocab, docmeta, analyzer
+    scored = compressed.with_scoring(impact_index.BM25Scoring())
 
-This uses SIMD bitpacking (BitPacker4x) for doc IDs and global
-quantization for impact values. The compressed index is returned
-ready for searching.
+    # For neural IR with float impacts, use quantization:
+    compressed = index.compress("/path/to/compressed", nbits=8)
 
-The default settings are optimized for performance:
+The compressed index is fully standalone: auxiliary files (vocabulary,
+analyzer config, document metadata) are automatically copied from the
+source index.
+
+The default settings are optimized for BM25:
 
 - **block_size=128**: aligns with SIMD registers and enables effective
   block-max pruning during search.
-- **nbits=8**: uses a fast path with direct byte reads (no bit-level
-  overhead). ``nbits=16`` also has a fast path via ``u16`` reads.
+- **nbits=0** (default): lossless integer bitpacking for TF counts
+  (~2-3 bits per value). Use ``nbits=8`` or ``nbits=16`` for quantized
+  float compression (neural IR like SPLADE).
 
 Advanced compression
 ~~~~~~~~~~~~~~~~~~~~
