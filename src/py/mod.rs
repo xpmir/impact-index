@@ -352,7 +352,7 @@ impl PySparseIndex {
             Box::new(compress::impact::BitPackedIntCompressor {})
         } else {
             // Quantized float compression
-            Box::new(compress::impact::GlobalQuantizerFactory { nbits })
+            Box::new(compress::impact::QuantizedBitPackedFactory { nbits })
         };
         let transform = CompressionTransform {
             max_block_size: block_size,
@@ -734,6 +734,29 @@ impl PyBitPackedIntCompressor {
             PyBitPackedIntCompressor {},
             PyImpactCompressorFactory {
                 inner: Arc::new(Box::new(compress::impact::BitPackedIntCompressor {})),
+            },
+        )
+    }
+}
+
+/// Quantized + adaptive bitpacked compressor for neural IR (SPLADE).
+///
+/// Quantizes float impacts to N-bit integers, then compresses with
+/// adaptive SIMD bitpacking (~3-4 bits/value instead of fixed N bits).
+#[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
+#[pyclass(name="QuantizedBitPackedCompressor", extends=PyImpactCompressorFactory)]
+pub struct PyQuantizedBitPackedCompressor {}
+
+#[pymethods]
+impl PyQuantizedBitPackedCompressor {
+    #[new]
+    fn new(nbits: u32) -> (Self, PyImpactCompressorFactory) {
+        (
+            PyQuantizedBitPackedCompressor {},
+            PyImpactCompressorFactory {
+                inner: Arc::new(Box::new(compress::impact::QuantizedBitPackedFactory {
+                    nbits,
+                })),
             },
         )
     }
@@ -1640,6 +1663,7 @@ fn impact_index(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyImpactQuantizer>()?;
     module.add_class::<PyGlobalQuantizerFactory>()?;
     module.add_class::<PyBitPackedIntCompressor>()?;
+    module.add_class::<PyQuantizedBitPackedCompressor>()?;
     module.add_class::<PyCompressionTransform>()?;
     module.add_class::<PySplitIndexTransform>()?;
     module.add_class::<PyBmpSearcher>()?;

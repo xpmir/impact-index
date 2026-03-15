@@ -376,3 +376,155 @@ impl BitPackedIntCompressor {
         }
     }
 }
+
+// ---
+// --- Quantized + BitPacked compressor (for neural IR like SPLADE)
+// ---
+
+/// Quantizes float impacts to N-bit integers, then compresses with adaptive
+/// SIMD bitpacking. Combines quantization with adaptive compression.
+///
+/// For SPLADE, most quantized values are small (0-3) with occasional spikes.
+/// Adaptive bitpacking uses ~3-4 bits/value instead of fixed N bits,
+/// reducing size by 2-3x compared to fixed-width quantization.
+///
+/// Use this for neural IR models with continuous float impact values.
+/// For BM25 with integer TF counts, use [`BitPackedIntCompressor`] instead.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+pub struct QuantizedBitPackedCompressor {
+    pub nbits: u32,
+    pub step: ImpactValue,
+    pub min: ImpactValue,
+    pub max: ImpactValue,
+}
+
+#[typetag::serde]
+impl ImpactCompressor for QuantizedBitPackedCompressor {}
+
+/// Factory that creates a [`QuantizedBitPackedCompressor`] with min/max from the index.
+#[derive(Clone)]
+pub struct QuantizedBitPackedFactory {
+    pub nbits: u32,
+}
+
+impl ImpactCompressorFactory for QuantizedBitPackedFactory {
+    fn create(&self, index: &dyn SparseIndexView) -> Box<dyn ImpactCompressor> {
+        let mut min = ImpactValue::INFINITY;
+        let mut max = -ImpactValue::INFINITY;
+        for term_ix in 0..index.len() {
+            let (term_min, term_max) = index.value_range(term_ix);
+            min = min.min(term_min);
+            max = max.max(term_max);
+        }
+        let levels = 1u32 << self.nbits;
+        let step = (max - min) / (levels as f32 + 1.0);
+        Box::new(QuantizedBitPackedCompressor {
+            nbits: self.nbits,
+            step,
+            min,
+            max,
+        })
+    }
+
+    fn clone(&self) -> Box<dyn ImpactCompressorFactory> {
+        Box::new(Clone::clone(self))
+    }
+}
+
+impl Compressor<ImpactValue> for QuantizedBitPackedCompressor {
+    fn write(
+        &self,
+        writer: &mut dyn Write,
+        values: &[ImpactValue],
+        _term_index: TermIndex,
+        _info: &TermBlockInformation,
+    ) {
+        let levels = (1u32 << self.nbits) - 1;
+        let ints: Vec<u32> = values
+            .iter()
+            .map(|&v| {
+                let q = ((v - self.min) / self.step).trunc() as u32;
+                q.min(levels)
+            })
+            .collect();
+
+        if ints.len() == BLOCK_LEN {
+            let bitpacker = BitPacker4x::new();
+            let num_bits = bitpacker.num_bits(&ints);
+            writer.write_all(&[num_bits]).expect("write num_bits");
+            if num_bits > 0 {
+                let mut compressed = vec![0u8; BLOCK_LEN * 4];
+                let written = bitpacker.compress(&ints, &mut compressed, num_bits);
+                writer
+                    .write_all(&compressed[..written])
+                    .expect("write packed");
+            }
+        } else {
+            writer.write_all(&[0xFF]).expect("write marker");
+            for &v in &ints {
+                writer.write_all(&v.to_le_bytes()).expect("write val");
+            }
+        }
+    }
+
+    fn read<'a>(
+        &self,
+        slice: Box<dyn Slice + 'a>,
+        _term_index: TermIndex,
+        info: &TermBlockInformation,
+    ) -> Box<dyn Iterator<Item = ImpactValue> + Send + 'a> {
+        let mut buffer = Vec::new();
+        self.decode_block(slice.data(), info, &mut buffer);
+        Box::new(buffer.into_iter())
+    }
+
+    fn decode_into_bytes(
+        &self,
+        data: &[u8],
+        _term_index: TermIndex,
+        info: &TermBlockInformation,
+        buffer: &mut Vec<ImpactValue>,
+    ) {
+        self.decode_block(data, info, buffer);
+    }
+}
+
+impl QuantizedBitPackedCompressor {
+    fn decode_block(
+        &self,
+        data: &[u8],
+        info: &TermBlockInformation,
+        buffer: &mut Vec<ImpactValue>,
+    ) {
+        buffer.clear();
+        let step = self.step;
+        let min = self.min;
+        let half_step = step / 2.0;
+        let marker = data[0];
+
+        if marker != 0xFF && info.length == BLOCK_LEN {
+            let num_bits = marker;
+            let mut decompressed = [0u32; BLOCK_LEN];
+            if num_bits > 0 {
+                let bitpacker = BitPacker4x::new();
+                bitpacker.decompress(&data[1..], &mut decompressed, num_bits);
+            }
+            buffer.reserve(BLOCK_LEN);
+            for &v in &decompressed {
+                buffer.push((v as ImpactValue) * step + min + half_step);
+            }
+        } else {
+            buffer.reserve(info.length);
+            for i in 0..info.length {
+                let offset = 1 + i * 4;
+                let v = u32::from_le_bytes([
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ]);
+                buffer.push((v as ImpactValue) * step + min + half_step);
+            }
+        }
+    }
+}

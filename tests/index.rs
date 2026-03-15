@@ -163,6 +163,8 @@ enum IndexType {
     BitPacked16,
     /// BitPacking + 8-bit quantized impacts (block_size=128)
     BitPacked8,
+    /// QuantizedBitPacked 8-bit (quantize then adaptive bitpack — for SPLADE)
+    QuantizedBitPacked8,
 }
 
 #[rstest]
@@ -183,6 +185,8 @@ enum IndexType {
 #[case(IndexType::BitPacked8, 500, 500, 5., 8, 10, Some(1), 0, vec![])]
 // PFOR-delta compression
 #[case(IndexType::PFor, 500, 500, 5., 8, 10, Some(1), 0, vec![])]
+// QuantizedBitPacked 8-bit (for SPLADE-style float impacts)
+#[case(IndexType::QuantizedBitPacked8, 500, 500, 5., 8, 10, Some(1), 0, vec![])]
 fn test_search(
     #[case] index_type: IndexType,
     #[case] vocabulary_size: usize,
@@ -295,6 +299,20 @@ fn test_search(
                 .expect("Could not build compressed index");
             load_index(&compressed_path, true)
         }
+        IndexType::QuantizedBitPacked8 => {
+            use impact_index::compress::docid::BitPackingCompressor;
+            use impact_index::compress::impact::QuantizedBitPackedFactory;
+            let transform = CompressionTransform {
+                max_block_size: 128,
+                doc_ids_compressor_factory: Box::new(BitPackingCompressor {}),
+                impacts_compressor_factory: Box::new(QuantizedBitPackedFactory { nbits: 8 }),
+            };
+            let compressed_path = data.dir.path().join("qbp8");
+            transform
+                .process(&compressed_path, &data.indexer.to_index(true))
+                .expect("Could not build compressed index");
+            load_index(&compressed_path, true)
+        }
     };
 
     // Builds a query from a document
@@ -339,7 +357,7 @@ fn test_search(
 
     // Quantized indices have lossy compression — use wider tolerance
     let delta = match index_type {
-        IndexType::BitPacked8 => 5e-2,
+        IndexType::BitPacked8 | IndexType::QuantizedBitPacked8 => 5e-2,
         IndexType::BitPacked16 => 1e-2,
         _ => 1e-2,
     };

@@ -66,6 +66,7 @@ from impact_index import (
     BmpSearcher,
     EliasFanoCompressor,
     GlobalImpactQuantizer,
+    QuantizedBitPackedCompressor,
     CompressionTransform,
     SplitIndexTransform,
 )
@@ -417,7 +418,7 @@ class CompressedIndexBuilder(IndexBuilder):
         if self.config.is_split():
             # Split requires the full transform pipeline
             doc_ids_compressor = BitPackingCompressor()
-            impact_compressor = GlobalImpactQuantizer(self.config.nbits)
+            impact_compressor = QuantizedBitPackedCompressor(self.config.nbits)
             compression_transform = CompressionTransform(
                 self.config.block_size, doc_ids_compressor, impact_compressor
             )
