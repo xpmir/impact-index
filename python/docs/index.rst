@@ -1,28 +1,33 @@
 impact-index
 =============
 
-A Python/Rust library for efficient sparse retrieval from neural information
-retrieval systems. Built on Rust with PyO3 bindings for high performance.
+A Python/Rust library for efficient sparse retrieval. Built on Rust with
+PyO3 bindings for high performance.
 
 **impact-index** supports both neural IR models with pre-computed floating-point
-impact scores and traditional bag-of-words models like BM25.
+impact scores and traditional BM25 bag-of-words retrieval with performance
+competitive with Lucene/Pyserini.
 
 Features
 --------
 
-- **Index construction** with checkpointing for crash recovery
-- **BM25 scoring** with bag-of-words index builder, stemming, and vocabulary management
-- **WAND and MaxScore** search algorithms for top-k retrieval
-- **Block-based compression** with Elias-Fano doc IDs and quantized impacts
+- **BM25 bag-of-words indexing** with stemming (Snowball) and stop words (17 languages)
+- **Block-Max MaxScore and BMW WAND** search with early termination
+- **SIMD bitpacking compression** with quantized impacts and block-max pruning
+- **One-liner compression**: ``index.compress("/path/to/output")``
 - **Posting list splitting** by quantile for term impact decomposition
-- **BMP (Block-Max Pruning)** integration for fast approximate search
+- **BMP (Block-Max Pruning)** for fast approximate search
 - **Document store** with zstd compression and key-based retrieval
 - **Async support** for non-blocking search and document retrieval
 
 Installation
 ------------
 
-Requires Rust toolchain and Python >= 3.8::
+From PyPI::
+
+    pip install impact-index
+
+From source (requires Rust toolchain)::
 
     pip install maturin
     maturin develop --release

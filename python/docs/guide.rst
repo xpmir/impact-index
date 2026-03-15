@@ -189,6 +189,47 @@ vocabulary management:
     scored = index.with_scoring(impact_index.BM25Scoring(), doc_meta)
     results = scored.search_wand(query, top_k=10)
 
+Stop words
+~~~~~~~~~~
+
+Stop words (common words like "the", "is", "a") can be filtered during
+indexing and querying to reduce index size and improve search speed.
+Built-in stop word lists from Lucene are available for 17 languages.
+
+.. code-block:: python
+
+    import impact_index
+
+    # Use default stop words for the language (matches Lucene/Pyserini)
+    builder = impact_index.BOWIndexBuilder(
+        "/path/to/index",
+        stemmer="snowball",
+        language="english",
+        stop_words=True,
+    )
+
+    # Or provide an explicit list
+    builder = impact_index.BOWIndexBuilder(
+        "/path/to/index",
+        stemmer="snowball",
+        stop_words=["the", "a", "is", "in"],
+    )
+
+    # Get the stop word list for any supported language
+    words = impact_index.get_stop_words("english")   # 33 words (Lucene default)
+    words = impact_index.get_stop_words("french")     # 154 words
+    words = impact_index.get_stop_words("german")     # 231 words
+
+Supported languages: arabic, danish, dutch, english, finnish, french,
+german, greek, hungarian, italian, norwegian, portuguese, romanian,
+russian, spanish, swedish, turkish.
+
+.. note::
+
+    For fair comparison with Pyserini/Lucene, always enable stop words.
+    Without them, high-frequency terms like "the" create very long
+    posting lists that slow down search significantly.
+
 Loading document metadata separately
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -217,9 +258,14 @@ directory, copy the document metadata files using:
 Compression and Transforms
 --------------------------
 
-Raw indices can be compressed to reduce size and improve cache efficiency.
-:class:`~impact_index.CompressionTransform` applies block-based encoding
-with configurable compressors for document IDs and impact values.
+Compressed indices use SIMD bitpacking for doc IDs and quantization for
+impact values, with 128-posting blocks that enable block-max pruning
+during search.
+
+Quick compression
+~~~~~~~~~~~~~~~~~
+
+The simplest way to compress an index:
 
 .. code-block:: python
 
@@ -227,8 +273,38 @@ with configurable compressors for document IDs and impact values.
 
     index = impact_index.Index.load("/path/to/raw_index", in_memory=True)
 
-    # Create compressors
-    docid_compressor = impact_index.EliasFanoCompressor()
+    # Compress with defaults (block_size=128, nbits=8)
+    compressed = index.compress("/path/to/compressed")
+
+    # Or with custom settings
+    compressed = index.compress("/path/to/compressed", block_size=128, nbits=16)
+
+This uses SIMD bitpacking (BitPacker4x) for doc IDs and global
+quantization for impact values. The compressed index is returned
+ready for searching.
+
+The default settings are optimized for performance:
+
+- **block_size=128**: aligns with SIMD registers and enables effective
+  block-max pruning during search.
+- **nbits=8**: uses a fast path with direct byte reads (no bit-level
+  overhead). ``nbits=16`` also has a fast path via ``u16`` reads.
+
+Advanced compression
+~~~~~~~~~~~~~~~~~~~~
+
+For full control over compressors, use
+:class:`~impact_index.CompressionTransform`:
+
+.. code-block:: python
+
+    import impact_index
+
+    index = impact_index.Index.load("/path/to/raw_index", in_memory=True)
+
+    # Choose compressors
+    docid_compressor = impact_index.BitPackingCompressor()   # SIMD (recommended)
+    # docid_compressor = impact_index.EliasFanoCompressor()  # alternative
 
     # Fixed-range quantization (if you know the value range)
     impact_compressor = impact_index.ImpactQuantizer(nbits=8, min=0.0, max=10.0)

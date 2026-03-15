@@ -62,6 +62,7 @@ from transformers import AutoModelForMaskedLM, AutoTokenizer
 # Import the index libraries
 import impact_index
 from impact_index import (
+    BitPackingCompressor,
     BmpSearcher,
     EliasFanoCompressor,
     GlobalImpactQuantizer,
@@ -413,21 +414,22 @@ class CompressedIndexBuilder(IndexBuilder):
         return self.config.get_display_name()
 
     def _do_build(self, source_index: impact_index.Index):
-        # Create compression transform
-        doc_ids_compressor = EliasFanoCompressor()
-        impact_compressor = GlobalImpactQuantizer(self.config.nbits)
-        compression_transform = CompressionTransform(
-            self.config.block_size, doc_ids_compressor, impact_compressor
-        )
-
-        # Optionally wrap with split transform
         if self.config.is_split():
+            # Split requires the full transform pipeline
+            doc_ids_compressor = BitPackingCompressor()
+            impact_compressor = GlobalImpactQuantizer(self.config.nbits)
+            compression_transform = CompressionTransform(
+                self.config.block_size, doc_ids_compressor, impact_compressor
+            )
             transform = SplitIndexTransform(self.config.split_quantiles, compression_transform)
+            transform.process(str(self.output_path), source_index)
         else:
-            transform = compression_transform
-
-        # Apply transform
-        transform.process(str(self.output_path), source_index)
+            # Simple compression: use Index.compress()
+            source_index.compress(
+                str(self.output_path),
+                block_size=self.config.block_size,
+                nbits=self.config.nbits,
+            )
 
     def _load_index(self) -> impact_index.Index:
         return impact_index.Index.load(str(self.output_path), in_memory=True)
@@ -966,6 +968,9 @@ def main():
                 args.index_configs.append(config)
             except ValueError as e:
                 parser.error(f"Invalid --compressed-index config '{config_str}': {e}")
+    else:
+        # Default: always test with a compressed index (block_size=128, nbits=8)
+        args.index_configs.append(CompressedIndexConfig(nbits=8, block_size=128))
 
     # Setup Rust logging via RUST_LOG environment variable
     os.environ["RUST_LOG"] = args.log_level
