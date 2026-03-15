@@ -453,8 +453,17 @@ pub struct CompressedIndex {
     /// View on document IDs
     docid_buffer: Box<dyn Buffer>,
 
-    /// View on document IDs
+    /// View on impact values
     impact_buffer: Box<dyn Buffer>,
+
+    /// Source directory path
+    source_dir: Option<std::path::PathBuf>,
+
+    /// Document metadata (auto-loaded if present)
+    doc_meta: Option<crate::docmeta::DocMetadata>,
+
+    /// Analyzer config (auto-loaded if present)
+    analyzer_config: Option<crate::vocab::analyzer::AnalyzerConfig>,
 }
 
 //
@@ -786,6 +795,18 @@ impl SparseIndex for CompressedIndex {
             .max()
             .unwrap_or(0)
     }
+
+    fn doc_meta(&self) -> Option<&crate::docmeta::DocMetadata> {
+        self.doc_meta.as_ref()
+    }
+
+    fn analyzer_config(&self) -> Option<&crate::vocab::analyzer::AnalyzerConfig> {
+        self.analyzer_config.as_ref()
+    }
+
+    fn source_path(&self) -> Option<&std::path::Path> {
+        self.source_dir.as_deref()
+    }
 }
 
 impl SparseIndexInformation for CompressedIndex {
@@ -1036,6 +1057,17 @@ impl IndexLoader for CompressedIndexLoader {
 
         let docid_path = path.join("docids.dat");
         let impact_path = path.join("impacts.dat");
+        // Auto-detect auxiliary components
+        let doc_meta = crate::docmeta::DocMetadata::load(path).ok();
+        let analyzer_config = {
+            let cfg = crate::vocab::analyzer::TextAnalyzer::load_config(path);
+            if cfg.stemmer == "none" && !cfg.stop_words {
+                None
+            } else {
+                Some(cfg)
+            }
+        };
+
         Box::new(CompressedIndex {
             information,
             docid_buffer: if in_memory {
@@ -1048,6 +1080,9 @@ impl IndexLoader for CompressedIndexLoader {
             } else {
                 Box::new(MmapBuffer::new(&impact_path))
             },
+            source_dir: Some(path.to_path_buf()),
+            doc_meta,
+            analyzer_config,
         })
     }
 }

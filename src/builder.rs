@@ -360,6 +360,11 @@ impl<V: PostingValue> Indexer<V> {
         }
     }
 
+    /// Get the index directory path.
+    pub fn folder(&self) -> &Path {
+        &self.folder
+    }
+
     /// Returns the document ID from the last checkpoint, or `None` if
     /// no checkpoint exists. Useful to resume indexing after a crash.
     pub fn get_checkpoint_doc_id(&self) -> Option<DocId> {
@@ -489,12 +494,34 @@ pub struct SparseBuilderIndex<V: PostingValue = f32> {
 
     /// Phantom for the value type
     _phantom: std::marker::PhantomData<V>,
+
+    /// Source directory path
+    source_dir: Option<PathBuf>,
+
+    /// Document metadata (if loaded from a BOW index)
+    pub doc_meta: Option<crate::docmeta::DocMetadata>,
+
+    /// Analyzer config (if loaded from a BOW index)
+    pub analyzer_config: Option<crate::vocab::analyzer::AnalyzerConfig>,
 }
 
 impl<V: PostingValue> SparseBuilderIndex<V> {
     fn new(terms: Vec<TermIndexInformation>, path: &PathBuf, in_memory: bool) -> Self {
+        // Auto-detect auxiliary files
+        let dir = path.parent().unwrap_or(path);
+        let doc_meta = crate::docmeta::DocMetadata::load(dir).ok();
+        let analyzer_config = crate::vocab::analyzer::TextAnalyzer::load_config(dir);
+        let analyzer_config = if analyzer_config.stemmer == "none" && !analyzer_config.stop_words {
+            None // default config = no analyzer was configured
+        } else {
+            Some(analyzer_config)
+        };
+
         Self {
             terms: terms,
+            source_dir: Some(dir.to_path_buf()),
+            doc_meta,
+            analyzer_config,
             buffer: if in_memory {
                 Box::new(MemoryBuffer::new(path))
             } else {
@@ -864,6 +891,18 @@ impl<V: PostingValue> SparseIndex for SparseBuilderIndex<V> {
             .map(|term| term.max_doc_id)
             .max()
             .unwrap_or(0)
+    }
+
+    fn doc_meta(&self) -> Option<&crate::docmeta::DocMetadata> {
+        self.doc_meta.as_ref()
+    }
+
+    fn analyzer_config(&self) -> Option<&crate::vocab::analyzer::AnalyzerConfig> {
+        self.analyzer_config.as_ref()
+    }
+
+    fn source_path(&self) -> Option<&std::path::Path> {
+        self.source_dir.as_deref()
     }
 }
 

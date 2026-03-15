@@ -294,6 +294,45 @@ pub trait SparseIndex: Send + Sync + SparseIndexView + AsSparseIndexView {
         v
     }
 
+    /// Document metadata (lengths for BM25). None if not available.
+    fn doc_meta(&self) -> Option<&crate::docmeta::DocMetadata> {
+        None
+    }
+
+    /// Analyzer config. None if not available.
+    fn analyzer_config(&self) -> Option<&crate::vocab::analyzer::AnalyzerConfig> {
+        None
+    }
+
+    /// Source directory path (for loading vocab, copying files).
+    fn source_path(&self) -> Option<&Path> {
+        None
+    }
+
+    /// Copy auxiliary files (vocab, analyzer, docmeta) to a destination directory.
+    /// Each component saves itself if present.
+    fn save_auxiliary(&self, dst: &Path) -> Result<()> {
+        if let Some(meta) = self.doc_meta() {
+            meta.save(dst)?;
+        }
+        if let (Some(src), Some(_config)) = (self.source_path(), self.analyzer_config()) {
+            // Copy vocab FST from source (it's a binary file, not serializable from config alone)
+            let src_fst = src.join("vocab.fst");
+            let dst_fst = dst.join("vocab.fst");
+            if src_fst.exists() && !dst_fst.exists() {
+                std::fs::copy(&src_fst, &dst_fst)?;
+            }
+            // Save analyzer config
+            let config_path = dst.join("analyzer.cbor");
+            if !config_path.exists() {
+                let file = std::fs::File::create(&config_path)?;
+                ciborium::ser::into_writer(_config, file)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Convert to BMP file format
     fn convert_to_bmp(&self, output: &Path, bsize: usize, compress_range: bool) -> Result<()> {
         let mut builder: IndexBuilder;

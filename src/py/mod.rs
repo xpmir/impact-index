@@ -146,8 +146,6 @@ pub struct PyIndexView {}
 #[pyclass(name = "Index", extends=PyIndexView)]
 pub struct PySparseIndex {
     index: Arc<Box<dyn SparseIndex>>,
-    /// Source directory path (for transparent auxiliary file copying)
-    source_path: Option<PathBuf>,
 }
 
 impl PySparseIndex {
@@ -295,12 +293,11 @@ impl PySparseIndex {
 
     /// Get the text analyzer for this index (stemmer, stop words, vocabulary).
     ///
-    /// Loads the analyzer configuration and vocabulary from the index directory.
+    /// Get the text analyzer for this index (if available).
     fn analyzer(&self) -> PyResult<PyTextAnalyzer> {
-        let source = self.source_path.as_ref().ok_or_else(|| {
+        let source = self.index.source_path().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
-                "Cannot load analyzer: index has no source path. \
-                 Use Index.load() to load from a directory.",
+                "Index has no source path — cannot load analyzer.",
             )
         })?;
         PyTextAnalyzer::from_index(source.to_str().unwrap())
@@ -308,23 +305,17 @@ impl PySparseIndex {
 
     /// Create a scored index that applies a scoring model to raw postings.
     ///
-    /// Document metadata (lengths) is loaded automatically from the index
-    /// directory.
+    /// Document metadata (lengths) is loaded automatically from the index.
     fn with_scoring(&self, py: Python<'_>, scoring: &PyBM25Scoring) -> PyResult<Py<PyAny>> {
-        let source = self.source_path.as_ref().ok_or_else(|| {
+        let doc_meta = self.index.doc_meta().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
-                "Cannot load doc metadata: index has no source path. \
-                 Use Index.load() to load from a directory.",
+                "Index has no document metadata. Build with BOWIndexBuilder for BM25.",
             )
         })?;
-
-        let doc_meta = Arc::new(crate::docmeta::DocMetadata::load(source).map_err(|e| {
-            pyo3::exceptions::PyIOError::new_err(format!(
-                "Failed to load doc metadata from '{}': {}",
-                source.display(),
-                e
-            ))
-        })?);
+        // Clone into Arc for ScoredIndex
+        let doc_meta = Arc::new(crate::docmeta::DocMetadata::from_lengths(
+            doc_meta.doc_lengths.clone(),
+        ));
 
         let model = Box::new(BM25Scoring::with_params(scoring.k1, scoring.b));
         let scored = ScoredIndex::new(self.index.clone(), doc_meta, model);
@@ -373,35 +364,14 @@ impl PySparseIndex {
             .process(path, &**self.index)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
 
-        // Transparently copy auxiliary files (vocab, analyzer, docmeta)
-        // so the compressed index is fully standalone
-        let src = self.source_path.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err(
-                "Cannot copy auxiliary files: index has no source path. \
-                 Use Index.load() to load from a directory.",
-            )
-        })?;
-        if src != path {
-            crate::docmeta::DocMetadata::copy_files(src, path).map_err(|e| {
-                pyo3::exceptions::PyIOError::new_err(format!(
-                    "Failed to copy doc metadata from '{}': {}",
-                    src.display(),
-                    e
-                ))
-            })?;
-            crate::vocab::analyzer::TextAnalyzer::copy_files(src, path).map_err(|e| {
-                pyo3::exceptions::PyIOError::new_err(format!(
-                    "Failed to copy analyzer files from '{}': {}",
-                    src.display(),
-                    e
-                ))
-            })?;
-        }
+        // Let the source index save its auxiliary data to the compressed dir
+        self.index
+            .save_auxiliary(path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
 
         let base = PyClassInitializer::from(PyIndexView {});
         let sub = base.add_subclass(PySparseIndex {
             index: Arc::new(load_index(path, in_memory)),
-            source_path: Some(path.to_path_buf()),
         });
         Ok(Py::new(py, sub)?.into_any())
     }
@@ -412,7 +382,6 @@ impl PySparseIndex {
         let base = PyClassInitializer::from(PyIndexView {});
         let sub = base.add_subclass(PySparseIndex {
             index: Arc::new(load_index(Path::new(folder), in_memory)),
-            source_path: Some(PathBuf::from(folder)),
         });
         Ok(Py::new(py, sub)?.into_any())
     }
@@ -618,12 +587,12 @@ impl PyIndexBuilder {
 
         macro_rules! build_index {
             ($indexer:expr) => {{
+                let folder = $indexer.folder().to_path_buf();
                 $indexer.build().expect("Error while building index");
                 let base = PyClassInitializer::from(PyIndexView {});
                 let index = $indexer.to_index(in_memory);
                 let sub = base.add_subclass(PySparseIndex {
                     index: Arc::new(Box::new(index)),
-                    source_path: None,
                 });
                 Ok(Py::new(py, sub)?.into_any())
             }};
@@ -1511,7 +1480,6 @@ impl PyBOWIndexBuilder {
                 let base = PyClassInitializer::from(PyIndexView {});
                 let sub = base.add_subclass(PySparseIndex {
                     index: Arc::new(Box::new(index)),
-                    source_path: Some(folder),
                 });
                 Ok(Py::new(py, sub)?.into_any())
             }};
