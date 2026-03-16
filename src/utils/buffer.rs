@@ -131,4 +131,8 @@ impl Buffer for MmapBuffer {
 
         Box::new(MmapSlice { vector: vector })
     }
+
+    fn as_bytes(&self) -> Option<&[u8]> {
+        Some(&self.mmap)
+    }
 }

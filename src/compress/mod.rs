@@ -9,7 +9,7 @@
 //! producing a block-based compressed index on disk.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     fmt,
     fs::{create_dir, File},
     io::{Seek, Write},
@@ -655,14 +655,19 @@ impl<'a> Iterator for CompressedIndexIterator<'a> {
 }
 
 struct CompressedBlockTermImpactIterator<'a> {
-    /// Iterator for this term
+    /// Iterator for this term (RefCell needed for lazy current() resolution)
     iterator: RefCell<CompressedIndexIterator<'a>>,
 
     // Requested minimum document ID
     current_min_docid: Option<DocId>,
 
-    // We need a RefCell for method current()
-    current_value: RefCell<Option<TermImpact>>,
+    /// Cached current posting (Cell: zero-cost for Copy types, no borrow checking)
+    current_value: Cell<Option<TermImpact>>,
+
+    /// Cached block metadata (updated in next_min_doc_id, no RefCell needed)
+    cached_block_min_doc_id: DocId,
+    cached_block_max_doc_id: DocId,
+    cached_block_max_value: ImpactValue,
 
     // Maximum value over all postings
     max_value: ImpactValue,
@@ -679,11 +684,14 @@ impl<'a> CompressedBlockTermImpactIterator<'a> {
         let info = &index.information.terms[term_index];
         Self {
             iterator: RefCell::new(CompressedIndexIterator::new(index, term_index)),
-            current_value: RefCell::new(None),
+            current_value: Cell::new(None),
+            current_min_docid: None,
+            cached_block_min_doc_id: 0,
+            cached_block_max_doc_id: 0,
+            cached_block_max_value: 0.0,
             max_value: info.max_value,
             max_doc_id: info.max_doc_id,
             length: info.length,
-            current_min_docid: None,
         }
     }
 }
@@ -692,7 +700,7 @@ impl<'a> BlockTermImpactIterator for CompressedBlockTermImpactIterator<'a> {
     fn next_min_doc_id(&mut self, min_doc_id: DocId) -> Option<DocId> {
         // Sets the current minimum document ID
         self.current_min_docid = Some(min_doc_id.max(
-            if let Some(impact) = self.current_value.get_mut() {
+            if let Some(impact) = self.current_value.get() {
                 impact.docid + 1
             } else {
                 0
@@ -700,16 +708,22 @@ impl<'a> BlockTermImpactIterator for CompressedBlockTermImpactIterator<'a> {
         ));
         let min_doc_id = self.current_min_docid.expect("Should not be None");
 
-        // Move to the block having at least one document greater that min_doc_id
-        if self.iterator.get_mut().move_iterator(min_doc_id) {
+        // Move to the block having at least one document >= min_doc_id
+        let iterator = self.iterator.get_mut();
+        if iterator.move_iterator(min_doc_id) {
+            // Cache block metadata (avoids RefCell borrow in tight loops)
+            let info = iterator.info.expect("Iterator has block");
+            self.cached_block_min_doc_id = info.min_doc_id;
+            self.cached_block_max_doc_id = info.max_doc_id;
+            self.cached_block_max_value = info.max_value;
+
             debug!(
                 "[{}] We have a candidate for doc_id >= {}",
-                self.iterator.get_mut().term_index,
-                min_doc_id
+                iterator.term_index, min_doc_id
             );
-            Some(self.min_block_doc_id())
+            Some(self.cached_block_min_doc_id)
         } else {
-            debug!("[{}] End of iterator", self.iterator.get_mut().term_index);
+            debug!("[{}] End of iterator", iterator.term_index);
             None
         }
     }
@@ -717,65 +731,55 @@ impl<'a> BlockTermImpactIterator for CompressedBlockTermImpactIterator<'a> {
     /// Returns the current posting using binary search within the decoded block.
     fn current(&self) -> TermImpact {
         let min_docid = self.current_min_docid.expect("Should not be null");
+        let cached = self.current_value.get();
 
-        let mut current_value = self.current_value.borrow_mut();
-
-        if current_value
-            .and_then(|x| Some(x.docid < min_docid))
-            .or(Some(true))
-            .unwrap()
-        {
+        if cached.map_or(true, |cv| cv.docid < min_docid) {
             let mut iterator = self.iterator.borrow_mut();
             iterator.ensure_block_loaded();
 
             if let Some(pos) = iterator.find_geq(min_docid) {
-                *current_value = Some(TermImpact {
+                let impact = TermImpact {
                     docid: iterator.docids[pos],
                     value: iterator.impacts[pos],
-                });
+                };
+                self.current_value.set(Some(impact));
                 iterator.index = pos + 1;
             } else {
                 panic!("Did not find current impact for min_docid={}", min_docid);
             }
         }
 
-        return current_value.expect("No current value");
+        self.current_value.get().expect("No current value")
     }
 
+    #[inline]
     fn max_value(&self) -> ImpactValue {
-        return self.max_value;
+        self.max_value
     }
 
+    #[inline]
     fn max_block_doc_id(&self) -> DocId {
-        self.iterator
-            .borrow()
-            .info
-            .expect("Iterator was over")
-            .max_doc_id
+        self.cached_block_max_doc_id
     }
 
+    #[inline]
     fn min_block_doc_id(&self) -> DocId {
-        self.iterator
-            .borrow()
-            .info
-            .expect("Iterator was over")
-            .min_doc_id
+        self.cached_block_min_doc_id
     }
 
+    #[inline]
     fn max_block_value(&self) -> ImpactValue {
-        self.iterator
-            .borrow()
-            .info
-            .expect("Iterator was over")
-            .max_value
+        self.cached_block_max_value
     }
 
+    #[inline]
     fn max_doc_id(&self) -> DocId {
-        return self.max_doc_id;
+        self.max_doc_id
     }
 
+    #[inline]
     fn length(&self) -> usize {
-        return self.length;
+        self.length
     }
 }
 

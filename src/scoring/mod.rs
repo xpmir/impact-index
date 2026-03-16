@@ -6,7 +6,7 @@
 
 pub mod bm25;
 
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::sync::Arc;
 
 use crate::base::{DocId, ImpactValue, Len, TermImpact, TermIndex};
@@ -44,21 +44,42 @@ pub trait ScoringModel: Send + Sync {
 struct ScoringBlockIterator<'a> {
     inner: Box<dyn BlockTermImpactIterator + 'a>,
     scorer: Box<dyn ScoringFunction>,
-    /// Cached current impact after scoring
-    current_impact: RefCell<Option<TermImpact>>,
+    /// Cached current impact after scoring (Cell: zero-cost for Copy types)
+    current_impact: Cell<Option<TermImpact>>,
     /// The scored max_value for this term
     max_value: f32,
+    /// Cached block metadata (refreshed once per next_min_doc_id, avoids inner vtable calls)
+    cached_block_min_doc_id: DocId,
+    cached_block_max_doc_id: DocId,
+    cached_scored_block_max: ImpactValue,
+    /// Global constants (cached once at creation)
+    cached_max_doc_id: DocId,
+    cached_length: usize,
+}
+
+impl<'a> ScoringBlockIterator<'a> {
+    /// Refresh cached block metadata from the inner iterator.
+    #[inline]
+    fn refresh_block_cache(&mut self) {
+        let raw_block_max = self.inner.max_block_value();
+        self.cached_scored_block_max = self.scorer.max_score(raw_block_max);
+        self.cached_block_min_doc_id = self.inner.min_block_doc_id();
+        self.cached_block_max_doc_id = self.inner.max_block_doc_id();
+    }
 }
 
 impl<'a> BlockTermImpactIterator for ScoringBlockIterator<'a> {
     fn next_min_doc_id(&mut self, doc_id: DocId) -> Option<DocId> {
-        *self.current_impact.get_mut() = None;
-        self.inner.next_min_doc_id(doc_id)
+        self.current_impact.set(None);
+        let result = self.inner.next_min_doc_id(doc_id);
+        if result.is_some() {
+            self.refresh_block_cache();
+        }
+        result
     }
 
     fn current(&self) -> TermImpact {
-        let mut cached = self.current_impact.borrow_mut();
-        if let Some(impact) = *cached {
+        if let Some(impact) = self.current_impact.get() {
             return impact;
         }
 
@@ -67,33 +88,38 @@ impl<'a> BlockTermImpactIterator for ScoringBlockIterator<'a> {
             docid: raw.docid,
             value: self.scorer.score(raw.value, raw.docid),
         };
-        *cached = Some(scored);
+        self.current_impact.set(Some(scored));
         scored
     }
 
+    #[inline]
     fn max_value(&self) -> ImpactValue {
         self.max_value
     }
 
+    #[inline]
     fn max_doc_id(&self) -> DocId {
-        self.inner.max_doc_id()
+        self.cached_max_doc_id
     }
 
+    #[inline]
     fn max_block_value(&self) -> ImpactValue {
-        // The block max is computed from the raw block max
-        self.scorer.max_score(self.inner.max_block_value())
+        self.cached_scored_block_max
     }
 
+    #[inline]
     fn max_block_doc_id(&self) -> DocId {
-        self.inner.max_block_doc_id()
+        self.cached_block_max_doc_id
     }
 
+    #[inline]
     fn min_block_doc_id(&self) -> DocId {
-        self.inner.min_block_doc_id()
+        self.cached_block_min_doc_id
     }
 
+    #[inline]
     fn length(&self) -> usize {
-        self.inner.length()
+        self.cached_length
     }
 }
 
@@ -131,13 +157,17 @@ impl ScoredIndex {
 impl SparseIndex for ScoredIndex {
     fn block_iterator(&self, term_ix: TermIndex) -> Box<dyn BlockTermImpactIterator + '_> {
         if term_ix >= self.inner.len() {
-            // Return an empty iterator-like wrapper
             let inner_iter = self.inner.block_iterator(term_ix);
             let scorer = self.model.term_scorer(0, 0.0);
             return Box::new(ScoringBlockIterator {
+                cached_max_doc_id: inner_iter.max_doc_id(),
+                cached_length: inner_iter.length(),
                 inner: inner_iter,
                 max_value: 0.0,
-                current_impact: RefCell::new(None),
+                current_impact: Cell::new(None),
+                cached_block_min_doc_id: 0,
+                cached_block_max_doc_id: 0,
+                cached_scored_block_max: 0.0,
                 scorer,
             });
         }
@@ -149,9 +179,14 @@ impl SparseIndex for ScoredIndex {
         let max_value = scorer.max_score(max_raw_value);
 
         Box::new(ScoringBlockIterator {
+            cached_max_doc_id: inner_iter.max_doc_id(),
+            cached_length: inner_iter.length(),
             inner: inner_iter,
             scorer,
-            current_impact: RefCell::new(None),
+            current_impact: Cell::new(None),
+            cached_block_min_doc_id: 0,
+            cached_block_max_doc_id: 0,
+            cached_scored_block_max: 0.0,
             max_value,
         })
     }
