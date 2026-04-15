@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use impact_index::docstore::{
-    builder::DocumentStoreBuilder,
+    builder::{BuilderOptions, DocumentStoreBuilder},
     store::{ContentAccess, DocumentStore},
-    DocumentData,
+    DocumentData, CHECKPOINT_FILE,
 };
 use temp_dir::TempDir;
 
@@ -261,6 +261,165 @@ fn test_mmap_access() {
     let store = DocumentStore::load(&path, ContentAccess::Mmap).unwrap();
     let docs = store.get_by_number(&[3]).unwrap();
     assert_eq!(docs[0].keys["docno"], "DOC-3");
+}
+
+#[test]
+fn test_checkpoint_clean_resume() {
+    // Write 30 docs, drop the builder mid-run, then resume and finish.
+    init_logger();
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+
+    let opts = BuilderOptions {
+        block_size: 64,
+        zstd_level: 3,
+        checkpoint_frequency: 5,
+    };
+
+    {
+        let mut builder = DocumentStoreBuilder::new_with_options(&path, &opts).unwrap();
+        for i in 0..30u64 {
+            builder
+                .add(&make_doc(
+                    &format!("DOC-{:04}", i),
+                    format!("content-{}", i).as_bytes(),
+                ))
+                .unwrap();
+        }
+        // Force one more checkpoint so state after the last add is durable.
+        builder.checkpoint().unwrap();
+        // Drop without building -> simulates a crash after a clean checkpoint.
+    }
+
+    assert!(path.join(CHECKPOINT_FILE).exists());
+
+    let mut builder = DocumentStoreBuilder::new_with_options(&path, &opts).unwrap();
+    assert_eq!(builder.num_documents(), 30);
+    for i in 30..50u64 {
+        builder
+            .add(&make_doc(
+                &format!("DOC-{:04}", i),
+                format!("content-{}", i).as_bytes(),
+            ))
+            .unwrap();
+    }
+    builder.build().unwrap();
+
+    // Checkpoint artifacts must be gone after a successful build.
+    assert!(!path.join(CHECKPOINT_FILE).exists());
+
+    let store = DocumentStore::load(&path, ContentAccess::Memory).unwrap();
+    assert_eq!(store.num_documents(), 50);
+    for i in 0..50u64 {
+        let docs = store.get_by_number(&[i]).unwrap();
+        assert_eq!(docs[0].keys["docno"], format!("DOC-{:04}", i));
+        assert_eq!(docs[0].content, format!("content-{}", i).as_bytes());
+    }
+
+    // Key lookup still works across the resume boundary.
+    let results = store
+        .get_by_key("docno", &["DOC-0003", "DOC-0027", "DOC-0042"])
+        .unwrap();
+    assert_eq!(results.len(), 3);
+    for r in &results {
+        assert!(r.is_some());
+    }
+}
+
+#[test]
+fn test_checkpoint_crash_after_adds_without_checkpoint() {
+    // Adds made after the last checkpoint must be dropped on resume so the
+    // on-disk state (content.dat, blocks.dat, key temp files) stays consistent.
+    init_logger();
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+
+    let opts = BuilderOptions {
+        block_size: 64,
+        zstd_level: 3,
+        checkpoint_frequency: 10,
+    };
+
+    {
+        let mut builder = DocumentStoreBuilder::new_with_options(&path, &opts).unwrap();
+        // First 10 trigger a checkpoint at doc 10.
+        for i in 0..10u64 {
+            builder
+                .add(&make_doc(
+                    &format!("DOC-{:04}", i),
+                    format!("c{}", i).as_bytes(),
+                ))
+                .unwrap();
+        }
+        // Add 3 more without another checkpoint, then drop: these should be lost.
+        for i in 10..13u64 {
+            builder
+                .add(&make_doc(
+                    &format!("DOC-{:04}", i),
+                    format!("c{}", i).as_bytes(),
+                ))
+                .unwrap();
+        }
+    }
+
+    let mut builder = DocumentStoreBuilder::new_with_options(&path, &opts).unwrap();
+    // Only the 10 checkpointed docs survived.
+    assert_eq!(builder.num_documents(), 10);
+
+    // Re-add docs 10..13 (under the same key values — no duplicate error proves
+    // the temp key files were truncated on resume).
+    for i in 10..13u64 {
+        builder
+            .add(&make_doc(
+                &format!("DOC-{:04}", i),
+                format!("c{}", i).as_bytes(),
+            ))
+            .unwrap();
+    }
+    builder.build().unwrap();
+
+    let store = DocumentStore::load(&path, ContentAccess::Memory).unwrap();
+    assert_eq!(store.num_documents(), 13);
+    for i in 0..13u64 {
+        let docs = store.get_by_number(&[i]).unwrap();
+        assert_eq!(docs[0].keys["docno"], format!("DOC-{:04}", i));
+        assert_eq!(docs[0].content, format!("c{}", i).as_bytes());
+    }
+}
+
+#[test]
+fn test_checkpoint_disabled_starts_fresh() {
+    // With checkpoint_frequency = 0, a pre-existing checkpoint file is ignored
+    // and the build starts from scratch (truncating output files).
+    init_logger();
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+
+    let opts = BuilderOptions {
+        block_size: 64,
+        zstd_level: 3,
+        checkpoint_frequency: 2,
+    };
+    {
+        let mut builder = DocumentStoreBuilder::new_with_options(&path, &opts).unwrap();
+        for i in 0..4u64 {
+            builder
+                .add(&make_doc(&format!("OLD-{}", i), b"old"))
+                .unwrap();
+        }
+        // Drop with an active checkpoint on disk.
+    }
+    assert!(path.join(CHECKPOINT_FILE).exists());
+
+    // Fresh start via the non-checkpoint constructor.
+    let mut builder = DocumentStoreBuilder::new(&path, 4096, 3).unwrap();
+    builder.add(&make_doc("NEW-0", b"new")).unwrap();
+    builder.build().unwrap();
+
+    let store = DocumentStore::load(&path, ContentAccess::Memory).unwrap();
+    assert_eq!(store.num_documents(), 1);
+    let docs = store.get_by_number(&[0]).unwrap();
+    assert_eq!(docs[0].keys["docno"], "NEW-0");
 }
 
 #[test]

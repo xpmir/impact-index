@@ -68,6 +68,7 @@ pub const META_FILE: &str = "docstore.cbor";
 pub const CONTENT_FILE: &str = "content.dat";
 pub const BLOCKS_FILE: &str = "blocks.dat";
 pub const OFFSETS_FILE: &str = "offsets.dat";
+pub const CHECKPOINT_FILE: &str = "docstore_checkpoint.cbor";
 
 pub fn key_fst_file(key_name: &str) -> String {
     format!("key_{}.fst", key_name)

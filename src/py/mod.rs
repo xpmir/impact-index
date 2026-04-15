@@ -960,11 +960,30 @@ pub struct PyDocumentStoreBuilder {
 // gen_stub_pymethods skipped: (Self, Parent) return in #[new] unsupported
 #[pymethods]
 impl PyDocumentStoreBuilder {
+    /// Create a new DocumentStoreBuilder.
+    ///
+    /// Args:
+    ///     folder: Directory to write the store into.
+    ///     block_size: Uncompressed block size in bytes before flushing.
+    ///     zstd_level: zstd compression level.
+    ///     checkpoint_frequency: If non-zero, checkpoint every N added
+    ///         documents. Reopening with the same folder and a non-zero
+    ///         ``checkpoint_frequency`` resumes from the last checkpoint.
     #[new]
-    #[pyo3(signature = (folder, block_size=4096, zstd_level=3))]
-    fn new(folder: &str, block_size: usize, zstd_level: i32) -> PyResult<Self> {
+    #[pyo3(signature = (folder, block_size=4096, zstd_level=3, checkpoint_frequency=0))]
+    fn new(
+        folder: &str,
+        block_size: usize,
+        zstd_level: i32,
+        checkpoint_frequency: u64,
+    ) -> PyResult<Self> {
+        let opts = docstore::builder::BuilderOptions {
+            block_size,
+            zstd_level,
+            checkpoint_frequency,
+        };
         let builder =
-            docstore::builder::DocumentStoreBuilder::new(Path::new(folder), block_size, zstd_level)
+            docstore::builder::DocumentStoreBuilder::new_with_options(Path::new(folder), &opts)
                 .map_err(|e| {
                     pyo3::exceptions::PyIOError::new_err(format!(
                         "Failed to create DocumentStoreBuilder: {}",
@@ -987,6 +1006,29 @@ impl PyDocumentStoreBuilder {
                 pyo3::exceptions::PyRuntimeError::new_err("Builder already consumed by build()")
             })?
             .add(&doc)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{}", e)))
+    }
+
+    /// Number of documents added so far (including any restored from a checkpoint).
+    fn num_documents(&self) -> PyResult<u64> {
+        Ok(self
+            .builder
+            .as_ref()
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("Builder already consumed by build()")
+            })?
+            .num_documents())
+    }
+
+    /// Force a checkpoint now. Only useful when the builder was created with
+    /// a non-zero ``checkpoint_frequency``.
+    fn checkpoint(&mut self) -> PyResult<()> {
+        self.builder
+            .as_mut()
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("Builder already consumed by build()")
+            })?
+            .checkpoint()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{}", e)))
     }
 

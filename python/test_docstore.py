@@ -106,6 +106,34 @@ class TestDocumentStore:
         store = impact_index.DocumentStore.load(store_dir)
         assert store.num_documents() == 1
 
+    def test_checkpoint_and_resume(self, tmp_path):
+        store_dir = str(tmp_path / "store")
+        os.makedirs(store_dir)
+
+        builder = impact_index.DocumentStoreBuilder(
+            store_dir, block_size=64, checkpoint_frequency=5
+        )
+        for i in range(12):
+            builder.add({"id": f"DOC-{i:03d}"}, f"c{i}".encode())
+        builder.checkpoint()
+        assert builder.num_documents() == 12
+        del builder  # simulate exit without build()
+
+        builder = impact_index.DocumentStoreBuilder(
+            store_dir, block_size=64, checkpoint_frequency=5
+        )
+        assert builder.num_documents() == 12
+        for i in range(12, 20):
+            builder.add({"id": f"DOC-{i:03d}"}, f"c{i}".encode())
+        builder.build()
+
+        store = impact_index.DocumentStore.load(store_dir)
+        assert store.num_documents() == 20
+        docs = store.get_by_key("id", ["DOC-000", "DOC-010", "DOC-019"])
+        assert all(d is not None for d in docs)
+        assert docs[0].content == b"c0"
+        assert docs[2].content == b"c19"
+
 
 class TestAsyncDocumentStore:
     @pytest.mark.asyncio

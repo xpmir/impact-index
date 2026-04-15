@@ -420,6 +420,42 @@ Use :class:`~impact_index.DocumentStoreBuilder` to create a store:
     # Finalize (can only be called once)
     builder.build()
 
+Resumable builds (crash recovery)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For long-running ingests, pass ``checkpoint_frequency`` to periodically
+persist the in-flight builder state. If the process crashes or exits
+before ``build()``, re-instantiating the builder against the same folder
+(with the same non-zero ``checkpoint_frequency``) will resume from the
+last checkpoint — any documents added after the last checkpoint but
+before the crash are discarded, and the output files are rewound to a
+consistent state.
+
+.. code-block:: python
+
+    builder = impact_index.DocumentStoreBuilder(
+        "/path/to/store",
+        checkpoint_frequency=10_000,  # checkpoint every 10k documents
+    )
+
+    for doc in documents:
+        builder.add(doc.keys, doc.content)
+
+    builder.build()  # clears the checkpoint on success
+
+    # On resume after a crash:
+    builder = impact_index.DocumentStoreBuilder(
+        "/path/to/store",
+        checkpoint_frequency=10_000,
+    )
+    print(builder.num_documents())  # docs restored from the last checkpoint
+    # Continue adding from wherever your source left off, then build().
+
+Call ``builder.checkpoint()`` directly to force a checkpoint at an
+arbitrary point (e.g. before exiting normally so that no work is lost).
+Passing ``checkpoint_frequency=0`` (the default) disables checkpointing
+and truncates any stale checkpoint on open.
+
 Retrieving documents
 ~~~~~~~~~~~~~~~~~~~~
 
