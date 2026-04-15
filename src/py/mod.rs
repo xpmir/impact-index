@@ -966,16 +966,20 @@ impl PyDocumentStoreBuilder {
     ///     folder: Directory to write the store into.
     ///     block_size: Uncompressed block size in bytes before flushing.
     ///     zstd_level: zstd compression level.
-    ///     checkpoint_frequency: If non-zero, checkpoint every N added
-    ///         documents. Reopening with the same folder and a non-zero
-    ///         ``checkpoint_frequency`` resumes from the last checkpoint.
+    ///     checkpoint_frequency: Controls checkpointing/recovery.
+    ///         - ``0`` (default): disabled — output files are truncated on
+    ///           open and any existing checkpoint is removed.
+    ///         - ``N > 0``: recover from any existing checkpoint, then
+    ///           automatically checkpoint every ``N`` added documents.
+    ///         - ``None``: recover from any existing checkpoint, but never
+    ///           auto-checkpoint — call ``checkpoint()`` manually.
     #[new]
-    #[pyo3(signature = (folder, block_size=4096, zstd_level=3, checkpoint_frequency=0))]
+    #[pyo3(signature = (folder, block_size=4096, zstd_level=3, checkpoint_frequency=Some(0)))]
     fn new(
         folder: &str,
         block_size: usize,
         zstd_level: i32,
-        checkpoint_frequency: u64,
+        checkpoint_frequency: Option<u64>,
     ) -> PyResult<Self> {
         let opts = docstore::builder::BuilderOptions {
             block_size,
@@ -995,7 +999,10 @@ impl PyDocumentStoreBuilder {
         })
     }
 
-    fn add(&mut self, keys: HashMap<String, String>, content: &[u8]) -> PyResult<()> {
+    /// Add a document. Returns ``True`` if this call triggered an automatic
+    /// checkpoint (only possible when ``checkpoint_frequency`` is a positive
+    /// integer).
+    fn add(&mut self, keys: HashMap<String, String>, content: &[u8]) -> PyResult<bool> {
         let doc = docstore::DocumentData {
             keys,
             content: content.to_vec(),

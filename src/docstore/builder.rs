@@ -14,15 +14,22 @@ use super::{
 };
 
 /// Configuration options for the [`DocumentStoreBuilder`].
+///
+/// `checkpoint_frequency` controls both crash recovery and automatic
+/// checkpointing:
+///
+/// - `Some(0)` — checkpointing disabled. Output files are truncated on
+///   open and any existing checkpoint is removed.
+/// - `Some(N)` for `N > 0` — recover from a checkpoint if one exists,
+///   and automatically write a new checkpoint every `N` added documents.
+/// - `None` — recover from a checkpoint if one exists, but never
+///   auto-checkpoint. The caller is responsible for invoking
+///   [`DocumentStoreBuilder::checkpoint`] when desired.
 #[derive(Clone, Debug)]
 pub struct BuilderOptions {
     pub block_size: usize,
     pub zstd_level: i32,
-    /// Build a checkpoint every N documents (0 disables checkpointing).
-    ///
-    /// Checkpoints allow resuming after a crash by persisting the current
-    /// in-flight state (open block, offsets, key temp files) to disk.
-    pub checkpoint_frequency: u64,
+    pub checkpoint_frequency: Option<u64>,
 }
 
 impl Default for BuilderOptions {
@@ -30,7 +37,7 @@ impl Default for BuilderOptions {
         Self {
             block_size: 4096,
             zstd_level: 3,
-            checkpoint_frequency: 0,
+            checkpoint_frequency: Some(0),
         }
     }
 }
@@ -81,21 +88,23 @@ impl DocumentStoreBuilder {
         let options = BuilderOptions {
             block_size,
             zstd_level,
-            checkpoint_frequency: 0,
+            checkpoint_frequency: Some(0),
         };
         Self::new_with_options(dir, &options)
     }
 
     /// Create a new builder with full options (including checkpointing).
     ///
-    /// If `options.checkpoint_frequency > 0` and a checkpoint file exists in
-    /// `dir`, the builder resumes from that state. Otherwise it starts fresh
-    /// (truncating any existing output files).
+    /// Recovery from an existing checkpoint is enabled whenever
+    /// `options.checkpoint_frequency` is not `Some(0)` (i.e. either `None`
+    /// or `Some(N)` for `N > 0`). Otherwise the builder starts fresh and
+    /// truncates any existing output files.
     pub fn new_with_options(dir: &Path, options: &BuilderOptions) -> BoxResult<Self> {
         fs::create_dir_all(dir)?;
 
         let checkpoint_path = dir.join(CHECKPOINT_FILE);
-        let resuming = options.checkpoint_frequency > 0 && checkpoint_path.exists();
+        let recovery_enabled = options.checkpoint_frequency != Some(0);
+        let resuming = recovery_enabled && checkpoint_path.exists();
 
         if resuming {
             Self::resume(dir, options, &checkpoint_path)
@@ -234,7 +243,10 @@ impl DocumentStoreBuilder {
     }
 
     /// Add a document to the store.
-    pub fn add(&mut self, doc: &DocumentData) -> BoxResult<()> {
+    ///
+    /// Returns `true` if this `add` triggered an automatic checkpoint
+    /// (only possible when `checkpoint_frequency = Some(N)` for `N > 0`).
+    pub fn add(&mut self, doc: &DocumentData) -> BoxResult<bool> {
         let block_index = self.num_blocks as u32;
         let intra_offset = self.current_block_buf.len() as u32;
 
@@ -280,14 +292,15 @@ impl DocumentStoreBuilder {
             self.flush_block()?;
         }
 
-        if self.options.checkpoint_frequency > 0
-            && self.num_documents - self.last_checkpoint_doc_count
-                >= self.options.checkpoint_frequency
-        {
-            self.checkpoint()?;
+        let mut checkpointed = false;
+        if let Some(freq) = self.options.checkpoint_frequency {
+            if freq > 0 && self.num_documents - self.last_checkpoint_doc_count >= freq {
+                self.checkpoint()?;
+                checkpointed = true;
+            }
         }
 
-        Ok(())
+        Ok(checkpointed)
     }
 
     fn flush_block(&mut self) -> BoxResult<()> {

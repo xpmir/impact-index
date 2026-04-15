@@ -423,38 +423,52 @@ Use :class:`~impact_index.DocumentStoreBuilder` to create a store:
 Resumable builds (crash recovery)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-For long-running ingests, pass ``checkpoint_frequency`` to periodically
-persist the in-flight builder state. If the process crashes or exits
-before ``build()``, re-instantiating the builder against the same folder
-(with the same non-zero ``checkpoint_frequency``) will resume from the
-last checkpoint — any documents added after the last checkpoint but
-before the crash are discarded, and the output files are rewound to a
-consistent state.
+The ``checkpoint_frequency`` argument controls both crash recovery and
+automatic checkpointing:
+
+- ``0`` (default) — checkpointing disabled. Output files are truncated
+  on open and any existing checkpoint file is removed.
+- ``N`` (positive int) — recover from any existing checkpoint, then
+  automatically write a new checkpoint every ``N`` added documents.
+- ``None`` — recover from any existing checkpoint, but never
+  auto-checkpoint. Call ``builder.checkpoint()`` manually whenever you
+  want a durable savepoint (e.g. before exiting cleanly).
+
+When recovery happens, any documents added between the last checkpoint
+and the crash are discarded and the output files are rewound to a
+consistent state. ``builder.num_documents()`` returns how many documents
+were restored.
+
+``builder.add(...)`` returns ``True`` whenever the call ended in an
+automatic checkpoint (only possible with a positive
+``checkpoint_frequency``), which is convenient for surfacing progress in
+your ingest loop.
 
 .. code-block:: python
 
-    builder = impact_index.DocumentStoreBuilder(
-        "/path/to/store",
-        checkpoint_frequency=10_000,  # checkpoint every 10k documents
-    )
-
-    for doc in documents:
-        builder.add(doc.keys, doc.content)
-
-    builder.build()  # clears the checkpoint on success
-
-    # On resume after a crash:
+    # Auto-checkpoint mode
     builder = impact_index.DocumentStoreBuilder(
         "/path/to/store",
         checkpoint_frequency=10_000,
     )
-    print(builder.num_documents())  # docs restored from the last checkpoint
-    # Continue adding from wherever your source left off, then build().
+    for doc in documents:
+        if builder.add(doc.keys, doc.content):
+            print(f"checkpointed at {builder.num_documents()} docs")
+    builder.build()  # clears the checkpoint on success
 
-Call ``builder.checkpoint()`` directly to force a checkpoint at an
-arbitrary point (e.g. before exiting normally so that no work is lost).
-Passing ``checkpoint_frequency=0`` (the default) disables checkpointing
-and truncates any stale checkpoint on open.
+.. code-block:: python
+
+    # Manual mode: recover if a checkpoint exists, never auto-write one
+    builder = impact_index.DocumentStoreBuilder(
+        "/path/to/store",
+        checkpoint_frequency=None,
+    )
+    print(f"resuming from {builder.num_documents()} docs")
+    for batch in batches:
+        for doc in batch:
+            builder.add(doc.keys, doc.content)
+        builder.checkpoint()  # one checkpoint per batch
+    builder.build()
 
 Retrieving documents
 ~~~~~~~~~~~~~~~~~~~~

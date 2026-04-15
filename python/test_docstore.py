@@ -113,8 +113,11 @@ class TestDocumentStore:
         builder = impact_index.DocumentStoreBuilder(
             store_dir, block_size=64, checkpoint_frequency=5
         )
+        triggered = []
         for i in range(12):
-            builder.add({"id": f"DOC-{i:03d}"}, f"c{i}".encode())
+            triggered.append(builder.add({"id": f"DOC-{i:03d}"}, f"c{i}".encode()))
+        # add() returns True on the auto-checkpoint boundaries (every 5 docs).
+        assert sum(triggered) == 2
         builder.checkpoint()
         assert builder.num_documents() == 12
         del builder  # simulate exit without build()
@@ -133,6 +136,29 @@ class TestDocumentStore:
         assert all(d is not None for d in docs)
         assert docs[0].content == b"c0"
         assert docs[2].content == b"c19"
+
+    def test_checkpoint_manual_mode(self, tmp_path):
+        # checkpoint_frequency=None -> recovery enabled, no auto-checkpoint.
+        store_dir = str(tmp_path / "store")
+        os.makedirs(store_dir)
+
+        builder = impact_index.DocumentStoreBuilder(
+            store_dir, block_size=64, checkpoint_frequency=None
+        )
+        for i in range(8):
+            assert builder.add({"id": f"D{i}"}, f"c{i}".encode()) is False
+        builder.checkpoint()
+        del builder
+
+        builder = impact_index.DocumentStoreBuilder(
+            store_dir, block_size=64, checkpoint_frequency=None
+        )
+        assert builder.num_documents() == 8
+        builder.add({"id": "D8"}, b"c8")
+        builder.build()
+
+        store = impact_index.DocumentStore.load(store_dir)
+        assert store.num_documents() == 9
 
 
 class TestAsyncDocumentStore:

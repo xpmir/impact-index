@@ -273,19 +273,25 @@ fn test_checkpoint_clean_resume() {
     let opts = BuilderOptions {
         block_size: 64,
         zstd_level: 3,
-        checkpoint_frequency: 5,
+        checkpoint_frequency: Some(5),
     };
 
     {
         let mut builder = DocumentStoreBuilder::new_with_options(&path, &opts).unwrap();
+        let mut auto_checkpoints = 0;
         for i in 0..30u64 {
-            builder
+            let did_checkpoint = builder
                 .add(&make_doc(
                     &format!("DOC-{:04}", i),
                     format!("content-{}", i).as_bytes(),
                 ))
                 .unwrap();
+            if did_checkpoint {
+                auto_checkpoints += 1;
+            }
         }
+        // Every 5 docs => 6 automatic checkpoints over 30 adds.
+        assert_eq!(auto_checkpoints, 6);
         // Force one more checkpoint so state after the last add is durable.
         builder.checkpoint().unwrap();
         // Drop without building -> simulates a crash after a clean checkpoint.
@@ -337,7 +343,7 @@ fn test_checkpoint_crash_after_adds_without_checkpoint() {
     let opts = BuilderOptions {
         block_size: 64,
         zstd_level: 3,
-        checkpoint_frequency: 10,
+        checkpoint_frequency: Some(10),
     };
 
     {
@@ -388,6 +394,66 @@ fn test_checkpoint_crash_after_adds_without_checkpoint() {
 }
 
 #[test]
+fn test_checkpoint_manual_mode() {
+    // checkpoint_frequency = None: recovery enabled, no automatic checkpoints.
+    init_logger();
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("store");
+
+    let opts = BuilderOptions {
+        block_size: 64,
+        zstd_level: 3,
+        checkpoint_frequency: None,
+    };
+
+    {
+        let mut builder = DocumentStoreBuilder::new_with_options(&path, &opts).unwrap();
+        for i in 0..15u64 {
+            let did = builder
+                .add(&make_doc(
+                    &format!("DOC-{:04}", i),
+                    format!("c{}", i).as_bytes(),
+                ))
+                .unwrap();
+            // Manual mode: add() never triggers a checkpoint on its own.
+            assert!(!did);
+        }
+        // Without an explicit checkpoint(), there is no checkpoint file yet,
+        // so nothing to recover from on a crash here.
+        assert!(!path.join(CHECKPOINT_FILE).exists());
+
+        builder.checkpoint().unwrap();
+        assert!(path.join(CHECKPOINT_FILE).exists());
+
+        // More adds without another manual checkpoint -> will be lost.
+        for i in 15..18u64 {
+            builder
+                .add(&make_doc(
+                    &format!("DOC-{:04}", i),
+                    format!("c{}", i).as_bytes(),
+                ))
+                .unwrap();
+        }
+        // Drop -> simulates crash.
+    }
+
+    let mut builder = DocumentStoreBuilder::new_with_options(&path, &opts).unwrap();
+    assert_eq!(builder.num_documents(), 15);
+    for i in 15..18u64 {
+        builder
+            .add(&make_doc(
+                &format!("DOC-{:04}", i),
+                format!("c{}", i).as_bytes(),
+            ))
+            .unwrap();
+    }
+    builder.build().unwrap();
+
+    let store = DocumentStore::load(&path, ContentAccess::Memory).unwrap();
+    assert_eq!(store.num_documents(), 18);
+}
+
+#[test]
 fn test_checkpoint_disabled_starts_fresh() {
     // With checkpoint_frequency = 0, a pre-existing checkpoint file is ignored
     // and the build starts from scratch (truncating output files).
@@ -398,7 +464,7 @@ fn test_checkpoint_disabled_starts_fresh() {
     let opts = BuilderOptions {
         block_size: 64,
         zstd_level: 3,
-        checkpoint_frequency: 2,
+        checkpoint_frequency: Some(2),
     };
     {
         let mut builder = DocumentStoreBuilder::new_with_options(&path, &opts).unwrap();
