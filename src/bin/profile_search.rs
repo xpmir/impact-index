@@ -64,7 +64,11 @@ fn main() {
         indexer.add(doc_id, &terms, &values).unwrap();
     }
     indexer.build().unwrap();
-    let raw_index = indexer.to_index(true);
+    let mut raw_index = indexer.to_index(true);
+    // P1a: per-block min_doc_length is computed at compression time from
+    // the *source* index's own doc_meta (distinct from the doc_meta handed
+    // to `ScoredIndex::new` below, which only affects query-time norms).
+    raw_index.doc_meta = Some(DocMetadata::from_lengths(doc_lengths.clone()));
 
     // Build compressed index
     eprintln!("Building compressed index...");

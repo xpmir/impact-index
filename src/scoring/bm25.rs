@@ -26,6 +26,13 @@ pub struct BM25Scoring {
 
     // Computed on initialize():
     min_dl_norm: f32,
+    /// `k1 * (1 - b)`: the length-independent half of the BM25 norm.
+    /// Cached so `max_score_with_dl` can recompute `norm(dl)` for an
+    /// arbitrary `dl` (a block or term's minimum document length) without
+    /// re-deriving it from `k1`/`b`/`avgdl` on every query.
+    k1_one_minus_b: f32,
+    /// `k1 * b / avgdl`: the length-dependent coefficient of the BM25 norm.
+    k1_b_over_avgdl: f32,
     num_docs: u64,
     /// Pre-computed BM25 norms per document as f16: k1 * (1 - b + b * dl / avgdl).
     /// Half the memory of f32/u32 (17.5MB vs 35MB for 8.8M docs), with
@@ -40,6 +47,8 @@ impl BM25Scoring {
             k1: 1.2,
             b: 0.75,
             min_dl_norm: 0.0,
+            k1_one_minus_b: 0.0,
+            k1_b_over_avgdl: 0.0,
             num_docs: 0,
             doc_norms: None,
         }
@@ -51,6 +60,8 @@ impl BM25Scoring {
             k1,
             b,
             min_dl_norm: 0.0,
+            k1_one_minus_b: 0.0,
+            k1_b_over_avgdl: 0.0,
             num_docs: 0,
             doc_norms: None,
         }
@@ -66,6 +77,8 @@ impl ScoringModel for BM25Scoring {
 
             let k1_one_minus_b = self.k1 * (1.0 - self.b);
             let k1_b_over_avgdl = self.k1 * self.b / avg_dl;
+            self.k1_one_minus_b = k1_one_minus_b;
+            self.k1_b_over_avgdl = k1_b_over_avgdl;
             self.min_dl_norm = k1_one_minus_b + k1_b_over_avgdl * min_dl as f32;
 
             // Pre-compute BM25 norms as f16 — half the cache footprint of f32/u32
@@ -99,6 +112,8 @@ impl BM25Scoring {
         BM25TermScorer {
             idf,
             min_dl_norm: self.min_dl_norm,
+            k1_one_minus_b: self.k1_one_minus_b,
+            k1_b_over_avgdl: self.k1_b_over_avgdl,
             doc_norms: self
                 .doc_norms
                 .as_ref()
@@ -114,11 +129,24 @@ impl BM25Scoring {
     }
 }
 
+/// Extra multiplicative safety margin applied (beyond the f16-rounding
+/// guard below) to the norm used by [`BM25TermScorer::max_score_with_dl`].
+/// Guards against any residual floating-point order-of-operations mismatch
+/// between the bound computation and the actual per-posting score
+/// computation, on top of the explicit f16-rounding guard. See
+/// `max_score_with_dl` for the full safety argument.
+const BOUND_SAFETY_MARGIN: f32 = 1e-3;
+
 /// Per-term BM25 scorer (includes IDF).
 pub(crate) struct BM25TermScorer {
     idf: f32,
-    /// Pre-computed normalization for min_dl (used in max_score)
+    /// Pre-computed normalization for the collection-wide min_dl (fallback
+    /// for `max_score` and for `max_score_with_dl(_, 0)`).
     min_dl_norm: f32,
+    /// `k1 * (1 - b)` (see [`BM25Scoring::k1_one_minus_b`]).
+    k1_one_minus_b: f32,
+    /// `k1 * b / avgdl` (see [`BM25Scoring::k1_b_over_avgdl`]).
+    k1_b_over_avgdl: f32,
     /// Pre-computed BM25 norms per document (f16, shared across all term scorers)
     doc_norms: Arc<Vec<f16>>,
 }
@@ -133,6 +161,47 @@ impl ScoringFunction for BM25TermScorer {
     #[inline]
     fn max_score(&self, max_tf: f32) -> f32 {
         self.idf * max_tf / (self.min_dl_norm + max_tf)
+    }
+
+    /// Tightened bound (P1a): same formula as [`Self::max_score`], but
+    /// using `norm(min_dl)` for a caller-supplied `min_dl` (a block or
+    /// term's own minimum document length) instead of the collection-wide
+    /// minimum -- BM25's TF-normalization is monotone decreasing in `dl`,
+    /// so a larger (tighter) `min_dl` always yields a smaller, still-safe
+    /// upper bound. `min_dl == 0` is the iterator-side "not available"
+    /// sentinel (see [`crate::index::BlockTermImpactIterator::min_dl`]) and
+    /// falls back to [`Self::max_score`].
+    ///
+    /// # Safety margin (why this isn't just `idf * max_tf / (norm + max_tf)`)
+    ///
+    /// Actual per-doc scores (`score`, `score_chunk`) are computed against
+    /// `doc_norms`, which stores each document's *exact* norm rounded to
+    /// `f16`. `f16` round-to-nearest can round a norm **down**, which would
+    /// make a real score computed against that (smaller) rounded norm
+    /// **larger** than a bound computed against the exact `f32` norm --
+    /// silently breaking the "bound dominates every real score" invariant
+    /// pruning depends on. Since every document of length exactly `min_dl`
+    /// gets the identical, deterministic `f16` rounding of `norm(min_dl)`
+    /// (precomputed once in `initialize`), we can compute that exact same
+    /// rounding here and pick whichever of the exact/rounded norm is
+    /// *smaller* (a smaller norm can only ever raise the bound, never lower
+    /// it below a real score). On top of that, an extra small multiplicative
+    /// margin ([`BOUND_SAFETY_MARGIN`]) guards against any remaining
+    /// floating-point order-of-operations mismatch. The
+    /// `debug_assert!`s in `compress::CompressedScoringCursor::fill_chunk`
+    /// and `scoring::ScoringBlockIterator::current` check this invariant
+    /// against real data on every debug-mode query.
+    #[inline]
+    fn max_score_with_dl(&self, max_tf: f32, min_dl: u32) -> f32 {
+        if min_dl == 0 {
+            return self.max_score(max_tf);
+        }
+
+        let raw_norm = self.k1_one_minus_b + self.k1_b_over_avgdl * min_dl as f32;
+        let f16_norm = f16::from_f32(raw_norm).to_f32();
+        let safe_norm = raw_norm.min(f16_norm) * (1.0 - BOUND_SAFETY_MARGIN);
+
+        self.idf * max_tf / (safe_norm + max_tf)
     }
 
     /// Batched BM25 scoring (P1b). Two passes over the chunk rather than

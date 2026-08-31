@@ -24,6 +24,26 @@ pub trait ScoringFunction: Send + Sync {
     /// Safe upper bound on score for the given max raw value.
     fn max_score(&self, max_raw_value: f32) -> f32;
 
+    /// Safe upper bound on score for the given max raw value, additionally
+    /// tightened using `min_dl` -- the minimum document length among the
+    /// postings the bound must cover (a whole term, or just the current
+    /// block; see [`crate::index::BlockTermImpactIterator::min_dl`] /
+    /// [`crate::index::BlockTermImpactIterator::min_block_dl`]) (P1a).
+    ///
+    /// `min_dl == 0` is the "not available" sentinel (see those methods'
+    /// docs): implementations must treat it as "fall back to
+    /// [`Self::max_score`]", not as a literal document length of zero.
+    ///
+    /// The default implementation ignores `min_dl` entirely and returns
+    /// [`Self::max_score`] -- always safe (if looser), and the only
+    /// possible behavior for a scorer whose bound isn't monotone in
+    /// document length. Only override this for scorers (BM25,
+    /// LM-Dirichlet, ...) whose TF-normalization is monotone decreasing in
+    /// `dl`.
+    fn max_score_with_dl(&self, max_raw_value: f32, _min_dl: u32) -> f32 {
+        self.max_score(max_raw_value)
+    }
+
     /// Batched scoring (P1b): score a chunk of postings from a decoded
     /// block in one call. `docid_offsets[i]` is the offset from
     /// `block_min_doc_id` and `tfs[i]` the raw posting value; the absolute
@@ -89,10 +109,16 @@ struct ScoringBlockIterator<'a> {
 
 impl<'a> ScoringBlockIterator<'a> {
     /// Refresh cached block metadata from the inner iterator.
+    ///
+    /// Uses `max_score_with_dl` with the block's own minimum document
+    /// length (P1a), rather than a collection-wide minimum, so pruning is
+    /// tightened for every dl-monotone scorer without touching this
+    /// generic (dyn-dispatched) path's callers.
     #[inline]
     fn refresh_block_cache(&mut self) {
         let raw_block_max = self.inner.max_block_value();
-        self.cached_scored_block_max = self.scorer.max_score(raw_block_max);
+        let min_block_dl = self.inner.min_block_dl();
+        self.cached_scored_block_max = self.scorer.max_score_with_dl(raw_block_max, min_block_dl);
         self.cached_block_min_doc_id = self.inner.min_block_doc_id();
         self.cached_block_max_doc_id = self.inner.max_block_doc_id();
     }
@@ -118,6 +144,14 @@ impl<'a> BlockTermImpactIterator for ScoringBlockIterator<'a> {
             docid: raw.docid,
             value: self.scorer.score(raw.value, raw.docid),
         };
+        debug_assert!(
+            scored.value
+                <= self.cached_scored_block_max + self.cached_scored_block_max.abs() * 1e-3 + 1e-4,
+            "score {} for doc {} exceeds block bound {} (P1a safety violation)",
+            scored.value,
+            scored.docid,
+            self.cached_scored_block_max
+        );
         self.current_impact.set(Some(scored));
         scored
     }
@@ -216,7 +250,9 @@ impl SparseIndex for ScoredIndex {
         let (_, max_raw_value) = SparseIndexInformation::value_range(&**self.inner, term_ix);
         let df = inner_iter.length() as u64;
         let scorer = self.model.term_scorer(df, max_raw_value);
-        let max_value = scorer.max_score(max_raw_value);
+        // Term-level bound tightened with the term's own minimum document
+        // length (P1a), rather than the collection-wide minimum.
+        let max_value = scorer.max_score_with_dl(max_raw_value, inner_iter.min_dl());
 
         Box::new(ScoringBlockIterator {
             cached_max_doc_id: inner_iter.max_doc_id(),
@@ -249,12 +285,13 @@ impl Len for ScoredIndex {
 impl SparseIndexInformation for ScoredIndex {
     fn value_range(&self, term_ix: TermIndex) -> (ImpactValue, ImpactValue) {
         let (_, max_raw) = SparseIndexInformation::value_range(&**self.inner, term_ix);
-        let df = if term_ix < self.inner.len() {
-            self.inner.block_iterator(term_ix).length() as u64
+        let (df, min_dl) = if term_ix < self.inner.len() {
+            let it = self.inner.block_iterator(term_ix);
+            (it.length() as u64, it.min_dl())
         } else {
-            0
+            (0, 0)
         };
         let scorer = self.model.term_scorer(df, max_raw);
-        (0.0, scorer.max_score(max_raw))
+        (0.0, scorer.max_score_with_dl(max_raw, min_dl))
     }
 }

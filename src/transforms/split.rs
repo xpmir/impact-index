@@ -431,6 +431,10 @@ impl<'a> SparseIndexView for SplitIndexView<'a> {
     fn max_doc_id(&self) -> DocId {
         self.source.max_doc_id()
     }
+
+    fn doc_meta(&self) -> Option<&crate::docmeta::DocMetadata> {
+        self.source.doc_meta()
+    }
 }
 
 impl<'a> Len for SplitIndexView<'a> {

@@ -52,7 +52,7 @@ pub const MANIFEST_FILENAME: &str = "manifest.json";
 /// `FORWARD_INDEX_VERSION` in `index.rs`, `COMPRESSED_INDEX_VERSION` in
 /// `compress/mod.rs`). Those stay as fine-grained safety checks on their
 /// own file formats; this is the version [`update_index`] migrates.
-pub const CURRENT_FORMAT_VERSION: u32 = 1;
+pub const CURRENT_FORMAT_VERSION: u32 = 2;
 
 /// Kind of index directory described by a manifest.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -320,7 +320,56 @@ fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
 /// doesn't actually have.
 fn migrate_legacy_to_v1(path: &Path) -> io::Result<()> {
     let kind = detect_index_kind(path);
-    write_manifest(path, kind, BuilderInfo::new())
+    // Explicitly version 1 (not `write_manifest`'s `CURRENT_FORMAT_VERSION`,
+    // which is now 2): each step in the chain must stamp the version it
+    // actually brought the directory to, one at a time, so a crash between
+    // two steps never leaves a manifest claiming a version whose data
+    // rewrite hasn't actually happened yet.
+    let mut manifest = Manifest::new(kind, BuilderInfo::new());
+    manifest.format_version = 1;
+    write_manifest_raw(path, &manifest)
+}
+
+/// v1 -> v2 (P1a): adds per-block (and derived per-term) minimum document
+/// length statistics to a compressed index's `index.bin`, so dl-monotone
+/// scorers (BM25, LM-Dirichlet) get a tight, model-agnostic upper bound
+/// instead of the collection-wide minimum.
+///
+/// Dispatches on the directory's `index_kind`:
+/// - `Compressed`: rewrites `index.bin` via
+///   [`crate::compress::migrate_add_min_dl`] (recomputed from `docmeta.*`
+///   if present; postings themselves are untouched).
+/// - `Split`: has no `index.bin` of its own -- it wraps an inner
+///   (typically `Compressed`) index directory at `<path>/inner`, which
+///   carries its *own* manifest and is migrated independently by
+///   recursing into [`update_index`] (this correctly handles the inner
+///   directory being manifest-less, already at v1, or already current).
+/// - `Forward`: raw (uncompressed) forward indices have no per-block
+///   metadata of this shape -- nothing to rewrite.
+///
+/// As with [`migrate_legacy_to_v1`], the manifest is written *last*, after
+/// any data rewrite, so a step that fails partway never leaves a directory
+/// claiming a version it doesn't actually have.
+fn migrate_v1_to_v2(path: &Path) -> io::Result<()> {
+    let kind = read_manifest(path)?
+        .map(|m| m.index_kind)
+        .unwrap_or_else(|| detect_index_kind(path));
+
+    match kind {
+        IndexKind::Compressed => crate::compress::migrate_add_min_dl(path)?,
+        IndexKind::Split => {
+            let inner = path.join("inner");
+            if inner.is_dir() {
+                update_index(&inner, None)?;
+            }
+        }
+        IndexKind::Forward => {}
+    }
+
+    let mut manifest =
+        read_manifest(path)?.unwrap_or_else(|| Manifest::new(kind, BuilderInfo::new()));
+    manifest.format_version = 2;
+    write_manifest_raw(path, &manifest)
 }
 
 /// Migrates the index directory at `path` to [`CURRENT_FORMAT_VERSION`].
@@ -358,9 +407,11 @@ pub fn update_index(path: &Path, dest: Option<&Path>) -> io::Result<PathBuf> {
     };
 
     // Ordered chain of migration steps, keyed by the version they start
-    // from. Add new entries here as the format evolves -- e.g. once P1a
-    // lands: `(1, migrate_v1_to_v2)`.
-    let steps: &[(u32, fn(&Path) -> io::Result<()>)] = &[(0, migrate_legacy_to_v1)];
+    // from. Add new entries here as the format evolves further (P1a's
+    // `(1, migrate_v1_to_v2)` is the template: recompute/rewrite what
+    // changed, write the manifest last).
+    let steps: &[(u32, fn(&Path) -> io::Result<()>)] =
+        &[(0, migrate_legacy_to_v1), (1, migrate_v1_to_v2)];
 
     while current_version != CURRENT_FORMAT_VERSION {
         if current_version > CURRENT_FORMAT_VERSION {

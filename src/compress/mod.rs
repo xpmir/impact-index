@@ -58,13 +58,27 @@ pub struct TermBlockInformation {
 
     /// Maximum document ID for this page
     pub max_doc_id: DocId,
+
+    /// Minimum document length among the documents stored in this block
+    /// (P1a), used by dl-monotone scorers (BM25, LM-Dirichlet) for a tight,
+    /// model-agnostic upper bound via
+    /// [`crate::scoring::ScoringFunction::max_score_with_dl`].
+    ///
+    /// `0` means "not available" (docmeta wasn't present when the index was
+    /// built/migrated) -- scorers treat that as a sentinel and fall back to
+    /// their collection-wide bound, never as a literal document length of
+    /// zero. Document lengths above `u16::MAX` saturate to `u16::MAX`; since
+    /// this is always a *minimum*, saturating down-clamps a huge length to
+    /// something smaller, which only ever loosens (never tightens past
+    /// safe) the resulting bound.
+    pub min_doc_length: u16,
 }
 
 impl std::fmt::Display for TermBlockInformation {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "(docids: {}-{}, impacts: {}-{}, len: {}, max_v: {}, docid: {}-{})",
+            "(docids: {}-{}, impacts: {}-{}, len: {}, max_v: {}, docid: {}-{}, min_dl: {})",
             self.docid_position_range.0,
             self.docid_position_range.1,
             self.impact_position_range.0,
@@ -72,7 +86,8 @@ impl std::fmt::Display for TermBlockInformation {
             self.length,
             self.max_value,
             self.min_doc_id,
-            self.max_doc_id
+            self.max_doc_id,
+            self.min_doc_length
         )
     }
 }
@@ -209,6 +224,13 @@ pub struct TermBlocksInformation {
     pub max_value: ImpactValue,
     pub max_doc_id: DocId,
     pub length: usize,
+    /// Minimum of `pages[..].min_doc_length` (P1a), i.e. the minimum
+    /// document length across the whole term, used for the term-level
+    /// score bound. `0` if `pages` is empty or every block's
+    /// `min_doc_length` is the "not available" sentinel. Always derived
+    /// from `pages` (at build time or at [`CompressedIndexInformation::read_binary`]
+    /// time) rather than stored as independent state.
+    pub min_dl: u32,
 }
 
 /// Global information on the index structure
@@ -220,7 +242,12 @@ pub struct CompressedIndexInformation {
 }
 
 const COMPRESSED_INDEX_MAGIC: u32 = 0x49445832; // "IDX2"
-const COMPRESSED_INDEX_VERSION: u32 = 3;
+/// v4 (P1a): adds a per-block `min_doc_length: u16` trailer to every block
+/// record (see [`TermBlockInformation::min_doc_length`]). v3 -> v4
+/// directories must be migrated via `manifest::update_index` (registered
+/// as the `(1, migrate_v1_to_v2)` step) -- `read_binary` below refuses to
+/// silently reinterpret v3 bytes.
+const COMPRESSED_INDEX_VERSION: u32 = 4;
 
 /// Write a u64 as variable-length integer (1-9 bytes).
 fn write_vint(writer: &mut dyn Write, mut v: u64) -> std::io::Result<()> {
@@ -256,7 +283,15 @@ impl CompressedIndexInformation {
     /// Per-term:  20 bytes (num_blocks:u32, max_value:f32, max_doc_id:u64, length:u32)
     /// Per-block: 24 bytes (docid_len:u32, impact_len:u32, length:u16, _pad:u16,
     ///                       max_value:f32, min_doc_id:u64, max_doc_id:u64)
-    fn write_binary(&self, writer: &mut dyn Write) -> std::io::Result<()> {
+    ///
+    /// Format v4 (P1a) appends one more field per block:
+    ///   `min_doc_length: u16` (see [`TermBlockInformation::min_doc_length`]).
+    ///
+    /// `pub` (rather than the usual module-private helper) so integration
+    /// tests can inspect exactly what was written, e.g. to hand-verify
+    /// migrated `min_doc_length` values (`tests/*.rs` link this crate
+    /// externally and can't see private items).
+    pub fn write_binary(&self, writer: &mut dyn Write) -> std::io::Result<()> {
         use byteorder::{LittleEndian, WriteBytesExt};
 
         // Header
@@ -313,6 +348,8 @@ impl CompressedIndexInformation {
                 write_vint(writer, block.min_doc_id - prev_doc_id)?;
                 write_vint(writer, block.max_doc_id - block.min_doc_id)?;
                 prev_doc_id = block.max_doc_id;
+                // P1a: per-block minimum document length (0 = not available).
+                writer.write_u16::<LittleEndian>(block.min_doc_length)?;
             }
         }
         Ok(())
@@ -320,7 +357,17 @@ impl CompressedIndexInformation {
 
     /// Read metadata from compact binary format.
     /// Reconstructs absolute byte positions via prefix sum.
-    fn read_binary(reader: &mut dyn std::io::Read) -> std::io::Result<Self> {
+    ///
+    /// `pub` for the same reason as [`Self::write_binary`]: integration
+    /// tests need to inspect the structured result (e.g. to verify
+    /// `min_doc_length` after a migration). This is the *live* reader --
+    /// it rejects anything other than [`COMPRESSED_INDEX_VERSION`] via
+    /// [`crate::manifest::check_format_version`], with an actionable error
+    /// pointing at `Index.update`/`update_index` rather than silently
+    /// misreading an older layout (see the `manifest` module docs). Only
+    /// [`migrate_add_min_dl`]'s private `read_binary_v3` understands the
+    /// old (v3) layout, and only for the sake of migrating it away.
+    pub fn read_binary(reader: &mut dyn std::io::Read) -> std::io::Result<Self> {
         use byteorder::{LittleEndian, ReadBytesExt};
 
         let magic = reader.read_u32::<LittleEndian>()?;
@@ -370,6 +417,7 @@ impl CompressedIndexInformation {
                 let min_doc_id = prev_doc_id + read_vint(reader)?;
                 let block_max_doc_id = min_doc_id + read_vint(reader)?;
                 prev_doc_id = block_max_doc_id;
+                let min_doc_length = reader.read_u16::<LittleEndian>()?;
 
                 pages.push(TermBlockInformation {
                     docid_position_range: (docid_pos, docid_pos + docid_len),
@@ -378,17 +426,27 @@ impl CompressedIndexInformation {
                     max_value: block_max_value,
                     min_doc_id,
                     max_doc_id: block_max_doc_id,
+                    min_doc_length,
                 });
 
                 docid_pos += docid_len;
                 impact_pos += impact_len;
             }
 
+            // Per-term min_dl (P1a) is always *derived* from the blocks,
+            // never stored independently -- see `TermBlocksInformation::min_dl`.
+            let min_dl = pages
+                .iter()
+                .map(|p| p.min_doc_length as u32)
+                .min()
+                .unwrap_or(0);
+
             terms.push(TermBlocksInformation {
                 pages,
                 max_value,
                 max_doc_id,
                 length,
+                min_dl,
             });
         }
 
@@ -398,6 +456,209 @@ impl CompressedIndexInformation {
             values_compressor,
         })
     }
+}
+
+/// Reads the pre-P1a (v3) binary layout: identical to
+/// [`CompressedIndexInformation::read_binary`] except that per-block
+/// records have no `min_doc_length` trailer. Every field it can't recover
+/// (`min_doc_length`, `min_dl`) is filled with the `0` ("not available")
+/// sentinel -- [`migrate_add_min_dl`] (the only caller) immediately
+/// overwrites those from `docmeta` before writing the file back out in the
+/// current (v4) layout.
+///
+/// This exists *only* for the v1->v2 manifest migration step -- the live
+/// loader (`read_binary`) intentionally does *not* fall back to this: an
+/// unmigrated v3 directory must fail with the actionable
+/// "run Index.update" error, not be silently reinterpreted.
+fn read_binary_v3(reader: &mut dyn std::io::Read) -> std::io::Result<CompressedIndexInformation> {
+    use byteorder::{LittleEndian, ReadBytesExt};
+
+    let magic = reader.read_u32::<LittleEndian>()?;
+    if magic != COMPRESSED_INDEX_MAGIC {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Not a compressed index binary file",
+        ));
+    }
+    let version = reader.read_u32::<LittleEndian>()?;
+    if version != 3 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "migrate_add_min_dl expected a legacy v3 compressed index, found v{} \
+                 (index.bin should have been at v3 for the v1->v2 manifest migration step \
+                 to apply -- this indicates a manifest/binary version mismatch)",
+                version
+            ),
+        ));
+    }
+    let num_terms = reader.read_u32::<LittleEndian>()? as usize;
+
+    let compressor_len = reader.read_u32::<LittleEndian>()? as usize;
+    let mut compressor_buf = vec![0u8; compressor_len];
+    reader.read_exact(&mut compressor_buf)?;
+    let (doc_ids_compressor, values_compressor): (
+        Box<dyn DocIdCompressor>,
+        Box<dyn ImpactCompressor>,
+    ) = ciborium::de::from_reader(&compressor_buf[..])
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+
+    let mut terms = Vec::with_capacity(num_terms);
+    let mut docid_pos: u64 = 0;
+    let mut impact_pos: u64 = 0;
+
+    for _ in 0..num_terms {
+        let num_blocks = read_vint(reader)? as usize;
+        let max_value = reader.read_f32::<LittleEndian>()?;
+        let max_doc_id = read_vint(reader)?;
+        let length = read_vint(reader)? as usize;
+        let min_block_val = reader.read_f32::<LittleEndian>()?;
+        let range = max_value - min_block_val;
+
+        let mut pages = Vec::with_capacity(num_blocks);
+        let mut prev_doc_id: u64 = 0;
+        for _ in 0..num_blocks {
+            let docid_len = read_vint(reader)?;
+            let impact_len = read_vint(reader)?;
+            let block_length = read_vint(reader)? as usize;
+            let mut q_byte = [0u8; 1];
+            reader.read_exact(&mut q_byte)?;
+            let block_max_value = min_block_val + (q_byte[0] as f32 / 255.0) * range;
+            let min_doc_id = prev_doc_id + read_vint(reader)?;
+            let block_max_doc_id = min_doc_id + read_vint(reader)?;
+            prev_doc_id = block_max_doc_id;
+            // No min_doc_length trailer in v3 -- filled in by the caller.
+
+            pages.push(TermBlockInformation {
+                docid_position_range: (docid_pos, docid_pos + docid_len),
+                impact_position_range: (impact_pos, impact_pos + impact_len),
+                length: block_length,
+                max_value: block_max_value,
+                min_doc_id,
+                max_doc_id: block_max_doc_id,
+                min_doc_length: 0,
+            });
+
+            docid_pos += docid_len;
+            impact_pos += impact_len;
+        }
+
+        terms.push(TermBlocksInformation {
+            pages,
+            max_value,
+            max_doc_id,
+            length,
+            min_dl: 0,
+        });
+    }
+
+    Ok(CompressedIndexInformation {
+        terms,
+        doc_ids_compressor,
+        values_compressor,
+    })
+}
+
+/// P1a migration step (registered as `(1, migrate_v1_to_v2)` in
+/// `manifest::update_index`'s step table): rewrites a compressed index
+/// directory's `index.bin` from the v3 layout (no per-block
+/// `min_doc_length`) to v4, recomputing that statistic from `docmeta.*`
+/// (if present) by decoding each block's existing doc-id bytes -- the
+/// posting files themselves (`docids.dat`/`impacts.dat`) are never
+/// touched, only the metadata file is rewritten. Streams one term's blocks
+/// at a time (via an mmap over `docids.dat`) rather than holding the whole
+/// index's postings in memory.
+///
+/// If `docmeta.*` is missing, every block/term gets `min_doc_length = 0`,
+/// which is exactly the old global-min-based bound behavior via
+/// `ScoringFunction::max_score_with_dl`'s `min_dl == 0` fallback -- still
+/// correct, just not tighter. If `index.bin` doesn't exist at all (this
+/// directory isn't a compressed-index directory, e.g. a `Split` wrapper's
+/// own directory, which has no `index.bin` of its own), this is a no-op.
+pub(crate) fn migrate_add_min_dl(path: &Path) -> std::io::Result<()> {
+    use byteorder::{LittleEndian, ReadBytesExt};
+
+    let bin_path = path.join("index.bin");
+    if !bin_path.exists() {
+        return Ok(());
+    }
+
+    // Peek the on-disk binary version before committing to the v3 layout:
+    // a manifest-less directory can be genuinely legacy (v3 binary, no
+    // min_doc_length -- the case this migration exists for) or can already
+    // carry the current (v4) binary layout with just a missing/stale
+    // manifest (e.g. rebuilt with this library but never re-stamped) --
+    // that needs no data rewrite at all.
+    let version = {
+        let mut reader = std::io::BufReader::new(File::open(&bin_path)?);
+        let _magic = reader.read_u32::<LittleEndian>()?;
+        reader.read_u32::<LittleEndian>()?
+    };
+    if version == COMPRESSED_INDEX_VERSION {
+        return Ok(());
+    }
+
+    let mut info = {
+        let mut reader = std::io::BufReader::new(File::open(&bin_path)?);
+        read_binary_v3(&mut reader)?
+    };
+
+    let doc_meta = crate::docmeta::DocMetadata::load(path).ok();
+    let docid_buffer = doc_meta
+        .is_some()
+        .then(|| MmapBuffer::new(&path.join("docids.dat")));
+
+    for term in info.terms.iter_mut() {
+        let mut term_min_dl = u32::MAX;
+        let mut offsets: Vec<u32> = Vec::new();
+
+        for block in term.pages.iter_mut() {
+            let min_doc_length: u16 = match (&doc_meta, &docid_buffer) {
+                (Some(dm), Some(buf)) => {
+                    let bytes = buf
+                        .as_bytes()
+                        .expect("MmapBuffer::as_bytes always returns Some");
+                    let slice = &bytes[block.docid_position_range.0 as usize
+                        ..block.docid_position_range.1 as usize];
+                    info.doc_ids_compressor
+                        .decode_offsets_into(slice, block, &mut offsets);
+
+                    offsets
+                        .iter()
+                        .map(|&o| {
+                            dm.doc_lengths
+                                .get((block.min_doc_id + o as DocId) as usize)
+                                .copied()
+                                .unwrap_or(0)
+                        })
+                        .min()
+                        .unwrap_or(0)
+                        .min(u16::MAX as u32) as u16
+                }
+                _ => 0,
+            };
+            block.min_doc_length = min_doc_length;
+            term_min_dl = term_min_dl.min(min_doc_length as u32);
+        }
+
+        term.min_dl = if term.pages.is_empty() {
+            0
+        } else {
+            term_min_dl
+        };
+    }
+
+    // Write to a temp file, then rename over index.bin: a crash/interrupt
+    // partway through never leaves a truncated or half-written metadata
+    // file in place.
+    let tmp_path = path.join("index.bin.migrating");
+    {
+        let mut writer = std::io::BufWriter::new(File::create(&tmp_path)?);
+        info.write_binary(&mut writer)?;
+    }
+    std::fs::rename(&tmp_path, &bin_path)?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -419,6 +680,7 @@ mod tests {
                             max_value: 3.14,
                             min_doc_id: 0,
                             max_doc_id: 500,
+                            min_doc_length: 5,
                         },
                         TermBlockInformation {
                             docid_position_range: (100, 180),
@@ -427,11 +689,13 @@ mod tests {
                             max_value: 2.71,
                             min_doc_id: 501,
                             max_doc_id: 999,
+                            min_doc_length: 12,
                         },
                     ],
                     max_value: 3.14,
                     max_doc_id: 999,
                     length: 192,
+                    min_dl: 5,
                 },
                 TermBlocksInformation {
                     pages: vec![TermBlockInformation {
@@ -441,10 +705,12 @@ mod tests {
                         max_value: 1.0,
                         min_doc_id: 10,
                         max_doc_id: 800,
+                        min_doc_length: 3,
                     }],
                     max_value: 1.0,
                     max_doc_id: 800,
                     length: 32,
+                    min_dl: 3,
                 },
             ],
             doc_ids_compressor: Box::new(EliasFanoCompressor {}),
@@ -468,6 +734,11 @@ mod tests {
         assert!((loaded.terms[0].pages[0].max_value - 3.14).abs() < 1e-5);
         assert_eq!(loaded.terms[0].pages[0].min_doc_id, 0);
         assert_eq!(loaded.terms[0].pages[0].max_doc_id, 500);
+        assert_eq!(loaded.terms[0].pages[0].min_doc_length, 5);
+        assert_eq!(loaded.terms[0].pages[1].min_doc_length, 12);
+        assert_eq!(loaded.terms[0].min_dl, 5);
+        assert_eq!(loaded.terms[1].pages[0].min_doc_length, 3);
+        assert_eq!(loaded.terms[1].min_dl, 3);
 
         // Second block of first term
         assert_eq!(loaded.terms[0].pages[1].docid_position_range, (100, 180));
@@ -765,6 +1036,8 @@ struct CompressedBlockTermImpactIterator<'a> {
     cached_block_min_doc_id: DocId,
     cached_block_max_doc_id: DocId,
     cached_block_max_value: ImpactValue,
+    /// Cached current block's minimum document length (P1a), 0 = unknown.
+    cached_block_min_dl: u32,
 
     // Maximum value over all postings
     max_value: ImpactValue,
@@ -774,6 +1047,9 @@ struct CompressedBlockTermImpactIterator<'a> {
 
     // Number of postings
     length: usize,
+
+    /// Minimum document length across the whole term (P1a), 0 = unknown.
+    min_dl: u32,
 }
 
 impl<'a> CompressedBlockTermImpactIterator<'a> {
@@ -788,9 +1064,11 @@ impl<'a> CompressedBlockTermImpactIterator<'a> {
             cached_block_min_doc_id: 0,
             cached_block_max_doc_id: 0,
             cached_block_max_value: 0.0,
+            cached_block_min_dl: 0,
             max_value: info.max_value,
             max_doc_id: info.max_doc_id,
             length: info.length,
+            min_dl: info.min_dl,
         }
     }
 }
@@ -820,6 +1098,7 @@ impl<'a> BlockTermImpactIterator for CompressedBlockTermImpactIterator<'a> {
             self.cached_block_min_doc_id = info.min_doc_id;
             self.cached_block_max_doc_id = info.max_doc_id;
             self.cached_block_max_value = info.max_value;
+            self.cached_block_min_dl = info.min_doc_length as u32;
 
             debug!(
                 "[{}] We have a candidate for doc_id >= {}",
@@ -896,6 +1175,16 @@ impl<'a> BlockTermImpactIterator for CompressedBlockTermImpactIterator<'a> {
     #[inline]
     fn max_doc_id(&self) -> DocId {
         self.max_doc_id
+    }
+
+    #[inline]
+    fn min_dl(&self) -> u32 {
+        self.min_dl
+    }
+
+    #[inline]
+    fn min_block_dl(&self) -> u32 {
+        self.cached_block_min_dl
     }
 
     #[inline]
@@ -977,7 +1266,8 @@ const SCORE_CHUNK_SIZE: usize = 32;
 impl<'a, S: ScoringFunction> CompressedScoringCursor<'a, S> {
     fn new(index: &'a CompressedIndex, term_index: TermIndex, scorer: S) -> Self {
         let info = &index.information.terms[term_index];
-        let max_value = scorer.max_score(info.max_value);
+        // Term-level bound tightened with the term's own min_dl (P1a).
+        let max_value = scorer.max_score_with_dl(info.max_value, info.min_dl);
         Self {
             iterator: CompressedIndexIterator::new(index, term_index),
             scorer,
@@ -1012,6 +1302,23 @@ impl<'a, S: ScoringFunction> CompressedScoringCursor<'a, S> {
         );
         self.chunk_start = start_pos;
         self.chunk_len = n;
+
+        // P1a safety net: the block bound (computed with min_doc_length,
+        // possibly f16-adjusted -- see `BM25TermScorer::max_score_with_dl`)
+        // must dominate every real score in the block, not just the ones a
+        // particular query happens to touch.
+        #[cfg(debug_assertions)]
+        {
+            let bound = self.cached_block_max_value;
+            for &s in &self.chunk[..n] {
+                debug_assert!(
+                    s <= bound + bound.abs() * 1e-3 + 1e-4,
+                    "chunk score {} exceeds block bound {} (P1a safety violation)",
+                    s,
+                    bound
+                );
+            }
+        }
     }
 }
 
@@ -1031,7 +1338,10 @@ impl<'a, S: ScoringFunction> TermCursor for CompressedScoringCursor<'a, S> {
             let info = self.iterator.info.expect("Iterator has block");
             self.cached_block_min_doc_id = info.min_doc_id;
             self.cached_block_max_doc_id = info.max_doc_id;
-            self.cached_block_max_value = self.scorer.max_score(info.max_value);
+            // Block-level bound tightened with this block's own min_dl (P1a).
+            self.cached_block_max_value = self
+                .scorer
+                .max_score_with_dl(info.max_value, info.min_doc_length as u32);
 
             // A block-max value is scored lazily by `current()`'s chunking;
             // invalidate any stale chunk from a previous block.
@@ -1202,6 +1512,13 @@ impl IndexTransform for CompressionTransform {
         let values_compressor = self.impacts_compressor_factory.create(index);
         let max_block_size = self.max_block_size;
 
+        // P1a: per-block minimum document length, computed here (at build
+        // time) when doc lengths are available. `None` (no docmeta) means
+        // every block gets `min_doc_length = 0`, i.e. the pre-P1a
+        // collection-wide-min behavior via `ScoringFunction::max_score_with_dl`'s
+        // `min_dl == 0` fallback -- still correct, just not tighter.
+        let doc_meta = index.doc_meta();
+
         let pb = ProgressBar::new(index.len() as u64);
         pb.set_style(
             ProgressStyle::default_bar()
@@ -1251,6 +1568,7 @@ impl IndexTransform for CompressionTransform {
                         max_value: 0f32,
                         max_doc_id: 0,
                         length: 0,
+                        min_dl: 0,
                     };
                     let mut max_doc_id = 0;
                     let mut docid_position: u64 = 0;
@@ -1285,6 +1603,25 @@ impl IndexTransform for CompressionTransform {
                             break;
                         }
 
+                        // P1a: minimum document length among this block's
+                        // documents. Saturates to `u16::MAX` for lengths
+                        // beyond that (rounding a huge length DOWN to
+                        // something smaller only ever loosens, never
+                        // unsafely tightens, the resulting score bound); a
+                        // missing per-doc length (shouldn't happen when
+                        // `doc_meta` is `Some` and complete) falls back to
+                        // `0`, the same safe direction.
+                        let min_doc_length: u16 = match doc_meta {
+                            Some(dm) => docids
+                                .iter()
+                                .map(|&d| dm.doc_lengths.get(d as usize).copied().unwrap_or(0))
+                                .min()
+                                .unwrap_or(0)
+                                .min(u16::MAX as u32)
+                                as u16,
+                            None => 0,
+                        };
+
                         let mut block_info = TermBlockInformation {
                             docid_position_range: (docid_position, 0),
                             impact_position_range: (impact_position, 0),
@@ -1292,6 +1629,7 @@ impl IndexTransform for CompressionTransform {
                             max_value: impacts.iter().fold(0f32, |cur, x| cur.max(*x)),
                             min_doc_id,
                             max_doc_id,
+                            min_doc_length,
                         };
 
                         assert!(max_doc_id >= min_doc_id);
@@ -1312,6 +1650,13 @@ impl IndexTransform for CompressionTransform {
                         term_information.length += block_info.length;
                         term_information.pages.push(block_info);
                     }
+
+                    term_information.min_dl = term_information
+                        .pages
+                        .iter()
+                        .map(|p| p.min_doc_length as u32)
+                        .min()
+                        .unwrap_or(0);
 
                     pb.inc(1);
 

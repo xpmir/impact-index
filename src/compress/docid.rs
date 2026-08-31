@@ -604,6 +604,7 @@ mod tests {
             max_value: 1.0,
             min_doc_id: min,
             max_doc_id: max,
+            min_doc_length: 0,
         }
     }
 

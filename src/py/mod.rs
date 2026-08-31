@@ -307,7 +307,7 @@ impl PySparseIndex {
     ///
     /// Document metadata (lengths) is loaded automatically from the index.
     fn with_scoring(&self, py: Python<'_>, scoring: &PyBM25Scoring) -> PyResult<Py<PyAny>> {
-        let doc_meta = self.index.doc_meta().ok_or_else(|| {
+        let doc_meta = crate::index::SparseIndex::doc_meta(&**self.index).ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
                 "Index has no document metadata. Build with BOWIndexBuilder for BM25.",
             )

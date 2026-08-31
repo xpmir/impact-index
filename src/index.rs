@@ -211,6 +211,18 @@ pub trait SparseIndexView: Send + Sync + SparseIndexInformation {
 
     /// num_docs
     fn max_doc_id(&self) -> DocId;
+
+    /// Document metadata (lengths), if available.
+    ///
+    /// [`crate::compress::CompressionTransform::process`] uses this (P1a)
+    /// to compute each block's minimum document length while it writes the
+    /// compressed postings, so dl-monotone scorers (BM25, LM-Dirichlet) get
+    /// a tight, model-agnostic upper bound instead of the collection-wide
+    /// minimum. `None` by default -- the blanket [`SparseIndex`] impl below
+    /// forwards to [`SparseIndex::doc_meta`].
+    fn doc_meta(&self) -> Option<&crate::docmeta::DocMetadata> {
+        None
+    }
 }
 
 /// Generic trait for block-based term impact iterators
@@ -246,6 +258,24 @@ pub trait BlockTermImpactIterator: Send {
     fn max_block_doc_id(&self) -> DocId {
         // If just one block...
         self.max_doc_id()
+    }
+
+    /// Minimum document length across every posting for this term (P1a).
+    ///
+    /// `0` is a sentinel meaning "not available" -- iterators that predate
+    /// this statistic (or aren't backed by a compressed+migrated index)
+    /// simply don't override it. [`crate::scoring::ScoringFunction::max_score_with_dl`]
+    /// implementations must treat `0` as "fall back to the model's own
+    /// (looser, but always safe) collection-wide bound", never as a literal
+    /// document length of zero.
+    fn min_dl(&self) -> u32 {
+        0
+    }
+
+    /// Minimum document length within the current block (P1a). Same `0` =
+    /// "not available" sentinel as [`Self::min_dl`].
+    fn min_block_dl(&self) -> u32 {
+        0
     }
 
     /// Returns the total number of records
@@ -322,7 +352,7 @@ pub trait SparseIndex: Send + Sync + SparseIndexView + AsSparseIndexView {
     /// Copy auxiliary files (vocab, analyzer, docmeta) to a destination directory.
     /// Each component saves itself if present.
     fn save_auxiliary(&self, dst: &Path) -> Result<()> {
-        if let Some(meta) = self.doc_meta() {
+        if let Some(meta) = SparseIndex::doc_meta(self) {
             meta.save(dst)?;
         }
         if let (Some(src), Some(_config)) = (self.source_path(), self.analyzer_config()) {
@@ -546,6 +576,10 @@ where
 
     fn max_doc_id(&self) -> DocId {
         SparseIndex::max_doc_id(self)
+    }
+
+    fn doc_meta(&self) -> Option<&crate::docmeta::DocMetadata> {
+        SparseIndex::doc_meta(self)
     }
 }
 
