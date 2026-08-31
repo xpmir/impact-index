@@ -19,17 +19,47 @@ Build for measurements: `maturin build --release` + install into `~/temporary/ii
 | # | Optimization | Kind | Est. gain | Effort | ARM/x86 notes | mac (q/s) | xian (q/s) |
 |---|--------------|------|-----------|--------|---------------|-----------|------------|
 | P8 | `lto=fat`, `codegen-units=1`, then PGO | build | 3–8% | trivial (TOML) / small (PGO) | PGO works on both; BOLT Linux-only | 195.0 (+3.2%) | 70.0 (+2.9%) |
-| P1a | Store per-block (and per-term) **min doc length** at index time — model-agnostic statistic; any dl-monotone scorer (BM25, LM-Dirichlet) gets tight bounds instead of global `min_dl` | index stat | 5–15% (more pruning) | small | arch-neutral; format addition, scoring stays query-time | 5636 (±noise, uniform-ish lengths, `profile_search` synthetic bin) / 8800 (+56%, skewed bimodal lengths, same bin) | |
+| P1a | Store per-block (and per-term) **min doc length** at index time — model-agnostic statistic; any dl-monotone scorer (BM25, LM-Dirichlet) gets tight bounds instead of global `min_dl` | index stat | 5–15% (more pruning) | small | arch-neutral; format addition, scoring stays query-time | 278.2 (+0.9%)¹ | 100.5 (−3.8%)¹ |
 | P1b | **Batch scoring per block**: when a block is entered, gather norms + score all/lazy-chunks of 128 postings into an `[f32;128]` buffer (vectorized divide, pipelined norm loads) instead of per-posting scalar score | scoring layer | 5–10% | medium | vectorizes on NEON+AVX2; amortizes the f16 lookups driving the x86 gap | measured with P3 ↑ | |
 | P4 | Cursor API: `next()` = index+1, `next_geq` = galloping from current pos (replaces per-posting `partition_point`) | data structure | ~5% | medium | arch-neutral | 240.5 (+23.3%, with P5) | 83.6 (+19.4%, with P5) |
 | P5 | u32 doc IDs inside decoded blocks (`[u32;128]`+`[f32;128]`) | data layout | 3–5% | small–medium | halves buffer footprint; feeds SIMD on both | measured with P4 ↑ | |
 | P3 | Monomorphize search loop over **(cursor × scorer)** pairs — generic `ScoringCursor<C, S>`, one enum dispatch per query, zero vtables per posting | Rust-specific | 8–15% (two vtable layers removed) | medium | arch-neutral; Rust's answer to JVM devirtualization | 275.8 (+14.7%, with P1b) | 104.5 (+25.0%, with P1b) |
-| P2 | Doc reordering by recursive graph bisection (BP) | algorithm (index-time) | 20–40% query + 10–30% smaller index | large (~200 lines + rebuild) | arch-neutral; also boosts BMP | | |
+| P2 | Doc reordering by recursive graph bisection (BP) | algorithm (index-time) | 20–40% query + 10–30% smaller index | large (~200 lines + rebuild) | arch-neutral; also boosts BMP | 294.8 (+6.0%)² | 106.0 (+5.5%)² |
 | P6 | Fuse MaxScore passes; f32 accumulation; `peek_mut` heap; incremental WAND sort | search loop | 2–4% | small | arch-neutral | | |
 | P7 | SIMD block scoring (autovectorized fixed-size loops; `wide`/`std::simd` fallback) | SIMD | 2–5% | small–medium | NEON + AVX2 from one source; avoid raw intrinsics | | |
 | P9 | Interleave docid+impact block bytes; zero-copy EF or drop EF default; prefetch next block | storage | 1–3% | small | prefetch intrinsic unstable on aarch64 → volatile-read trick | | |
 | P10 | Route quantized top-k queries to BMP (already in repo) | engine choice | large (per SIGIR'24) | small (glue) | **deferred**: BMP bakes scores at conversion — conflicts with query-time model choice | | |
 | P1-later | Precompute quantized impacts at index time (idf folded in, 8-bit, no scoring layer) | algorithm + format | 15–25% | medium | **deferred**: freezes the scoring model at index time — revisit as an *optional* transform per model | | |
+
+¹ P1a is near-neutral on mac and −3.8% on xian with the current random doc
+ordering: a 128-posting block almost always contains a short document, so
+block min_dl ≈ global min_dl — pure bookkeeping overhead, no pruning gain.
+On skewed/clustered lengths the same code gives +56% (synthetic bin, bimodal
+lengths). Decision deferred to after P2 reordering (which clusters similar
+documents into blocks): if P1a is still net-negative on reordered MS MARCO,
+revert its query-time use and keep only the format/stat. Migration of the
+620MB MS MARCO index via `Index.update`: 1.0s (mac), 3.3s (xian).
+
+² P2 on MS MARCO: reorder+recompress of 8.8M docs in 416s (mac) / 781s
+(xian); index 675MB vs 706MB (−4.4%); MRR@10 verified via reorder_map
+(mac Δ0.0002 tie reordering, xian Δ0.0000). Includes the P1a bound working
+on reordered blocks — on xian, P2's gain (+5.5% over the P1a state) mostly
+recovers P1a's −3.8%; net over P3+P1b is +1.4% (mac: +6.9%). Isolating
+"P2 without P1a bound" is an open follow-up. Below the 20–40% literature
+figures (those are BMW-centric evals).
+
+## Measured result (2026-08-31, branch perf/roadmap @ 5ecda42)
+
+| | mac (M-series) | xian (x86-64) |
+|---|---|---|
+| Baseline (master e40772d) | 188.9 q/s | 68.0 q/s |
+| + P8 fat LTO | 195.0 | 70.0 |
+| + P4+P5 cursor/u32 | 240.5 | 83.6 |
+| + P3+P1b monomorph/batch | 275.8 | 104.5 |
+| + P1a min_dl bounds | 278.2 | 100.5 |
+| + P2 BP reordering | **294.8** | **106.0** |
+| **Cumulative** | **+56%** | **+56%** |
+| Pyserini (Lucene) | 213.0 (−28% vs us) | 89.6 (−15% vs us) |
 
 Gains are not additive (P1b/P3 shrink what P4 optimizes). `bitpacking` 0.9.3
 verified to have NEON kernels for `BitPacker4x`, so the SIMD decode format is
