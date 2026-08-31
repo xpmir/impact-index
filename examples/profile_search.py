@@ -3,8 +3,6 @@
 # requires-python = ">=3.9"
 # dependencies = [
 #     "ir-datasets",
-#     "cbor2",
-#     "snowballstemmer",
 # ]
 # ///
 """Profile search performance on MS MARCO.
@@ -14,9 +12,7 @@ Usage:
 """
 
 import argparse
-import re
 import time
-from collections import defaultdict
 from pathlib import Path
 from typing import Dict
 
@@ -24,24 +20,13 @@ import impact_index
 
 
 class QueryAnalyzer:
-    def __init__(self, index_dir: Path, language: str = "english"):
-        import cbor2
-        import snowballstemmer
+    """Uses the index's own analyzer (vocab.fst + analyzer.cbor)."""
 
-        vocab_path = index_dir / "vocab.cbor"
-        with open(vocab_path, "rb") as f:
-            vocab_data = cbor2.load(f)
-        self.term_to_id: Dict[str, int] = vocab_data["term_to_id"]
-        self.stemmer = snowballstemmer.stemmer(language)
+    def __init__(self, analyzer):
+        self.analyzer = analyzer
 
     def analyze_query(self, text: str) -> Dict[int, float]:
-        tf: Dict[int, float] = defaultdict(float)
-        for token in re.findall(r"\w+", text.lower(), re.UNICODE):
-            stemmed = self.stemmer.stemWord(token)
-            term_id = self.term_to_id.get(stemmed)
-            if term_id is not None:
-                tf[term_id] += 1.0
-        return dict(tf)
+        return self.analyzer.analyze_query(text)
 
 
 def main():
@@ -65,15 +50,14 @@ def main():
     output_dir = Path(args.output_dir)
     impact_dir = output_dir / "impact_index"
 
-    # Load analyzer
-    analyzer = QueryAnalyzer(impact_dir)
-
     # Load index
     if args.index == "compressed":
         # Find compressed index dir
-        compressed_dirs = list(output_dir.glob("index_bp_*"))
-        if not compressed_dirs:
-            compressed_dirs = list(output_dir.glob("index_nb*"))
+        compressed_dirs = sorted(
+            d
+            for pattern in ("index_pfor_*", "index_bp_*", "index_nb*")
+            for d in output_dir.glob(pattern)
+        )
         if not compressed_dirs:
             print("No compressed index found")
             return
@@ -84,9 +68,11 @@ def main():
         print(f"Loading raw index from {impact_dir}")
         index = impact_index.Index.load(str(impact_dir), in_memory=True)
 
-    doc_meta = impact_index.DocMetadata.load(str(impact_dir))
+    # Analyzer and doc metadata are auto-loaded from the index directory
+    analyzer = QueryAnalyzer(index.analyzer())
+
     scoring = impact_index.BM25Scoring(k1=args.k1, b=args.b)
-    scored_index = index.with_scoring(scoring, doc_meta)
+    scored_index = index.with_scoring(scoring)
 
     search_fn = (
         scored_index.search_wand

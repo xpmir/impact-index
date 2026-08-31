@@ -21,6 +21,13 @@ test = false
 extension-module = ["pyo3/extension-module"]
 stub-gen = ["pyo3-stub-gen"]
 
+# Fat LTO + single codegen unit: lets LLVM inline/devirtualize across the
+# whole crate graph, which matters for the dyn-heavy search hot paths.
+# No panic=abort: pyo3 relies on unwinding to convert panics to exceptions.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 
 [[bin]]
 name = "stub_gen"
