@@ -8,6 +8,20 @@ pub mod cursor;
 pub mod maxscore;
 pub mod wand;
 
+/// Reordered indices renumber documents internally (see
+/// `transforms::reorder`); search results are translated back to the
+/// original document ids here so callers never see internal ids.
+pub(crate) fn remap_to_original_ids(
+    index: &dyn crate::index::SparseIndex,
+    results: &mut [ScoredDocument],
+) {
+    if let Some(map) = index.reorder_map() {
+        for r in results.iter_mut() {
+            r.docid = map[r.docid as usize];
+        }
+    }
+}
+
 use std::{cmp::Ordering, collections::BinaryHeap};
 
 use crate::base::{DocId, ImpactValue};

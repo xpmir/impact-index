@@ -188,10 +188,13 @@ pub fn search_wand<'a>(
     query: &HashMap<TermIndex, ImpactValue>,
     top_k: usize,
 ) -> Vec<ScoredDocument> {
-    if let Some((compressed, bm25)) = as_bm25_compressed(index) {
-        return search_wand_bm25_compressed(compressed, bm25, query, top_k);
-    }
-    search_wand_dyn(index, query, top_k)
+    let mut results = if let Some((compressed, bm25)) = as_bm25_compressed(index) {
+        search_wand_bm25_compressed(compressed, bm25, query, top_k)
+    } else {
+        search_wand_dyn(index, query, top_k)
+    };
+    crate::search::remap_to_original_ids(index, &mut results);
+    results
 }
 
 /// Generic (dyn-dispatched) WAND: works for any index/scorer combination

@@ -3,9 +3,10 @@
 //! `src/transforms/reorder.rs`).
 //!
 //! Covers the validation plan from the task:
-//! 1. **Correctness**: reordering then searching, mapping results back
-//!    through `reorder_map()`, must reproduce the exact same top-k result
-//!    set/scores as searching the un-reordered index, for many queries.
+//! 1. **Correctness**: reordering then searching must reproduce the exact
+//!    same top-k result set/scores as searching the un-reordered index,
+//!    for many queries — search results are translated back to original
+//!    document ids transparently by the search functions.
 //! 2. **Determinism**: the same input always yields the same permutation.
 //! 3. **Effectiveness**: total log-gap cost (the quantity BP's objective
 //!    approximates, and which drives PFOR/bitpacking bit-widths) strictly
@@ -157,14 +158,17 @@ fn compression_sink(max_block_size: usize) -> CompressionTransform {
     }
 }
 
-/// Asserts that `reordered` (searched against the reordered index),
-/// mapped back through `reorder_map`, reproduces the exact same
-/// docid/score set as `baseline` (searched against the original index).
+/// Asserts that `reordered` (searched against the reordered index)
+/// reproduces the exact same docid/score set as `baseline` (searched
+/// against the original index). Search results on a reordered index are
+/// translated back to ORIGINAL document ids automatically by the search
+/// functions (`remap_to_original_ids`), so no mapping is applied here —
+/// `_reorder_map` remains only for auxiliary sanity checks in callers.
 fn assert_same_after_mapping(
     label: &str,
     baseline: &[ScoredDocument],
     reordered: &[ScoredDocument],
-    reorder_map: &[DocId],
+    _reorder_map: &[DocId],
 ) {
     assert_eq!(
         baseline.len(),
@@ -174,10 +178,7 @@ fn assert_same_after_mapping(
         reordered.len()
     );
 
-    let mapped: HashMap<DocId, f32> = reordered
-        .iter()
-        .map(|d| (reorder_map[d.docid as usize], d.score))
-        .collect();
+    let mapped: HashMap<DocId, f32> = reordered.iter().map(|d| (d.docid, d.score)).collect();
     let baseline_map: HashMap<DocId, f32> = baseline.iter().map(|d| (d.docid, d.score)).collect();
 
     let mapped_ids: HashSet<DocId> = mapped.keys().copied().collect();

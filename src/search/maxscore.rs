@@ -116,10 +116,13 @@ pub fn search_maxscore<'a>(
     top_k: usize,
     options: MaxScoreOptions,
 ) -> Vec<ScoredDocument> {
-    if let Some((compressed, bm25)) = as_bm25_compressed(index) {
-        return search_maxscore_bm25_compressed(compressed, bm25, query, top_k, &options);
-    }
-    search_maxscore_dyn(index, query, top_k, options)
+    let mut results = if let Some((compressed, bm25)) = as_bm25_compressed(index) {
+        search_maxscore_bm25_compressed(compressed, bm25, query, top_k, &options)
+    } else {
+        search_maxscore_dyn(index, query, top_k, options)
+    };
+    crate::search::remap_to_original_ids(index, &mut results);
+    results
 }
 
 /// Generic (dyn-dispatched) MaxScore: works for any index/scorer

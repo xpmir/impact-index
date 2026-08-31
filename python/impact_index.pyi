@@ -282,9 +282,11 @@ class Index(impactindex.IndexView):
         lengths become skewed instead of near-uniform, which sharpens
         block-max and P1a `min_dl` pruning (see `optimizations.md`, P2).
 
-        Because document ids change, callers that track document identity
-        by (pre-reorder) docid must translate results through
-        ``reorder_map()``: ``reorder_map()[new_docid] == original_docid``.
+        Reordering is transparent to search: results returned by
+        ``search_maxscore``/``search_wand`` on a reordered index carry the
+        ORIGINAL document ids (translated automatically), so no caller-side
+        mapping is needed. ``reorder_map()`` exposes the raw internal
+        mapping for advanced uses.
 
         Args:
             output_folder: Directory to write the reordered, compressed
@@ -302,11 +304,11 @@ class Index(impactindex.IndexView):
         Document-id reorder map (`new_docid -> original_docid`), if this
         index was produced by ``reorder()`` (or a ``ReorderTransform``).
 
-        `impact-index` has no notion of an external document identity, so
-        after reordering, translating a search result's docid back to
-        whatever id/name the caller associated with the document *before*
-        reordering requires this map: ``reorder_map()[new_docid] ==
-        original_docid``. Returns ``None`` for an index that was never
+        Search results are already translated to original document ids
+        automatically, so most callers never need this. It exposes the raw
+        internal permutation (``reorder_map()[internal_docid] ==
+        original_docid``) for advanced uses such as interpreting raw
+        posting iterators. Returns ``None`` for an index that was never
         reordered.
         """
     @staticmethod

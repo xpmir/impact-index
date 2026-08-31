@@ -271,6 +271,10 @@ impl SparseIndex for ScoredIndex {
         SparseIndex::max_doc_id(&**self.inner)
     }
 
+    fn reorder_map(&self) -> Option<&Vec<DocId>> {
+        self.inner.reorder_map()
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

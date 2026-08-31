@@ -251,6 +251,10 @@ impl<'a> BlockTermImpactIterator for SplitIndexTermIterator<'a> {
 }
 
 impl SparseIndex for SplitIndex {
+    fn reorder_map(&self) -> Option<&Vec<DocId>> {
+        self.inner.reorder_map()
+    }
+
     fn block_iterator(
         &self,
         term_ix: crate::base::TermIndex,

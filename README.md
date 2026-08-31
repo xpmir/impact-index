@@ -10,7 +10,9 @@ Supports both neural IR models with floating-point impact scores and traditional
 - **Block-Max MaxScore and BMW (Block-Max WAND)** search with early termination
 - **SIMD bitpacking compression** (BitPacker4x) with quantized impacts and reusable block buffers
 - **One-liner compression**: `index.compress("/path/to/output")`
+- **Document reordering** by recursive graph bisection (`index.reorder(...)`) for smaller indices and stronger block-max pruning
 - **Posting list splitting** by quantile for term impact decomposition
+- **Index versioning**: per-index `manifest.json` with format version checks and one-step migration (`Index.update(path)`)
 - **BMP (Block-Max Pruning)** for fast approximate search ([SIGIR 2024](https://github.com/pisa-engine/BMP))
 - **Document store** with zstd compression and key-based retrieval
 - **Async support** for non-blocking search and document retrieval
@@ -18,18 +20,20 @@ Supports both neural IR models with floating-point impact scores and traditional
 
 ## Performance
 
-BM25 on MS MARCO passage (8.8M docs, 6,980 queries, top-100, single-threaded):
+BM25 on MS MARCO passage (8.8M docs, 6,980 queries, top-100, single-threaded,
+compressed index with MaxScore; measured 2026-08 on Apple M-series and
+x86-64/AVX2):
 
-| System | q/s | Index size | MRR@10 |
-|--------|-----|-----------|--------|
-| **impact-index MaxScore** | **193** | 3.2 GB | 0.1858 |
-| **impact-index Compressed** | **182** | 0.6 GB | 0.1858 |
-| Pyserini (Lucene) | 221 | 0.6 GB | 0.1855 |
+| System | ARM q/s | x86 q/s | Index size | MRR@10 |
+|--------|---------|---------|-----------|--------|
+| **impact-index** (compressed) | **278** | **101** | 0.69 GB | 0.1858 |
+| **impact-index** (compressed + reordered) | **295** | **106** | 0.66 GB | 0.1858 |
+| Pyserini (Lucene) | 213 | 90 | 0.6 GB | 0.1855 |
 
 Result overlap with Pyserini: @10=0.985, @100=0.989. Compressed index
 is lossless (same results as raw). Analysis pipeline matches Lucene's
 EnglishAnalyzer: UAX#29 tokenizer, Porter stemmer, English possessive
-filter, and stop words.
+filter, and stop words. Per-step measurements live in `optimizations.md`.
 
 ## Installation
 
@@ -90,6 +94,39 @@ results = scored.search_maxscore(query, top_k=10)
 The default settings (`block_size=128`, `nbits=0`) are optimized:
 - **block_size=128** aligns with SIMD registers and enables block-max pruning
 - **nbits=0** lossless integer bitpacking for TF counts (~2-3 bits/value). Use `nbits=8` for neural IR with float impacts
+
+## Document Reordering
+
+Renumber documents by recursive graph bisection (BP) so similar documents
+get nearby ids — the index gets smaller and block-max pruning gets stronger:
+
+```python
+# From a raw index: reorder + compress in one step
+reordered = index.reorder("/path/to/reordered")
+
+# Fully transparent: search results carry the ORIGINAL document ids
+scored = reordered.with_scoring(impact_index.BM25Scoring())
+results = scored.search_maxscore(query, top_k=10)
+for doc in results:
+    print(f"Document {doc.docid}: {doc.score:.4f}")
+```
+
+The internal renumbering is invisible to callers; `reorder_map()` exposes
+the raw permutation for advanced uses.
+
+## Index Versioning & Migration
+
+Every index directory carries a `manifest.json` with its format version.
+Loading an index built by an older library version raises an actionable
+error; migrate with:
+
+```python
+impact_index.Index.update("/path/to/index")            # in place
+impact_index.Index.update("/path/to/index", "/dest")   # or to a copy
+```
+
+Indices without a manifest (built before versioning existed) load
+normally and are stamped on first load.
 
 ## Neural IR (Impact Scores)
 
