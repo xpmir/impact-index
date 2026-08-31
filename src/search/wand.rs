@@ -5,13 +5,16 @@ use std::collections::HashMap;
 use log::debug;
 
 use crate::{
-    base::{DocId, ImpactValue},
-    search::{ScoredDocument, TopScoredDocuments},
+    base::{DocId, ImpactValue, Len},
+    search::{
+        cursor::{as_bm25_compressed, TermCursor},
+        ScoredDocument, TopScoredDocuments,
+    },
 };
 
 use crate::base::TermIndex;
 
-use crate::index::{BlockTermImpactIterator, SparseIndex};
+use crate::index::SparseIndex;
 
 /**
  * WAND algorithm
@@ -23,15 +26,17 @@ use crate::index::{BlockTermImpactIterator, SparseIndex};
  * DOI 10.1145/956863.956944.
 */
 
-/// Wraps an iterator with a query weight and cached docid for cheap sorting
-struct BlockTermImpactIteratorWrapper<'a> {
-    iterator: Box<dyn BlockTermImpactIterator + 'a>,
+/// Wraps a cursor with a query weight and cached docid for cheap sorting.
+/// Generic over the cursor type `C` (P3): monomorphized per (index, scorer)
+/// combination, same as [`crate::search::maxscore::MaxScoreTermIterator`].
+struct BlockTermImpactIteratorWrapper<C: TermCursor> {
+    iterator: C,
     query_weight: f32,
     /// Cached docid to avoid calling current().docid through the vtable during sort
     cached_docid: DocId,
 }
 
-impl BlockTermImpactIteratorWrapper<'_> {
+impl<C: TermCursor> BlockTermImpactIteratorWrapper<C> {
     /// Advance the iterator and update the cached docid.
     /// Returns false if the iterator is exhausted.
     fn advance_to(&mut self, min_doc_id: DocId) -> bool {
@@ -44,52 +49,12 @@ impl BlockTermImpactIteratorWrapper<'_> {
     }
 }
 
-impl std::fmt::Display for BlockTermImpactIteratorWrapper<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "({}; max={})",
-            self.iterator.current(),
-            self.iterator.max_value() * self.query_weight
-        )
-    }
-}
-
-struct WandSearch<'a> {
+struct WandSearch<C: TermCursor> {
     cur_doc: Option<DocId>,
-    iterators: Vec<BlockTermImpactIteratorWrapper<'a>>,
+    iterators: Vec<BlockTermImpactIteratorWrapper<C>>,
 }
 
-impl<'a> WandSearch<'a> {
-    fn new<'b: 'a>(index: &'b dyn SparseIndex, query: &HashMap<TermIndex, ImpactValue>) -> Self {
-        let mut iterators = Vec::new();
-
-        for (&ix, &weight) in query.iter() {
-            // Discard a term if the index does not match
-            if ix >= index.len() {
-                debug!("Discarding term with index {}", ix);
-                continue;
-            }
-
-            let iterator = index.block_iterator(ix);
-
-            let mut wrapper = BlockTermImpactIteratorWrapper {
-                iterator: iterator,
-                query_weight: weight,
-                cached_docid: 0,
-            };
-            if wrapper.iterator.next_min_doc_id(0).is_some() {
-                wrapper.cached_docid = wrapper.iterator.current().docid;
-                iterators.push(wrapper)
-            }
-        }
-
-        Self {
-            cur_doc: None,
-            iterators: iterators,
-        }
-    }
-
+impl<C: TermCursor> WandSearch<C> {
     /// Phase 1: Find pivot using global max scores.
     ///
     /// Sorts iterators by cached docid and accumulates global `max_value()` until the
@@ -213,12 +178,99 @@ impl<'a> WandSearch<'a> {
 /// * `index` - The sparse index to search
 /// * `query` - Map from term index to query weight
 /// * `top_k` - Number of top documents to return
+///
+/// Dispatches once per query (P3), same as [`crate::search::maxscore::search_maxscore`]:
+/// a `ScoredIndex` wrapping a `CompressedIndex` with `BM25Scoring` gets a
+/// fully statically-typed cursor loop; anything else falls back to the
+/// generic `dyn BlockTermImpactIterator` path.
 pub fn search_wand<'a>(
     index: &'a dyn SparseIndex,
     query: &HashMap<TermIndex, ImpactValue>,
     top_k: usize,
 ) -> Vec<ScoredDocument> {
-    let mut search = WandSearch::new(index, query);
+    if let Some((compressed, bm25)) = as_bm25_compressed(index) {
+        return search_wand_bm25_compressed(compressed, bm25, query, top_k);
+    }
+    search_wand_dyn(index, query, top_k)
+}
+
+/// Generic (dyn-dispatched) WAND: works for any index/scorer combination
+/// via `Box<dyn BlockTermImpactIterator>`.
+fn search_wand_dyn<'a>(
+    index: &'a dyn SparseIndex,
+    query: &HashMap<TermIndex, ImpactValue>,
+    top_k: usize,
+) -> Vec<ScoredDocument> {
+    let mut iterators = Vec::new();
+
+    for (&ix, &weight) in query.iter() {
+        // Discard a term if the index does not match
+        if ix >= index.len() {
+            debug!("Discarding term with index {}", ix);
+            continue;
+        }
+
+        let iterator = index.block_iterator(ix);
+
+        let mut wrapper = BlockTermImpactIteratorWrapper {
+            iterator,
+            query_weight: weight,
+            cached_docid: 0,
+        };
+        if wrapper.iterator.next_min_doc_id(0).is_some() {
+            wrapper.cached_docid = wrapper.iterator.current().docid;
+            iterators.push(wrapper)
+        }
+    }
+
+    search_wand_core(iterators, top_k)
+}
+
+/// Monomorphized WAND for `CompressedIndex` + `BM25Scoring` (P3): builds one
+/// `CompressedScoringCursor<BM25TermScorer>` per query term (concrete type,
+/// no `Box<dyn _>`) and runs the same loop, instantiated for that concrete
+/// cursor type instead.
+fn search_wand_bm25_compressed(
+    index: &crate::compress::CompressedIndex,
+    model: &crate::scoring::bm25::BM25Scoring,
+    query: &HashMap<TermIndex, ImpactValue>,
+    top_k: usize,
+) -> Vec<ScoredDocument> {
+    let mut iterators = Vec::new();
+
+    for (&ix, &weight) in query.iter() {
+        if ix >= index.len() {
+            debug!("Discarding term with index {}", ix);
+            continue;
+        }
+
+        let df = index.term_length(ix);
+        let scorer = model.term_scorer_typed(df);
+        let mut cursor = index.typed_cursor(ix, scorer);
+
+        if cursor.next_min_doc_id(0).is_some() {
+            let cached_docid = cursor.current().docid;
+            iterators.push(BlockTermImpactIteratorWrapper {
+                iterator: cursor,
+                query_weight: weight,
+                cached_docid,
+            });
+        }
+    }
+
+    search_wand_core(iterators, top_k)
+}
+
+/// Shared WAND loop, generic over the cursor type `C` (P3): monomorphized
+/// once per (index, scorer) combination that reaches it.
+fn search_wand_core<C: TermCursor>(
+    iterators: Vec<BlockTermImpactIteratorWrapper<C>>,
+    top_k: usize,
+) -> Vec<ScoredDocument> {
+    let mut search = WandSearch {
+        cur_doc: None,
+        iterators,
+    };
 
     let mut results = TopScoredDocuments::new(top_k);
     let mut theta: ImpactValue = 0.;
@@ -239,7 +291,10 @@ pub fn search_wand<'a>(
         }
 
         let mut dominated = false;
-        for x in search.iterators.iter() {
+        // `iter_mut`: resolving `current()` is lazy (P3/P4 cursors, and the
+        // dyn fallback's `Cell`-based iterators alike may need `&mut self`
+        // to compute/cache the exact posting).
+        for x in search.iterators.iter_mut() {
             if x.cached_docid != candidate {
                 break;
             }
@@ -261,4 +316,143 @@ pub fn search_wand<'a>(
     }
 
     results.into_sorted_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    //! Result-identity check (P3 validation), mirroring
+    //! `search::maxscore::tests`: the monomorphized `CompressedIndex` +
+    //! `BM25Scoring` fast path must return exactly the same top-k docids
+    //! and (bit-identical) scores as the generic `dyn
+    //! BlockTermImpactIterator` path it bypasses.
+
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use ndarray::Array1;
+
+    use crate::{
+        base::{load_index, ImpactValue, TermIndex},
+        builder::{BuilderOptions, Indexer},
+        compress::{
+            docid::BitPackingCompressor, impact::GlobalQuantizerFactory, CompressionTransform,
+        },
+        docmeta::DocMetadata,
+        scoring::{bm25::BM25Scoring, ScoredIndex},
+        search::wand::search_wand_dyn,
+        transforms::IndexTransform,
+    };
+
+    use super::search_wand;
+
+    fn build_scored_index() -> ScoredIndex {
+        let tmpdir = std::env::temp_dir().join(format!(
+            "wand_identity_test_{}_{}",
+            std::process::id(),
+            rand_seed()
+        ));
+        std::fs::create_dir_all(&tmpdir).unwrap();
+
+        let mut indexer = Indexer::<f32>::new(
+            &tmpdir,
+            &BuilderOptions {
+                in_memory_threshold: 128,
+                checkpoint_frequency: 0,
+                checkpoint_flush_ratio: 0.5,
+            },
+        );
+
+        const NUM_DOCS: u64 = 2_000;
+        const VOCABULARY_SIZE: usize = 300;
+        let mut doc_lengths = Vec::with_capacity(NUM_DOCS as usize);
+
+        let mut seed: u64 = 987654321;
+        let mut next_rand = || -> f32 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32) / (u32::MAX as f32) * 2.0
+        };
+
+        for doc_id in 0..NUM_DOCS {
+            let num_terms = 3 + ((next_rand() * 20.0) as usize).min(40);
+            let mut term_set = std::collections::BTreeSet::new();
+            let mut term_vals = Vec::new();
+            for _ in 0..num_terms {
+                let t = (next_rand() * VOCABULARY_SIZE as f32) as TermIndex % VOCABULARY_SIZE;
+                let v = next_rand().abs() + 0.1;
+                if term_set.insert(t) {
+                    term_vals.push((t, v));
+                }
+            }
+            doc_lengths.push(term_vals.len() as u32);
+            let terms: Array1<TermIndex> = Array1::from_iter(term_vals.iter().map(|(t, _)| *t));
+            let values: Array1<f32> = Array1::from_iter(term_vals.iter().map(|(_, v)| *v));
+            indexer.add(doc_id, &terms, &values).unwrap();
+        }
+        indexer.build().unwrap();
+        let raw_index = indexer.to_index(true);
+
+        let transform = CompressionTransform {
+            max_block_size: 128,
+            doc_ids_compressor_factory: Box::new(BitPackingCompressor {}),
+            impacts_compressor_factory: Box::new(GlobalQuantizerFactory { nbits: 16 }),
+        };
+        let compressed_path = tmpdir.join("compressed");
+        transform.process(&compressed_path, &raw_index).unwrap();
+        let index = load_index(&compressed_path, true);
+
+        let doc_meta = Arc::new(DocMetadata::from_lengths(doc_lengths));
+        ScoredIndex::new(Arc::new(index), doc_meta, Box::new(BM25Scoring::new()))
+    }
+
+    fn rand_seed() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    }
+
+    #[test]
+    fn test_typed_fast_path_matches_dyn_path() {
+        let scored = build_scored_index();
+
+        let queries: Vec<HashMap<TermIndex, ImpactValue>> = (0..15)
+            .map(|i| {
+                let mut q = HashMap::new();
+                for j in 0..6 {
+                    q.insert((i * 7 + j * 13) % 300, 1.0 + (j as f32) * 0.37);
+                }
+                q
+            })
+            .collect();
+
+        for (qi, query) in queries.iter().enumerate() {
+            for &top_k in &[1usize, 5, 10, 50] {
+                let dyn_results = search_wand_dyn(&scored, query, top_k);
+                // `search_wand` dispatches to the typed fast path since
+                // `scored` is a `ScoredIndex<CompressedIndex, BM25Scoring>`.
+                let typed_results = search_wand(&scored, query, top_k);
+
+                assert_eq!(
+                    dyn_results.len(),
+                    typed_results.len(),
+                    "query {qi}, top_k {top_k}: result count mismatch"
+                );
+                for (a, b) in dyn_results.iter().zip(typed_results.iter()) {
+                    assert_eq!(
+                        a.docid, b.docid,
+                        "query {qi}, top_k {top_k}: docid mismatch"
+                    );
+                    assert_eq!(
+                        a.score.to_bits(),
+                        b.score.to_bits(),
+                        "query {qi}, top_k {top_k}, docid {}: score mismatch ({} vs {})",
+                        a.docid,
+                        a.score,
+                        b.score
+                    );
+                }
+            }
+        }
+    }
 }

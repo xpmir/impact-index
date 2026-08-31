@@ -4,6 +4,7 @@
 //! - [`wand::search_wand`]: WAND (Weak AND) algorithm for top-k retrieval
 //! - [`maxscore::search_maxscore`]: MaxScore algorithm with optional term impact decomposition
 
+pub mod cursor;
 pub mod maxscore;
 pub mod wand;
 

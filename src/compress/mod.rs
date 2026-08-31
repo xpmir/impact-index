@@ -23,6 +23,8 @@ use super::{
 use crate::{
     base::{save_index, DocId, ImpactValue, IndexLoader, Len, TermImpact, TermIndex},
     index::SparseIndexInformation,
+    scoring::ScoringFunction,
+    search::cursor::TermCursor,
     utils::buffer::{Buffer, MemoryBuffer, MmapBuffer, Slice},
 };
 use indicatif::{ProgressBar, ProgressIterator, ProgressStyle};
@@ -889,6 +891,217 @@ impl<'a> BlockTermImpactIterator for CompressedBlockTermImpactIterator<'a> {
     }
 }
 
+impl CompressedIndex {
+    /// Number of postings for a term (used as BM25's document frequency).
+    pub(crate) fn term_length(&self, term_index: TermIndex) -> u64 {
+        self.information.terms[term_index].length as u64
+    }
+
+    /// Builds a monomorphized, scored cursor over a term's postings (P3):
+    /// a concrete `TermCursor` combining block movement, the galloping
+    /// intra-block cursor (P4/P5) and batched scoring (P1b), with no
+    /// `Box<dyn _>` or `Cell`-based interior mutability anywhere in the
+    /// hot path. `S` is a concrete scorer type (e.g. `BM25TermScorer`), not
+    /// `Box<dyn ScoringFunction>`, so the whole chain inlines through a
+    /// generic search loop instantiated for this `(CompressedIndex, S)`
+    /// pair.
+    pub(crate) fn typed_cursor<S: ScoringFunction>(
+        &self,
+        term_index: TermIndex,
+        scorer: S,
+    ) -> CompressedScoringCursor<'_, S> {
+        CompressedScoringCursor::new(self, term_index, scorer)
+    }
+}
+
+/// Concrete, monomorphizable (cursor x scorer) combination for
+/// [`CompressedIndex`] (P3), with lazy batched scoring in chunks (P1b).
+///
+/// Mirrors [`CompressedBlockTermImpactIterator`]'s shallow-move/lazy-current
+/// contract, but:
+/// - takes `&mut self` throughout (no `RefCell`/`Cell`: this type isn't
+///   required to be object-safe), and
+/// - resolves scores in chunks (`ScoringFunction::score_chunk`) from the
+///   cursor's current position rather than one posting — or one whole
+///   128-posting block — at a time, so block-max pruning that only touches
+///   a handful of postings per block doesn't pay to score the rest.
+pub(crate) struct CompressedScoringCursor<'a, S: ScoringFunction> {
+    /// Block decoder/cursor (shared with the dyn path).
+    iterator: CompressedIndexIterator<'a>,
+
+    /// Concrete scorer for this term (e.g. `BM25TermScorer`).
+    scorer: S,
+
+    /// Requested minimum document ID, updated only by `next_min_doc_id`.
+    current_min_docid: DocId,
+    has_current: bool,
+    current_docid: DocId,
+    /// Position of the resolved posting within the decoded block arrays.
+    current_pos: usize,
+
+    /// Lazily-filled batch of scores (P1b), covering
+    /// `[chunk_start, chunk_start + chunk_len)` of the current block.
+    chunk: Vec<f32>,
+    chunk_start: usize,
+    chunk_len: usize,
+
+    /// Cached block metadata (already scored).
+    cached_block_min_doc_id: DocId,
+    cached_block_max_doc_id: DocId,
+    cached_block_max_value: ImpactValue,
+
+    /// Term-level metadata (already scored).
+    max_value: ImpactValue,
+    max_doc_id: DocId,
+    length: usize,
+}
+
+/// Number of postings scored per batch (P1b): small enough that block-max
+/// pruning skipping most of a 128-posting block doesn't waste work, large
+/// enough to amortize the scorer call and let the per-chunk loop vectorize.
+const SCORE_CHUNK_SIZE: usize = 32;
+
+impl<'a, S: ScoringFunction> CompressedScoringCursor<'a, S> {
+    fn new(index: &'a CompressedIndex, term_index: TermIndex, scorer: S) -> Self {
+        let info = &index.information.terms[term_index];
+        let max_value = scorer.max_score(info.max_value);
+        Self {
+            iterator: CompressedIndexIterator::new(index, term_index),
+            scorer,
+            current_min_docid: 0,
+            has_current: false,
+            current_docid: 0,
+            current_pos: 0,
+            chunk: vec![0.0; SCORE_CHUNK_SIZE],
+            chunk_start: 0,
+            chunk_len: 0,
+            cached_block_min_doc_id: 0,
+            cached_block_max_doc_id: 0,
+            cached_block_max_value: 0.0,
+            max_value,
+            max_doc_id: info.max_doc_id,
+            length: info.length,
+        }
+    }
+
+    /// Scores a chunk of `SCORE_CHUNK_SIZE` postings (or fewer, at the tail
+    /// of the block) starting at `start_pos`.
+    #[inline]
+    fn fill_chunk(&mut self, start_pos: usize) {
+        let info = self.iterator.info.expect("block should be loaded");
+        let end = (start_pos + SCORE_CHUNK_SIZE).min(self.iterator.docids.len());
+        let n = end - start_pos;
+        self.scorer.score_chunk(
+            info.min_doc_id,
+            &self.iterator.docids[start_pos..end],
+            &self.iterator.impacts[start_pos..end],
+            &mut self.chunk[..n],
+        );
+        self.chunk_start = start_pos;
+        self.chunk_len = n;
+    }
+}
+
+impl<'a, S: ScoringFunction> TermCursor for CompressedScoringCursor<'a, S> {
+    fn next_min_doc_id(&mut self, min_doc_id: DocId) -> Option<DocId> {
+        let min_doc_id = min_doc_id.max(if self.has_current {
+            self.current_docid + 1
+        } else {
+            0
+        });
+        self.current_min_docid = min_doc_id;
+
+        let had_block = self.iterator.info.is_some();
+        let prev_block_min_doc_id = self.cached_block_min_doc_id;
+
+        if self.iterator.move_iterator(min_doc_id) {
+            let info = self.iterator.info.expect("Iterator has block");
+            self.cached_block_min_doc_id = info.min_doc_id;
+            self.cached_block_max_doc_id = info.max_doc_id;
+            self.cached_block_max_value = self.scorer.max_score(info.max_value);
+
+            // A block-max value is scored lazily by `current()`'s chunking;
+            // invalidate any stale chunk from a previous block.
+            if !had_block || self.cached_block_min_doc_id != prev_block_min_doc_id {
+                self.chunk_len = 0;
+            }
+
+            Some(self.cached_block_min_doc_id)
+        } else {
+            None
+        }
+    }
+
+    fn current(&mut self) -> TermImpact {
+        let min_docid = self.current_min_docid;
+
+        if !self.has_current || self.current_docid < min_docid {
+            self.iterator.ensure_block_loaded();
+
+            let info = self.iterator.info.expect("Iterator has block");
+            let min_offset = min_docid.saturating_sub(info.min_doc_id) as u32;
+            let start = self.iterator.index;
+            let pos = self
+                .iterator
+                .gallop_geq(start, min_offset)
+                .unwrap_or_else(|| {
+                    panic!("Did not find current impact for min_docid={}", min_docid)
+                });
+
+            let docid = info.min_doc_id + self.iterator.docids[pos] as DocId;
+            self.current_docid = docid;
+            self.current_pos = pos;
+            self.iterator.index = pos + 1;
+            self.has_current = true;
+
+            // Ensure the batch (P1b) covers `pos`, computing a new one
+            // lazily from the cursor position if it doesn't.
+            if self.chunk_len == 0
+                || pos < self.chunk_start
+                || pos >= self.chunk_start + self.chunk_len
+            {
+                self.fill_chunk(pos);
+            }
+        }
+
+        let local = self.current_pos - self.chunk_start;
+        TermImpact {
+            docid: self.current_docid,
+            value: self.chunk[local],
+        }
+    }
+
+    #[inline]
+    fn max_value(&self) -> ImpactValue {
+        self.max_value
+    }
+
+    #[inline]
+    fn max_doc_id(&self) -> DocId {
+        self.max_doc_id
+    }
+
+    #[inline]
+    fn max_block_value(&self) -> ImpactValue {
+        self.cached_block_max_value
+    }
+
+    #[inline]
+    fn max_block_doc_id(&self) -> DocId {
+        self.cached_block_max_doc_id
+    }
+
+    #[inline]
+    fn min_block_doc_id(&self) -> DocId {
+        self.cached_block_min_doc_id
+    }
+
+    #[inline]
+    fn length(&self) -> usize {
+        self.length
+    }
+}
+
 impl SparseIndex for CompressedIndex {
     fn block_iterator(
         &self,
@@ -916,6 +1129,10 @@ impl SparseIndex for CompressedIndex {
 
     fn source_path(&self) -> Option<&std::path::Path> {
         self.source_dir.as_deref()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

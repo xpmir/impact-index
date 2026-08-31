@@ -287,6 +287,16 @@ pub trait SparseIndex: Send + Sync + SparseIndexView + AsSparseIndexView {
     /// Returns the maximum document ID
     fn max_doc_id(&self) -> DocId;
 
+    /// Downcast support for the monomorphized search fast path (P3).
+    ///
+    /// `search_maxscore`/`search_wand` use this (plus [`crate::scoring::ScoringModel::as_any`])
+    /// to detect specific (index, scorer) combinations at query entry and
+    /// dispatch to a fully statically-typed loop with zero per-posting
+    /// vtable calls. Any combination that doesn't match falls back to the
+    /// generic `dyn BlockTermImpactIterator` path, so this is required (not
+    /// defaulted) to keep the set of "known" fast-path types explicit.
+    fn as_any(&self) -> &dyn std::any::Any;
+
     /// Returns all the iterators for a term (if split list)
     fn block_iterators(&self, term_ix: TermIndex) -> Vec<Box<dyn BlockTermImpactIterator + '_>> {
         let mut v = Vec::new();

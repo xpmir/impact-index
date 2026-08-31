@@ -998,6 +998,10 @@ impl<V: PostingValue> SparseIndex for SparseBuilderIndex<V> {
     fn source_path(&self) -> Option<&std::path::Path> {
         self.source_dir.as_deref()
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl<V: PostingValue> SparseIndexInformation for SparseBuilderIndex<V> {

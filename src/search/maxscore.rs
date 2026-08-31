@@ -11,17 +11,23 @@ use derivative::Derivative;
 use log::debug;
 
 use crate::{
-    base::{DocId, ImpactValue, TermImpact},
+    base::{DocId, ImpactValue, Len, TermImpact},
     index::SparseIndex,
-    search::{ScoredDocument, TopScoredDocuments},
+    search::{
+        cursor::{as_bm25_compressed, TermCursor},
+        ScoredDocument, TopScoredDocuments,
+    },
 };
 
 use crate::base::TermIndex;
 
-use crate::index::BlockTermImpactIterator;
-
-struct MaxScoreTermIterator<'a> {
-    iterator: Box<dyn BlockTermImpactIterator + 'a>,
+/// Wraps a [`TermCursor`] with a query weight and the term's contribution
+/// to the current candidate, generic over the concrete cursor type `C` so
+/// that the whole MaxScore loop monomorphizes (P3): `C = Box<dyn
+/// BlockTermImpactIterator>` for the generic fallback, or a concrete
+/// compressed+BM25 cursor for the fast path.
+struct MaxScoreTermIterator<C: TermCursor> {
+    iterator: C,
     term_index: usize,
     query_weight: f32,
     max_value: f64,
@@ -30,10 +36,10 @@ struct MaxScoreTermIterator<'a> {
     impact: TermImpact,
 }
 
-impl MaxScoreTermIterator<'_> {
+impl<C: TermCursor> MaxScoreTermIterator<C> {
     /// Call iterator's next
     fn next(&mut self) -> bool {
-        if let Some(mut impact) = self.iterator.next() {
+        if let Some(mut impact) = self.iterator.advance() {
             impact.value *= self.query_weight;
             self.impact = impact;
             true
@@ -97,17 +103,34 @@ pub struct MaxScoreOptions {
 /// * `query` - Map from term index to query weight
 /// * `top_k` - Number of top documents to return
 /// * `options` - Algorithm configuration
+///
+/// Dispatches once per query (P3): if `index` is a `ScoredIndex` wrapping a
+/// `CompressedIndex` with `BM25Scoring` — the combination the benchmark
+/// exercises — the whole per-posting path (cursor advance, batched BM25
+/// scoring) is statically typed and inlined, with zero vtable calls inside
+/// the search loop. Any other (index, scorer) combination falls back to the
+/// generic `dyn BlockTermImpactIterator` path below, unchanged.
 pub fn search_maxscore<'a>(
     index: &'a dyn SparseIndex,
     query: &HashMap<TermIndex, ImpactValue>,
     top_k: usize,
     options: MaxScoreOptions,
 ) -> Vec<ScoredDocument> {
-    // --- Initialize the structures
+    if let Some((compressed, bm25)) = as_bm25_compressed(index) {
+        return search_maxscore_bm25_compressed(compressed, bm25, query, top_k, &options);
+    }
+    search_maxscore_dyn(index, query, top_k, options)
+}
 
-    let mut results = TopScoredDocuments::new(top_k);
+/// Generic (dyn-dispatched) MaxScore: works for any index/scorer
+/// combination via `Box<dyn BlockTermImpactIterator>`.
+fn search_maxscore_dyn<'a>(
+    index: &'a dyn SparseIndex,
+    query: &HashMap<TermIndex, ImpactValue>,
+    top_k: usize,
+    options: MaxScoreOptions,
+) -> Vec<ScoredDocument> {
     let mut active = Vec::new();
-    let mut theta: f64 = 0.;
 
     for (&ix, &weight) in query.iter() {
         // Discard a term if the index does not match
@@ -137,7 +160,64 @@ pub fn search_maxscore<'a>(
         }
     }
 
-    if options.length_based_ordering {
+    search_maxscore_core(active, top_k, options.length_based_ordering)
+}
+
+/// Monomorphized MaxScore for `CompressedIndex` + `BM25Scoring` (P3):
+/// builds one `CompressedScoringCursor<BM25TermScorer>` per query term
+/// (concrete type, no `Box<dyn _>`) and runs the same loop as the generic
+/// path, instantiated for that concrete cursor type instead.
+fn search_maxscore_bm25_compressed(
+    index: &crate::compress::CompressedIndex,
+    model: &crate::scoring::bm25::BM25Scoring,
+    query: &HashMap<TermIndex, ImpactValue>,
+    top_k: usize,
+    options: &MaxScoreOptions,
+) -> Vec<ScoredDocument> {
+    let mut active = Vec::new();
+
+    for (&ix, &weight) in query.iter() {
+        if ix >= index.len() {
+            debug!("Discarding term with index {}", ix);
+            continue;
+        }
+
+        let df = index.term_length(ix);
+        let scorer = model.term_scorer_typed(df);
+        let cursor = index.typed_cursor(ix, scorer);
+        let max_value = (cursor.max_value() * weight) as f64;
+
+        let mut wrapper = MaxScoreTermIterator {
+            iterator: cursor,
+            query_weight: weight,
+            term_index: ix,
+            impact: TermImpact {
+                value: 0.,
+                docid: 0,
+            },
+            max_value,
+        };
+
+        if wrapper.next() {
+            active.push(wrapper);
+        }
+    }
+
+    search_maxscore_core(active, top_k, options.length_based_ordering)
+}
+
+/// Shared MaxScore loop, generic over the cursor type `C` (P3): monomorphized
+/// once per (index, scorer) combination that reaches it, so the body below
+/// compiles to a fully statically-dispatched loop for each instantiation.
+fn search_maxscore_core<C: TermCursor>(
+    mut active: Vec<MaxScoreTermIterator<C>>,
+    top_k: usize,
+    length_based_ordering: bool,
+) -> Vec<ScoredDocument> {
+    let mut results = TopScoredDocuments::new(top_k);
+    let mut theta: f64 = 0.;
+
+    if length_based_ordering {
         // Sort by posting list length (increasing, so that the longest will be passive first)
         // Note: this is what Mackenzie does
         active.sort_by(|a, b| a.iterator.length().cmp(&b.iterator.length()));
@@ -146,7 +226,7 @@ pub fn search_maxscore<'a>(
         active.sort_by(|a, b| b.max_value.total_cmp(&a.max_value));
     }
 
-    let mut passive = Vec::<MaxScoreTermIterator>::new();
+    let mut passive = Vec::<MaxScoreTermIterator<C>>::new();
     let mut sum_pass = 0.;
 
     while !&active.is_empty() {
@@ -247,4 +327,151 @@ pub fn search_maxscore<'a>(
     }
 
     results.into_sorted_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    //! Result-identity check (P3 validation): the monomorphized
+    //! `CompressedIndex` + `BM25Scoring` fast path
+    //! (`search_maxscore_bm25_compressed`) must return exactly the same
+    //! top-k docids and scores as the generic `dyn BlockTermImpactIterator`
+    //! path (`search_maxscore_dyn`) it bypasses — bit-identical, since
+    //! `BM25TermScorer::score_chunk` (P1b) is required to compute the same
+    //! scalar expression as `score`.
+
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use ndarray::Array1;
+
+    use crate::{
+        base::{load_index, ImpactValue, TermIndex},
+        builder::{BuilderOptions, Indexer},
+        compress::{
+            docid::BitPackingCompressor, impact::GlobalQuantizerFactory, CompressionTransform,
+        },
+        docmeta::DocMetadata,
+        scoring::{bm25::BM25Scoring, ScoredIndex},
+        search::maxscore::{search_maxscore_dyn, MaxScoreOptions},
+        transforms::IndexTransform,
+    };
+
+    use super::search_maxscore;
+
+    /// Builds a small synthetic compressed index wrapped with BM25 scoring
+    /// (the exact (index, scorer) shape the fast path targets).
+    fn build_scored_index() -> ScoredIndex {
+        let tmpdir = std::env::temp_dir().join(format!(
+            "maxscore_identity_test_{}_{}",
+            std::process::id(),
+            rand_seed()
+        ));
+        std::fs::create_dir_all(&tmpdir).unwrap();
+
+        let mut indexer = Indexer::<f32>::new(
+            &tmpdir,
+            &BuilderOptions {
+                in_memory_threshold: 128,
+                checkpoint_frequency: 0,
+                checkpoint_flush_ratio: 0.5,
+            },
+        );
+
+        const NUM_DOCS: u64 = 2_000;
+        const VOCABULARY_SIZE: usize = 300;
+        let mut doc_lengths = Vec::with_capacity(NUM_DOCS as usize);
+
+        let mut seed: u64 = 12345;
+        let mut next_rand = || -> f32 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32) / (u32::MAX as f32) * 2.0
+        };
+
+        for doc_id in 0..NUM_DOCS {
+            let num_terms = 3 + ((next_rand() * 20.0) as usize).min(40);
+            let mut term_set = std::collections::BTreeSet::new();
+            let mut term_vals = Vec::new();
+            for _ in 0..num_terms {
+                let t = (next_rand() * VOCABULARY_SIZE as f32) as TermIndex % VOCABULARY_SIZE;
+                let v = next_rand().abs() + 0.1;
+                if term_set.insert(t) {
+                    term_vals.push((t, v));
+                }
+            }
+            doc_lengths.push(term_vals.len() as u32);
+            let terms: Array1<TermIndex> = Array1::from_iter(term_vals.iter().map(|(t, _)| *t));
+            let values: Array1<f32> = Array1::from_iter(term_vals.iter().map(|(_, v)| *v));
+            indexer.add(doc_id, &terms, &values).unwrap();
+        }
+        indexer.build().unwrap();
+        let raw_index = indexer.to_index(true);
+
+        let transform = CompressionTransform {
+            max_block_size: 128,
+            doc_ids_compressor_factory: Box::new(BitPackingCompressor {}),
+            impacts_compressor_factory: Box::new(GlobalQuantizerFactory { nbits: 16 }),
+        };
+        let compressed_path = tmpdir.join("compressed");
+        transform.process(&compressed_path, &raw_index).unwrap();
+        let index = load_index(&compressed_path, true);
+
+        let doc_meta = Arc::new(DocMetadata::from_lengths(doc_lengths));
+        ScoredIndex::new(Arc::new(index), doc_meta, Box::new(BM25Scoring::new()))
+    }
+
+    /// Cheap process-local pseudo-uniqueness for the tmpdir name (avoids
+    /// collisions when tests run concurrently in the same process).
+    fn rand_seed() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    }
+
+    #[test]
+    fn test_typed_fast_path_matches_dyn_path() {
+        let scored = build_scored_index();
+
+        let queries: Vec<HashMap<TermIndex, ImpactValue>> = (0..15)
+            .map(|i| {
+                let mut q = HashMap::new();
+                for j in 0..6 {
+                    q.insert((i * 7 + j * 13) % 300, 1.0 + (j as f32) * 0.37);
+                }
+                q
+            })
+            .collect();
+
+        for (qi, query) in queries.iter().enumerate() {
+            for &top_k in &[1usize, 5, 10, 50] {
+                let dyn_results =
+                    search_maxscore_dyn(&scored, query, top_k, MaxScoreOptions::default());
+                // `search_maxscore` dispatches to the typed fast path since
+                // `scored` is a `ScoredIndex<CompressedIndex, BM25Scoring>`.
+                let typed_results =
+                    search_maxscore(&scored, query, top_k, MaxScoreOptions::default());
+
+                assert_eq!(
+                    dyn_results.len(),
+                    typed_results.len(),
+                    "query {qi}, top_k {top_k}: result count mismatch"
+                );
+                for (a, b) in dyn_results.iter().zip(typed_results.iter()) {
+                    assert_eq!(
+                        a.docid, b.docid,
+                        "query {qi}, top_k {top_k}: docid mismatch"
+                    );
+                    assert_eq!(
+                        a.score.to_bits(),
+                        b.score.to_bits(),
+                        "query {qi}, top_k {top_k}, docid {}: score mismatch ({} vs {})",
+                        a.docid,
+                        a.score,
+                        b.score
+                    );
+                }
+            }
+        }
+    }
 }

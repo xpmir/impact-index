@@ -6,11 +6,14 @@
 //!   sample <pid> 10 -f /tmp/profile.txt
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use impact_index::{
     base::{load_index, ImpactValue, TermIndex},
     builder::{BuilderOptions, Indexer},
     compress::{docid::BitPackingCompressor, impact::GlobalQuantizerFactory, CompressionTransform},
+    docmeta::DocMetadata,
+    scoring::{bm25::BM25Scoring, ScoredIndex},
     search::maxscore::{search_maxscore, MaxScoreOptions},
     transforms::IndexTransform,
 };
@@ -41,6 +44,8 @@ fn main() {
         ((seed >> 33) as f32) / (u32::MAX as f32) * 2.0
     };
 
+    let mut doc_lengths: Vec<u32> = Vec::with_capacity(NUM_DOCS as usize);
+
     for doc_id in 0..NUM_DOCS {
         let num_terms = 5 + ((next_rand() * 30.0) as usize).min(50);
         // Use a set to avoid duplicate term indices
@@ -53,6 +58,7 @@ fn main() {
                 term_vals.push((t, v));
             }
         }
+        doc_lengths.push(term_vals.len() as u32);
         let terms: Array1<TermIndex> = Array1::from_iter(term_vals.iter().map(|(t, _)| *t));
         let values: Array1<f32> = Array1::from_iter(term_vals.iter().map(|(_, v)| *v));
         indexer.add(doc_id, &terms, &values).unwrap();
@@ -71,6 +77,13 @@ fn main() {
     transform.process(&compressed_path, &raw_index).unwrap();
     let index = load_index(&compressed_path, true);
 
+    // Wrap with BM25 scoring (ScoredIndex + CompressedIndex + BM25Scoring):
+    // this is the (index, scorer) combination the P3/P1b monomorphized fast
+    // path targets, and matches how the index is actually searched via the
+    // Python bindings (`Index.with_scoring(...)`).
+    let doc_meta = Arc::new(DocMetadata::from_lengths(doc_lengths));
+    let scored = ScoredIndex::new(Arc::new(index), doc_meta, Box::new(BM25Scoring::new()));
+
     // Multiple queries with different term combinations
     let queries: Vec<HashMap<TermIndex, ImpactValue>> = (0..20)
         .map(|i| {
@@ -86,7 +99,7 @@ fn main() {
     eprintln!("Warming up...");
     for q in &queries {
         for _ in 0..100 {
-            let _ = search_maxscore(&*index, q, 100, MaxScoreOptions::default());
+            let _ = search_maxscore(&scored, q, 100, MaxScoreOptions::default());
         }
     }
 
@@ -99,7 +112,7 @@ fn main() {
     let mut iterations = 0u64;
     while start.elapsed().as_secs() < 30 {
         for q in &queries {
-            let _ = search_maxscore(&*index, q, 100, MaxScoreOptions::default());
+            let _ = search_maxscore(&scored, q, 100, MaxScoreOptions::default());
             iterations += 1;
         }
     }

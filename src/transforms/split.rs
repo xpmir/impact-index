@@ -300,6 +300,10 @@ impl SparseIndex for SplitIndex {
     fn max_doc_id(&self) -> DocId {
         SparseIndex::max_doc_id(&*self.inner)
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 impl Len for SplitIndex {

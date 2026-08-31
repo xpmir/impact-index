@@ -18,12 +18,12 @@ Build for measurements: `maturin build --release` + install into `~/temporary/ii
 
 | # | Optimization | Kind | Est. gain | Effort | ARM/x86 notes | mac (q/s) | xian (q/s) |
 |---|--------------|------|-----------|--------|---------------|-----------|------------|
-| P8 | `lto=fat`, `codegen-units=1`, then PGO | build | 3–8% | trivial (TOML) / small (PGO) | PGO works on both; BOLT Linux-only | 195.0 (+3.2%) | |
+| P8 | `lto=fat`, `codegen-units=1`, then PGO | build | 3–8% | trivial (TOML) / small (PGO) | PGO works on both; BOLT Linux-only | 195.0 (+3.2%) | 70.0 (+2.9%) |
 | P1a | Store per-block (and per-term) **min doc length** at index time — model-agnostic statistic; any dl-monotone scorer (BM25, LM-Dirichlet) gets tight bounds instead of global `min_dl` | index stat | 5–15% (more pruning) | small | arch-neutral; format addition, scoring stays query-time | | |
-| P1b | **Batch scoring per block**: when a block is entered, gather norms + score all/lazy-chunks of 128 postings into an `[f32;128]` buffer (vectorized divide, pipelined norm loads) instead of per-posting scalar score | scoring layer | 5–10% | medium | vectorizes on NEON+AVX2; amortizes the f16 lookups driving the x86 gap | | |
-| P4 | Cursor API: `next()` = index+1, `next_geq` = galloping from current pos (replaces per-posting `partition_point`) | data structure | ~5% | medium | arch-neutral | 240.5 (+23.3%, with P5) | |
+| P1b | **Batch scoring per block**: when a block is entered, gather norms + score all/lazy-chunks of 128 postings into an `[f32;128]` buffer (vectorized divide, pipelined norm loads) instead of per-posting scalar score | scoring layer | 5–10% | medium | vectorizes on NEON+AVX2; amortizes the f16 lookups driving the x86 gap | measured with P3 ↑ | |
+| P4 | Cursor API: `next()` = index+1, `next_geq` = galloping from current pos (replaces per-posting `partition_point`) | data structure | ~5% | medium | arch-neutral | 240.5 (+23.3%, with P5) | 83.6 (+19.4%, with P5) |
 | P5 | u32 doc IDs inside decoded blocks (`[u32;128]`+`[f32;128]`) | data layout | 3–5% | small–medium | halves buffer footprint; feeds SIMD on both | measured with P4 ↑ | |
-| P3 | Monomorphize search loop over **(cursor × scorer)** pairs — generic `ScoringCursor<C, S>`, one enum dispatch per query, zero vtables per posting | Rust-specific | 8–15% (two vtable layers removed) | medium | arch-neutral; Rust's answer to JVM devirtualization | | |
+| P3 | Monomorphize search loop over **(cursor × scorer)** pairs — generic `ScoringCursor<C, S>`, one enum dispatch per query, zero vtables per posting | Rust-specific | 8–15% (two vtable layers removed) | medium | arch-neutral; Rust's answer to JVM devirtualization | 275.8 (+14.7%, with P1b) | |
 | P2 | Doc reordering by recursive graph bisection (BP) | algorithm (index-time) | 20–40% query + 10–30% smaller index | large (~200 lines + rebuild) | arch-neutral; also boosts BMP | | |
 | P6 | Fuse MaxScore passes; f32 accumulation; `peek_mut` heap; incremental WAND sort | search loop | 2–4% | small | arch-neutral | | |
 | P7 | SIMD block scoring (autovectorized fixed-size loops; `wide`/`std::simd` fallback) | SIMD | 2–5% | small–medium | NEON + AVX2 from one source; avoid raw intrinsics | | |

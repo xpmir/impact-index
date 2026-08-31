@@ -23,6 +23,31 @@ pub trait ScoringFunction: Send + Sync {
 
     /// Safe upper bound on score for the given max raw value.
     fn max_score(&self, max_raw_value: f32) -> f32;
+
+    /// Batched scoring (P1b): score a chunk of postings from a decoded
+    /// block in one call. `docid_offsets[i]` is the offset from
+    /// `block_min_doc_id` and `tfs[i]` the raw posting value; the absolute
+    /// doc id is `block_min_doc_id + docid_offsets[i]`. `out` must have the
+    /// same length as `docid_offsets`/`tfs`.
+    ///
+    /// The default falls back to `score` per element — always correct, but
+    /// dyn-dispatched. Scorers with per-document state that a caller wants
+    /// on the monomorphized fast path (P3) should override this with a
+    /// plain, branch-free loop over slices (so it auto-vectorizes) that
+    /// keeps the scalar expression bit-identical to `score`.
+    fn score_chunk(
+        &self,
+        block_min_doc_id: DocId,
+        docid_offsets: &[u32],
+        tfs: &[f32],
+        out: &mut [f32],
+    ) {
+        debug_assert_eq!(docid_offsets.len(), tfs.len());
+        debug_assert_eq!(docid_offsets.len(), out.len());
+        for i in 0..tfs.len() {
+            out[i] = self.score(tfs[i], block_min_doc_id + docid_offsets[i] as DocId);
+        }
+    }
 }
 
 /// A scoring model that creates per-term scoring functions.
@@ -38,6 +63,11 @@ pub trait ScoringModel: Send + Sync {
     /// - `df`: document frequency (number of documents containing the term)
     /// - `max_value`: maximum raw value for this term
     fn term_scorer(&self, df: u64, max_value: f32) -> Box<dyn ScoringFunction>;
+
+    /// Downcast support for the monomorphized search fast path (P3): lets
+    /// `search_maxscore`/`search_wand` detect a specific model (e.g. BM25)
+    /// at query entry. See [`crate::index::SparseIndex::as_any`].
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// Wraps a [`BlockTermImpactIterator`], applying a [`ScoringFunction`] to each posting.
@@ -152,6 +182,16 @@ impl ScoredIndex {
             model,
         }
     }
+
+    /// The wrapped index (for the monomorphized search fast path, P3).
+    pub(crate) fn inner_index(&self) -> &dyn SparseIndex {
+        &**self.inner
+    }
+
+    /// The scoring model, as `Any` (for downcasting to a concrete model).
+    pub(crate) fn model_any(&self) -> &dyn std::any::Any {
+        self.model.as_any()
+    }
 }
 
 impl SparseIndex for ScoredIndex {
@@ -193,6 +233,10 @@ impl SparseIndex for ScoredIndex {
 
     fn max_doc_id(&self) -> DocId {
         SparseIndex::max_doc_id(&**self.inner)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

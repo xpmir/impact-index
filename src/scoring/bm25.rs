@@ -79,12 +79,24 @@ impl ScoringModel for BM25Scoring {
     }
 
     fn term_scorer(&self, df: u64, _max_value: f32) -> Box<dyn ScoringFunction> {
+        Box::new(self.build_term_scorer(df))
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl BM25Scoring {
+    /// Builds the concrete per-term scorer (shared by `term_scorer` and
+    /// `term_scorer_typed`).
+    fn build_term_scorer(&self, df: u64) -> BM25TermScorer {
         // IDF: ln(1 + (N - df + 0.5) / (df + 0.5))
         let n = self.num_docs as f64;
         let df_f64 = df as f64;
         let idf = ((n - df_f64 + 0.5) / (df_f64 + 0.5) + 1.0).ln() as f32;
 
-        Box::new(BM25TermScorer {
+        BM25TermScorer {
             idf,
             min_dl_norm: self.min_dl_norm,
             doc_norms: self
@@ -92,12 +104,18 @@ impl ScoringModel for BM25Scoring {
                 .as_ref()
                 .expect("BM25Scoring not initialized")
                 .clone(),
-        })
+        }
+    }
+
+    /// Concrete (unboxed) per-term scorer, for the monomorphized search
+    /// fast path (P3) — avoids the `Box<dyn ScoringFunction>` vtable.
+    pub(crate) fn term_scorer_typed(&self, df: u64) -> BM25TermScorer {
+        self.build_term_scorer(df)
     }
 }
 
 /// Per-term BM25 scorer (includes IDF).
-struct BM25TermScorer {
+pub(crate) struct BM25TermScorer {
     idf: f32,
     /// Pre-computed normalization for min_dl (used in max_score)
     min_dl_norm: f32,
@@ -115,6 +133,42 @@ impl ScoringFunction for BM25TermScorer {
     #[inline]
     fn max_score(&self, max_tf: f32) -> f32 {
         self.idf * max_tf / (self.min_dl_norm + max_tf)
+    }
+
+    /// Batched BM25 scoring (P1b). Two passes over the chunk rather than
+    /// one fused loop:
+    ///
+    /// 1. Gather norms into `out` (reused as scratch — no extra buffer).
+    ///    These are independent random loads into `doc_norms`; issuing them
+    ///    back-to-back lets the CPU overlap the cache misses that were
+    ///    previously serialized one-per-posting behind a vtable call.
+    /// 2. A branch-free loop computing `idf * tf / (norm + tf)` — the exact
+    ///    same scalar expression (and f16 norm read) as `score()`, so
+    ///    results are bit-identical. This shape (independent f16->f32
+    ///    converts, multiply, divide over a slice) auto-vectorizes on both
+    ///    NEON and AVX2.
+    #[inline]
+    fn score_chunk(
+        &self,
+        block_min_doc_id: DocId,
+        docid_offsets: &[u32],
+        tfs: &[f32],
+        out: &mut [f32],
+    ) {
+        let n = tfs.len();
+        debug_assert_eq!(docid_offsets.len(), n);
+        debug_assert_eq!(out.len(), n);
+
+        let doc_norms = &self.doc_norms;
+        for i in 0..n {
+            let docid = block_min_doc_id + docid_offsets[i] as DocId;
+            out[i] = unsafe { doc_norms.get_unchecked(docid as usize) }.to_f32();
+        }
+
+        let idf = self.idf;
+        for i in 0..n {
+            out[i] = idf * tfs[i] / (out[i] + tfs[i]);
+        }
     }
 }
 
