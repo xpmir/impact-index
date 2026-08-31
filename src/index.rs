@@ -344,6 +344,20 @@ pub trait SparseIndex: Send + Sync + SparseIndexView + AsSparseIndexView {
         None
     }
 
+    /// Document-id reorder map (`new_docid -> original_docid`), if this
+    /// index was produced by [`crate::transforms::reorder::ReorderTransform`].
+    ///
+    /// `impact-index` has no notion of an "external" document identity --
+    /// [`crate::docmeta::DocMetadata`] only stores lengths -- so a caller
+    /// that reordered an index is the one responsible for mapping a
+    /// (post-reorder) docid back to whatever external id/name they
+    /// associated with the document *before* reordering. This is how they
+    /// recover the mapping: `reorder_map()[new_docid] == original_docid`.
+    /// `None` for an index that was never reordered.
+    fn reorder_map(&self) -> Option<&Vec<DocId>> {
+        None
+    }
+
     /// Source directory path (for loading vocab, copying files).
     fn source_path(&self) -> Option<&Path> {
         None
@@ -351,10 +365,23 @@ pub trait SparseIndex: Send + Sync + SparseIndexView + AsSparseIndexView {
 
     /// Copy auxiliary files (vocab, analyzer, docmeta) to a destination directory.
     /// Each component saves itself if present.
+    ///
+    /// Callers that already wrote a *different* (e.g. permuted)
+    /// `docmeta` into `dst` themselves -- [`crate::transforms::reorder::ReorderTransform`]
+    /// is the case in point -- must call [`Self::save_vocab_and_analyzer`]
+    /// instead: this method unconditionally overwrites `dst`'s docmeta
+    /// with `self`'s own (here, the *original*, un-reordered) lengths,
+    /// which would silently corrupt the docid -> length mapping.
     fn save_auxiliary(&self, dst: &Path) -> Result<()> {
         if let Some(meta) = SparseIndex::doc_meta(self) {
             meta.save(dst)?;
         }
+        self.save_vocab_and_analyzer(dst)
+    }
+
+    /// Copy vocab/analyzer config only (no docmeta) -- see
+    /// [`Self::save_auxiliary`] for when this is required instead.
+    fn save_vocab_and_analyzer(&self, dst: &Path) -> Result<()> {
         if let (Some(src), Some(_config)) = (self.source_path(), self.analyzer_config()) {
             // Copy vocab FST from source (it's a binary file, not serializable from config alone)
             let src_fst = src.join("vocab.fst");

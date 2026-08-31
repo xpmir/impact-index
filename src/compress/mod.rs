@@ -773,6 +773,10 @@ pub struct CompressedIndex {
 
     /// Analyzer config (auto-loaded if present)
     analyzer_config: Option<crate::vocab::analyzer::AnalyzerConfig>,
+
+    /// Document-id reorder map (`new_docid -> original_docid`), auto-loaded
+    /// if present (i.e. this index was produced by `ReorderTransform`).
+    reorder_map: Option<Vec<DocId>>,
 }
 
 //
@@ -1454,6 +1458,10 @@ impl SparseIndex for CompressedIndex {
         self.source_dir.as_deref()
     }
 
+    fn reorder_map(&self) -> Option<&Vec<DocId>> {
+        self.reorder_map.as_ref()
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -1770,6 +1778,8 @@ impl IndexLoader for CompressedIndexLoader {
             }
         };
 
+        let reorder_map = crate::transforms::reorder::ReorderMap::load(path).ok();
+
         Box::new(CompressedIndex {
             information,
             docid_buffer: if in_memory {
@@ -1785,6 +1795,7 @@ impl IndexLoader for CompressedIndexLoader {
             source_dir: Some(path.to_path_buf()),
             doc_meta,
             analyzer_config,
+            reorder_map,
         })
     }
 }

@@ -4,9 +4,12 @@
 //! specified directory. Available transforms:
 //! - [`split::SplitIndexTransform`]: Splits posting lists by impact quantiles
 //!   for use with term impact decomposition algorithms
+//! - [`reorder::ReorderTransform`]: Renumbers document ids by recursive
+//!   graph bisection so similar documents get adjacent ids (P2)
 
 use std::path::Path;
 
+pub mod reorder;
 pub mod split;
 use super::index::SparseIndexView;
 

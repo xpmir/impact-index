@@ -376,6 +376,89 @@ impl PySparseIndex {
         Ok(Py::new(py, sub)?.into_any())
     }
 
+    /// Reorder documents by recursive graph bisection (BP), then compress.
+    ///
+    /// Renumbers document ids so that documents sharing many terms end up
+    /// with nearby ids: posting-list gaps shrink (smaller/faster
+    /// compressed index) and per-block impact maxima / minimum document
+    /// lengths become skewed instead of near-uniform, which sharpens
+    /// block-max and P1a `min_dl` pruning (see `optimizations.md`, P2).
+    ///
+    /// Because document ids change, callers that track document identity
+    /// by (pre-reorder) docid must translate results through
+    /// ``reorder_map()``: ``reorder_map()[new_docid] == original_docid``.
+    ///
+    /// Args:
+    ///     output_folder: Directory to write the reordered, compressed
+    ///         index to.
+    ///     block_size: Number of postings per block (default: 128).
+    ///     nbits: Quantization bits for impact values (see ``compress``).
+    ///     in_memory: Load the resulting index in memory (default: True).
+    ///     leaf_size: Stop recursing once a subtree has at most this many
+    ///         documents (default: 64).
+    ///     max_iters: Maximum swap iterations per recursion level
+    ///         (default: 20).
+    #[pyo3(signature = (output_folder, block_size=128, nbits=0, in_memory=true, leaf_size=64, max_iters=20))]
+    fn reorder(
+        &self,
+        py: Python<'_>,
+        output_folder: &str,
+        block_size: usize,
+        nbits: u32,
+        in_memory: bool,
+        leaf_size: usize,
+        max_iters: usize,
+    ) -> PyResult<Py<PyAny>> {
+        let impacts_factory: Box<dyn compress::ImpactCompressorFactory> = if nbits == 0 {
+            Box::new(compress::impact::BitPackedIntCompressor {})
+        } else {
+            Box::new(compress::impact::QuantizedBitPackedFactory { nbits })
+        };
+        let sink = Box::new(CompressionTransform {
+            max_block_size: block_size,
+            doc_ids_compressor_factory: Box::new(PForCompressor {}),
+            impacts_compressor_factory: impacts_factory,
+        });
+        let transform = crate::transforms::reorder::ReorderTransform {
+            sink,
+            options: crate::transforms::reorder::BpOptions {
+                leaf_size,
+                max_iters,
+                ..Default::default()
+            },
+        };
+        let path = Path::new(output_folder);
+        transform
+            .process(path, &**self.index)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
+
+        // `ReorderTransform` already wrote the (permuted) docmeta itself;
+        // copy vocab/analyzer only -- `save_auxiliary` would overwrite
+        // docmeta with the *original*, un-reordered lengths.
+        self.index
+            .save_vocab_and_analyzer(path)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
+
+        let base = PyClassInitializer::from(PyIndexView {});
+        let sub = base.add_subclass(PySparseIndex {
+            index: Arc::new(load_index(path, in_memory)),
+        });
+        Ok(Py::new(py, sub)?.into_any())
+    }
+
+    /// Document-id reorder map (`new_docid -> original_docid`), if this
+    /// index was produced by ``reorder()`` (or a ``ReorderTransform``).
+    ///
+    /// `impact-index` has no notion of an external document identity, so
+    /// after reordering, translating a search result's docid back to
+    /// whatever id/name the caller associated with the document *before*
+    /// reordering requires this map: ``reorder_map()[new_docid] ==
+    /// original_docid``. Returns ``None`` for an index that was never
+    /// reordered.
+    fn reorder_map(&self) -> Option<Vec<DocId>> {
+        self.index.reorder_map().cloned()
+    }
+
     /// Load an index from a directory.
     #[staticmethod]
     fn load(py: Python<'_>, folder: &str, in_memory: bool) -> PyResult<Py<PyAny>> {
@@ -877,6 +960,60 @@ impl PySplitIndexTransform {
     fn new(quantiles: Vec<f64>, sink: Py<PyTransform>) -> (Self, PyTransform) {
         let factory = Box::new(PySplitIndexTransformFactory { sink, quantiles });
         (PySplitIndexTransform {}, PyTransform { factory })
+    }
+}
+
+struct PyReorderTransformFactory {
+    sink: Py<PyTransform>,
+    options: crate::transforms::reorder::BpOptions,
+}
+
+impl PyTransformFactory for PyReorderTransformFactory {
+    fn create(&self, py: Python<'_>) -> Box<dyn IndexTransform> {
+        let sink_ref = self.sink.bind(py).borrow();
+        let sink = sink_ref.factory.create(py);
+        Box::new(crate::transforms::reorder::ReorderTransform {
+            sink,
+            options: self.options.clone(),
+        })
+    }
+}
+
+/// Transform that renumbers document ids by recursive graph bisection
+/// (BP, see `optimizations.md` P2) before delegating to `sink` (typically
+/// a `CompressionTransform`) to write the reordered postings.
+///
+/// Note: composing this generically (rather than through
+/// `Index.reorder(...)`) does not copy vocab/analyzer auxiliary files --
+/// callers that need those must copy them separately, the way
+/// `Index.compress(...)` does. Permuted `docmeta` and `reorder_map.dat`
+/// are always written directly by the transform itself.
+#[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
+#[pyclass(name="ReorderTransform", extends=PyTransform)]
+struct PyReorderTransform {}
+
+// gen_stub_pymethods skipped: (Self, Parent) return in #[new] unsupported
+#[pymethods]
+impl PyReorderTransform {
+    #[new]
+    #[pyo3(signature = (sink, leaf_size=64, max_iters=20, min_df=2, max_df_ratio=0.5))]
+    fn new(
+        sink: Py<PyTransform>,
+        leaf_size: usize,
+        max_iters: usize,
+        min_df: usize,
+        max_df_ratio: f64,
+    ) -> (Self, PyTransform) {
+        let factory = Box::new(PyReorderTransformFactory {
+            sink,
+            options: crate::transforms::reorder::BpOptions {
+                leaf_size,
+                max_iters,
+                min_df,
+                max_df_ratio,
+            },
+        });
+        (PyReorderTransform {}, PyTransform { factory })
     }
 }
 
@@ -1739,6 +1876,7 @@ fn impact_index(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyQuantizedBitPackedCompressor>()?;
     module.add_class::<PyCompressionTransform>()?;
     module.add_class::<PySplitIndexTransform>()?;
+    module.add_class::<PyReorderTransform>()?;
     module.add_class::<PyBmpSearcher>()?;
 
     module.add_class::<PyDocument>()?;

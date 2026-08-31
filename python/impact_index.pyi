@@ -28,6 +28,7 @@ __all__ = [
     "PyScoredDocument",
     "PyTransform",
     "QuantizedBitPackedCompressor",
+    "ReorderTransform",
     "ScoredIndex",
     "SparseIndexIterator",
     "SplitIndexTransform",
@@ -263,6 +264,51 @@ class Index(impactindex.IndexView):
                 Set to 8 or 16 for quantized float compression.
             in_memory: Load the compressed index in memory (default: True).
         """
+    def reorder(
+        self,
+        output_folder: builtins.str,
+        block_size: builtins.int = 128,
+        nbits: builtins.int = 0,
+        in_memory: builtins.bool = True,
+        leaf_size: builtins.int = 64,
+        max_iters: builtins.int = 20,
+    ) -> typing.Any:
+        r"""
+        Reorder documents by recursive graph bisection (BP), then compress.
+
+        Renumbers document ids so that documents sharing many terms end up
+        with nearby ids: posting-list gaps shrink (smaller/faster
+        compressed index) and per-block impact maxima / minimum document
+        lengths become skewed instead of near-uniform, which sharpens
+        block-max and P1a `min_dl` pruning (see `optimizations.md`, P2).
+
+        Because document ids change, callers that track document identity
+        by (pre-reorder) docid must translate results through
+        ``reorder_map()``: ``reorder_map()[new_docid] == original_docid``.
+
+        Args:
+            output_folder: Directory to write the reordered, compressed
+                index to.
+            block_size: Number of postings per block (default: 128).
+            nbits: Quantization bits for impact values (see ``compress``).
+            in_memory: Load the resulting index in memory (default: True).
+            leaf_size: Stop recursing once a subtree has at most this many
+                documents (default: 64).
+            max_iters: Maximum swap iterations per recursion level
+                (default: 20).
+        """
+    def reorder_map(self) -> typing.Optional[builtins.list[builtins.int]]:
+        r"""
+        Document-id reorder map (`new_docid -> original_docid`), if this
+        index was produced by ``reorder()`` (or a ``ReorderTransform``).
+
+        `impact-index` has no notion of an external document identity, so
+        after reordering, translating a search result's docid back to
+        whatever id/name the caller associated with the document *before*
+        reordering requires this map: ``reorder_map()[new_docid] ==
+        original_docid``. Returns ``None`` for an index that was never
+        reordered.
+        """
     @staticmethod
     def load(folder: builtins.str, in_memory: builtins.bool) -> typing.Any:
         r"""
@@ -352,6 +398,22 @@ class QuantizedBitPackedCompressor(impactindex.ImpactCompressor):
 
     Quantizes float impacts to N-bit integers, then compresses with
     adaptive SIMD bitpacking (~3-4 bits/value instead of fixed N bits).
+    """
+
+    ...
+
+@typing.final
+class ReorderTransform(impactindex.PyTransform):
+    r"""
+    Transform that renumbers document ids by recursive graph bisection
+    (BP, see `optimizations.md` P2) before delegating to `sink` (typically
+    a `CompressionTransform`) to write the reordered postings.
+
+    Note: composing this generically (rather than through
+    `Index.reorder(...)`) does not copy vocab/analyzer auxiliary files --
+    callers that need those must copy them separately, the way
+    `Index.compress(...)` does. Permuted `docmeta` and `reorder_map.dat`
+    are always written directly by the transform itself.
     """
 
     ...
