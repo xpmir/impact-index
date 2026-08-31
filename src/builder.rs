@@ -462,6 +462,19 @@ impl<V: PostingValue> Indexer<V> {
                     fs::remove_file(&cpkt_path).expect("error while removing checkpoint file");
                 }
             }
+
+            // Record the on-disk format version + build parameters so a
+            // future format change can be detected on load (see the
+            // `manifest` module). `in_memory_threshold` is this index's
+            // block size (postings buffered per term before a flush).
+            let builder_info = crate::manifest::BuilderInfo::new()
+                .with_block_size(self.impacts.options.in_memory_threshold);
+            crate::manifest::write_manifest(
+                &self.folder,
+                crate::manifest::IndexKind::Forward,
+                builder_info,
+            )
+            .expect("Error writing index manifest");
         } else {
             println!("Already built")
         }

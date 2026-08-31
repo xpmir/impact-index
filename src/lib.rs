@@ -46,6 +46,7 @@ pub mod compress;
 pub mod docmeta;
 pub mod docstore;
 pub mod index;
+pub mod manifest;
 pub mod scoring;
 pub mod search;
 pub mod transforms;

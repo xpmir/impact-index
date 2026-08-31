@@ -385,6 +385,30 @@ impl PySparseIndex {
         });
         Ok(Py::new(py, sub)?.into_any())
     }
+
+    /// Migrate an index directory to the format version this library expects.
+    ///
+    /// Raised by ``Index.load`` (and internal loaders) when an index
+    /// directory's ``manifest.json`` records an older ``format_version``
+    /// than this library supports: call ``Index.update(path)`` first, then
+    /// retry loading.
+    ///
+    /// Args:
+    ///     path: Directory containing the index to migrate.
+    ///     dest: If given, write the migrated index there instead of
+    ///         migrating in place (``path`` is left untouched).
+    ///
+    /// Returns:
+    ///     The directory holding the migrated index (``dest`` if given,
+    ///     otherwise ``path``).
+    #[staticmethod]
+    #[pyo3(signature = (path, dest=None))]
+    fn update(path: &str, dest: Option<&str>) -> PyResult<String> {
+        let dest_path = dest.map(PathBuf::from);
+        let result_path = crate::manifest::update_index(Path::new(path), dest_path.as_deref())
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+        Ok(result_path.to_string_lossy().into_owned())
+    }
 }
 
 /// Configuration options for IndexBuilder.

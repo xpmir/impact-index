@@ -83,6 +83,18 @@ impl std::fmt::Display for TermBlockInformation {
 
 /// Trait for encoding/decoding a sequence of values within a block.
 pub trait Compressor<T>: Sync + Send {
+    /// Human-readable codec name, used in manifest / diagnostics summaries.
+    ///
+    /// The default implementation derives it from the concrete type name
+    /// (e.g. `EliasFanoCompressor`); this stays object-safe because it only
+    /// uses `Self` as a type parameter inside the body, never in the
+    /// signature, so each concrete compressor gets its own vtable entry
+    /// without needing to implement this itself.
+    fn codec_name(&self) -> &'static str {
+        let full = std::any::type_name::<Self>();
+        full.rsplit("::").next().unwrap_or(full)
+    }
+
     /// Writes compressed values to the given writer.
     fn write(
         &self,
@@ -318,7 +330,8 @@ impl CompressedIndexInformation {
                 "Not a compressed index binary file",
             ));
         }
-        let _version = reader.read_u32::<LittleEndian>()?;
+        let version = reader.read_u32::<LittleEndian>()?;
+        crate::manifest::check_format_version(version, COMPRESSED_INDEX_VERSION)?;
         let num_terms = reader.read_u32::<LittleEndian>()? as usize;
 
         // Compressor header
@@ -1358,6 +1371,23 @@ impl IndexTransform for CompressionTransform {
                 values_compressor: information.values_compressor,
             },
         };
+
+        // Record the on-disk format version + build parameters so a future
+        // format change can be detected on load (see `manifest` module).
+        let codecs = format!(
+            "{}+{}",
+            stub.information.doc_ids_compressor.codec_name(),
+            stub.information.values_compressor.codec_name(),
+        );
+        let builder_info = crate::manifest::BuilderInfo::new()
+            .with_block_size(max_block_size)
+            .with_codecs(codecs);
+        crate::manifest::write_manifest(
+            path,
+            crate::manifest::IndexKind::Compressed,
+            builder_info,
+        )?;
+
         save_index(Box::new(stub), path)
     }
 }

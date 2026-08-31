@@ -52,6 +52,12 @@ impl IndexTransform for SplitIndexTransform {
             splits: self.quantiles.len() + 1,
         };
 
+        // The inner (compressed) index writes its own manifest inside
+        // `inner/`; this one describes the split wrapper itself.
+        let builder_info = crate::manifest::BuilderInfo::new()
+            .with_codecs(format!("quantiles={:?}", self.quantiles));
+        crate::manifest::write_manifest(path, crate::manifest::IndexKind::Split, builder_info)?;
+
         save_index(Box::new(index), path)
     }
 }

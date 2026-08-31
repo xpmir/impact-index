@@ -281,8 +281,14 @@ pub trait IndexLoader {
 /// * `path` - Directory containing the index files
 /// * `in_memory` - If `true`, loads data into memory; otherwise uses memory-mapped I/O
 pub fn load_index(path: &Path, in_memory: bool) -> Box<dyn SparseIndex> {
+    // Check the on-disk manifest (if any) before touching any data file.
+    // A version mismatch fails here with an actionable message rather
+    // than letting a lower-level reader crash or (worse) silently
+    // misinterpret bytes written by a different format version.
+    let manifest = crate::manifest::check_index_manifest(path).unwrap_or_else(|e| panic!("{}", e));
+
     let info_path = path.join(BUILDER_INDEX_CBOR);
-    if info_path.exists() {
+    let index: Box<dyn SparseIndex> = if info_path.exists() {
         // Takes care of old/new format with the raw builder index
         load_forward_index_dynamic(path, in_memory)
     } else {
@@ -297,7 +303,17 @@ pub fn load_index(path: &Path, in_memory: bool) -> Box<dyn SparseIndex> {
             .expect("Error loading compressed term index information");
 
         loader.into_index(path, in_memory)
+    };
+
+    // Legacy directory (no manifest.json at all): it just loaded fine
+    // above, so opportunistically stamp a manifest for next time. This is
+    // best-effort only -- a read-only directory must still load.
+    if manifest.is_none() {
+        let kind = crate::manifest::detect_index_kind(path);
+        let _ = crate::manifest::write_manifest(path, kind, crate::manifest::BuilderInfo::new());
     }
+
+    index
 }
 
 /// Saves an index loader to disk so the index can be loaded later.
