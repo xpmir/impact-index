@@ -11,8 +11,8 @@ Measurement protocol: `examples/profile_search.py --output-dir ~/temporary/bm25_
 k1=0.9 b=0.4, top-100, MaxScore on the PFOR-compressed index (`index_pfor_nb0_bs128`),
 in-memory, median pass. Measured cumulatively in the suggested order at the bottom.
 
-Baseline (2026-08-31, master e40772d): **mac 188.9 q/s**, **xian ___ q/s**
-(Pyserini reference: mac 213.0 q/s, xian ___; MRR@10 0.1858 vs 0.1855 — matches).
+Baseline (2026-08-31, master e40772d): **mac 188.9 q/s**, **xian 67.6 q/s**
+(Pyserini reference: mac 213.0 q/s, xian 89.6 q/s; MRR@10 0.1858 vs 0.1855 — matches).
 Build for measurements: `maturin build --release` + install into `~/temporary/ii-venv`
 (do NOT trust `uv run --with .` caching — it silently reuses stale wheels).
 
@@ -21,8 +21,8 @@ Build for measurements: `maturin build --release` + install into `~/temporary/ii
 | P8 | `lto=fat`, `codegen-units=1`, then PGO | build | 3–8% | trivial (TOML) / small (PGO) | PGO works on both; BOLT Linux-only | 195.0 (+3.2%) | |
 | P1a | Store per-block (and per-term) **min doc length** at index time — model-agnostic statistic; any dl-monotone scorer (BM25, LM-Dirichlet) gets tight bounds instead of global `min_dl` | index stat | 5–15% (more pruning) | small | arch-neutral; format addition, scoring stays query-time | | |
 | P1b | **Batch scoring per block**: when a block is entered, gather norms + score all/lazy-chunks of 128 postings into an `[f32;128]` buffer (vectorized divide, pipelined norm loads) instead of per-posting scalar score | scoring layer | 5–10% | medium | vectorizes on NEON+AVX2; amortizes the f16 lookups driving the x86 gap | | |
-| P4 | Cursor API: `next()` = index+1, `next_geq` = galloping from current pos (replaces per-posting `partition_point`) | data structure | ~5% | medium | arch-neutral | | |
-| P5 | u32 doc IDs inside decoded blocks (`[u32;128]`+`[f32;128]`) | data layout | 3–5% | small–medium | halves buffer footprint; feeds SIMD on both | | |
+| P4 | Cursor API: `next()` = index+1, `next_geq` = galloping from current pos (replaces per-posting `partition_point`) | data structure | ~5% | medium | arch-neutral | 240.5 (+23.3%, with P5) | |
+| P5 | u32 doc IDs inside decoded blocks (`[u32;128]`+`[f32;128]`) | data layout | 3–5% | small–medium | halves buffer footprint; feeds SIMD on both | measured with P4 ↑ | |
 | P3 | Monomorphize search loop over **(cursor × scorer)** pairs — generic `ScoringCursor<C, S>`, one enum dispatch per query, zero vtables per posting | Rust-specific | 8–15% (two vtable layers removed) | medium | arch-neutral; Rust's answer to JVM devirtualization | | |
 | P2 | Doc reordering by recursive graph bisection (BP) | algorithm (index-time) | 20–40% query + 10–30% smaller index | large (~200 lines + rebuild) | arch-neutral; also boosts BMP | | |
 | P6 | Fuse MaxScore passes; f32 accumulation; `peek_mut` heap; incremental WAND sort | search loop | 2–4% | small | arch-neutral | | |
@@ -55,6 +55,23 @@ model-specific may be baked into the postings. Consequences:
 - The `ScoringBlockIterator` layer stays, so removing its *per-posting*
   overhead (P1b, P3) matters more, and pruning must be improved through
   model-agnostic statistics (P1a).
+
+## P0-fmt. Index manifest, versioning, and migration (prerequisite for P1a/P2)
+
+Requirement (user, 2026-08-31): any index-format change must come with an
+upgrade path and a clear error, not a crash or silent misread.
+
+- Add a `manifest.json` to every index directory: format version, index
+  type, build parameters (block size, codecs, analyzer), creation date.
+- On load, check the version. Mismatch → actionable error:
+  `"index format v3, this build requires v4 — run `impact-index update <dir>`
+  (or Index.update(path) in Python) to migrate"`.
+- Fix `CompressedIndexInformation::read_binary` (src/compress/mod.rs), which
+  reads but ignores the stored version today.
+- Provide the migration itself: `Index.update(path, dest=None)` — rewrites
+  an old-format index into the current format (for P1a: recompute per-block
+  metadata from docmeta; for P2: full re-transform). Keep readers for one
+  version back where cheap; otherwise migrate.
 
 ## P1a. Model-agnostic index statistics for tight bounds (~5–15%)
 

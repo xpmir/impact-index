@@ -6,7 +6,7 @@
 //! further transformation (compression, splitting).
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     fs::{self, File},
     io::{BufReader, BufWriter, Seek, Write},
     path::{Path, PathBuf},
@@ -700,6 +700,94 @@ impl<'a, V: PostingValue> SparseBuilderIndexIterator<'a, V> {
         self.slice = None;
         self.index = 0;
     }
+
+    /// Ensure the current block's slice is loaded (P4).
+    #[inline]
+    fn ensure_block_loaded(&mut self) {
+        if self.slice.is_none() {
+            if let Some(info) = self.info {
+                self.read_block(info);
+            }
+        }
+    }
+
+    /// Read only the doc ID at position `idx` within the currently loaded
+    /// block, without decoding the impact value (P4 galloping search probe).
+    #[inline]
+    fn docid_at(&self, idx: usize) -> DocId {
+        let data = self.slice.as_ref().expect("block not loaded").data();
+        let start = idx * Self::RECORD_SIZE;
+        let mut slice_ptr = &data[start..start + std::mem::size_of::<DocId>()];
+        slice_ptr
+            .read_u64::<BigEndian>()
+            .expect("Erreur de lecture")
+    }
+
+    /// Read the full record (doc ID + value) at position `idx` within the
+    /// currently loaded block.
+    #[inline]
+    fn record_at(&self, idx: usize) -> TermImpact {
+        let data = self.slice.as_ref().expect("block not loaded").data();
+        let start = idx * Self::RECORD_SIZE;
+        let end = start + Self::RECORD_SIZE;
+        let mut slice_ptr = &data[start..end];
+        let docid: DocId = slice_ptr
+            .read_u64::<BigEndian>()
+            .expect("Erreur de lecture");
+        let value = V::read_be(&mut slice_ptr);
+        TermImpact {
+            docid,
+            value: value.to_f32(),
+        }
+    }
+
+    /// Galloping (exponential) search for the first position in
+    /// `[start, length)` whose doc ID is `>= min_doc_id` within the
+    /// currently loaded block (P4). Replaces a linear scan: O(1) when the
+    /// target is the next posting (the common case during sequential
+    /// WAND/MaxScore advance), O(log gap) otherwise. Returns `None` if no
+    /// such position exists within the block.
+    #[inline]
+    fn gallop_geq(&self, start: usize, length: usize, min_doc_id: DocId) -> Option<usize> {
+        if start >= length {
+            return None;
+        }
+        if self.docid_at(start) >= min_doc_id {
+            return Some(start);
+        }
+
+        let mut prev = start;
+        let mut bound = 1usize;
+        let mut cur = start + bound;
+        while cur < length && self.docid_at(cur) < min_doc_id {
+            prev = cur;
+            bound *= 2;
+            cur = start + bound;
+        }
+        let hi = cur.min(length);
+        let lo = prev + 1;
+
+        if lo >= hi {
+            return if hi < length { Some(hi) } else { None };
+        }
+
+        // Bounded binary search within (lo, hi)
+        let mut l = lo;
+        let mut r = hi;
+        while l < r {
+            let mid = l + (r - l) / 2;
+            if self.docid_at(mid) < min_doc_id {
+                l = mid + 1;
+            } else {
+                r = mid;
+            }
+        }
+        if l < length {
+            Some(l)
+        } else {
+            None
+        }
+    }
 }
 
 impl<'a, V: PostingValue> Iterator for SparseBuilderIndexIterator<'a, V> {
@@ -746,10 +834,24 @@ impl<'a, V: PostingValue> Iterator for SparseBuilderIndexIterator<'a, V> {
 // --- Block index
 
 struct SparseBuilderBlockTermImpactIterator<'a, V: PostingValue> {
+    /// Needs interior mutability: `current()` (`&self`) may need to load
+    /// the current block's slice and/or advance the cursor.
     iterator: RefCell<SparseBuilderIndexIterator<'a, V>>,
-    current_min_docid: Option<DocId>,
-    // We need a RefCell for method current()
-    current_value: RefCell<Option<TermImpact>>,
+
+    /// Requested minimum document ID, updated only by `next_min_doc_id`
+    /// (`&mut self`).
+    current_min_docid: DocId,
+
+    /// Whether a posting has ever been resolved (so `current_docid` below
+    /// is meaningful).
+    has_current: Cell<bool>,
+
+    /// Cached resolved posting (plain `Cell<Copy>` fields rather than a
+    /// single `Cell<Option<TermImpact>>`: cheaper to read/write, no
+    /// `Option` matching on the hot path).
+    current_docid: Cell<DocId>,
+    current_value: Cell<ImpactValue>,
+
     max_value: ImpactValue,
     max_doc_id: DocId,
     length: usize,
@@ -760,29 +862,35 @@ impl<'a, V: PostingValue> SparseBuilderBlockTermImpactIterator<'a, V> {
         let info = &index.terms[term_ix];
         Self {
             iterator: RefCell::new(SparseBuilderIndexIterator::new(index, term_ix)),
-            current_value: RefCell::new(None),
+            current_min_docid: 0,
+            has_current: Cell::new(false),
+            current_docid: Cell::new(0),
+            current_value: Cell::new(0.0),
             max_value: info.max_value,
             max_doc_id: info.max_doc_id,
             length: info.length,
-            current_min_docid: None,
         }
     }
 }
 
 impl<'a, V: PostingValue> BlockTermImpactIterator for SparseBuilderBlockTermImpactIterator<'a, V> {
     fn next_min_doc_id(&mut self, min_doc_id: DocId) -> Option<DocId> {
-        // Sets the current minimum document ID
-        self.current_min_docid = Some(min_doc_id.max(
-            if let Some(impact) = self.current_value.get_mut() {
-                impact.docid + 1
-            } else {
-                0
-            },
-        ));
+        // Sets the current minimum document ID. This is a *shallow* move
+        // (block-skip logic unchanged): the intra-block cursor is resolved
+        // lazily in `current()`, so repeated `next_min_doc_id` calls (or a
+        // `current()` call with no intervening `next_min_doc_id`, as
+        // `transforms/split.rs` does) remain idempotent and never skip a
+        // posting.
+        let min_doc_id = min_doc_id.max(if self.has_current.get() {
+            self.current_docid.get() + 1
+        } else {
+            0
+        });
+        self.current_min_docid = min_doc_id;
 
-        let min_doc_id = self.current_min_docid.expect("Should not be None");
-
-        // Move to the block having at least one document greater that min_doc_id
+        // Move to the block having at least one document greater that
+        // min_doc_id. `get_mut` (not `borrow_mut`): we already hold `&mut
+        // self` here.
         if let Some(min_doc_id) = self.iterator.get_mut().move_iterator(min_doc_id) {
             debug!(
                 "[{}] We have a candidate for doc_id >= {}",
@@ -797,58 +905,44 @@ impl<'a, V: PostingValue> BlockTermImpactIterator for SparseBuilderBlockTermImpa
         }
     }
 
-    /// Returns the current document ID
+    /// Returns the current posting.
+    ///
+    /// If already positioned at (or past) `current_min_docid` — the common
+    /// case when `current()` is called more than once without an
+    /// intervening `next_min_doc_id` — this is a plain read of the cached
+    /// fields (P4): no search, no re-check of the decoded block.
+    /// Otherwise, resolves the exact posting via a galloping (exponential)
+    /// search from the cursor's current position within the block, which
+    /// is O(1) when the target is the very next posting (the common case
+    /// for sequential WAND/MaxScore advance) and O(log gap) otherwise —
+    /// replacing the previous linear scan.
     fn current(&self) -> TermImpact {
-        let min_docid = self.current_min_docid.expect("Should not be null");
-        {
-            let iterator = self.iterator.borrow();
-            debug!("[{}] Searching for next {}", iterator.term_ix, min_docid);
-        }
+        let min_docid = self.current_min_docid;
 
-        let mut current_value = self.current_value.borrow_mut();
-
-        if current_value
-            .and_then(|x| Some(x.docid < min_docid))
-            .or(Some(true))
-            .unwrap()
-        {
+        if !self.has_current.get() || self.current_docid.get() < min_docid {
             let mut iterator = self.iterator.borrow_mut();
-            debug!(
-                "[{}] Current DOC ID value is {}",
-                iterator.term_ix,
-                if let Some(cv) = current_value.as_ref() {
-                    cv.docid as i64
-                } else {
-                    -1
-                },
-            );
+            let info = iterator.info.expect("Iterator was over");
+            iterator.ensure_block_loaded();
 
-            *current_value = None;
-            while let Some(v) = iterator.next() {
-                if v.docid >= min_docid {
-                    debug!("[{}] Returning {} ({})", iterator.term_ix, v.docid, v.value);
+            let start = iterator.index;
+            let pos = iterator
+                .gallop_geq(start, info.length, min_docid)
+                .unwrap_or_else(|| {
+                    panic!("Did not find current impact for min_docid={}", min_docid)
+                });
 
-                    *current_value = Some(v);
-                    break;
-                }
-                debug!(
-                    "[{}] Skipping {} ({}) / {}",
-                    iterator.term_ix, v.docid, v.value, min_docid
-                );
-            }
+            let record = iterator.record_at(pos);
+            iterator.index = pos + 1;
 
-            assert!(current_value.is_some(), "Did not find current impact");
-        } else {
-            let iterator = self.iterator.borrow();
-            debug!(
-                "[{}] Current value was good {} >= {}",
-                iterator.term_ix,
-                current_value.expect("").docid,
-                min_docid
-            );
+            self.current_docid.set(record.docid);
+            self.current_value.set(record.value);
+            self.has_current.set(true);
         }
 
-        return current_value.expect("No current value");
+        TermImpact {
+            docid: self.current_docid.get(),
+            value: self.current_value.get(),
+        }
     }
 
     fn max_value(&self) -> ImpactValue {

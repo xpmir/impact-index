@@ -141,7 +141,30 @@ pub trait Compressor<T>: Sync + Send {
 
 /// A serializable compressor for document IDs.
 #[typetag::serde(tag = "type")]
-pub trait DocIdCompressor: Compressor<DocId> {}
+pub trait DocIdCompressor: Compressor<DocId> {
+    /// Decode doc-id OFFSETS (relative to `info.min_doc_id`) into a reusable
+    /// `u32` buffer (P5).
+    ///
+    /// All current codecs (BitPacking, PFOR, EliasFano) already encode
+    /// offsets-from-min internally: a block spans at most `max_block_size`
+    /// sorted, distinct document IDs, so `max_doc_id - min_doc_id` fits
+    /// comfortably in 32 bits for any realistic collection/block-size
+    /// combination — this is asserted in each concrete implementation's
+    /// hot decode path. Storing offsets as `u32` (rather than absolute
+    /// `u64` doc IDs) halves the decoded buffer's footprint and lets the
+    /// SIMD bitpacker (`BitPacker4x`, whose native output unit is `u32`)
+    /// decompress directly into the buffer with no scalar widening loop.
+    ///
+    /// The default implementation falls back to the `u64` decode path and
+    /// narrows each value; concrete compressors should override this for
+    /// a zero-widen fast path.
+    fn decode_offsets_into(&self, data: &[u8], info: &TermBlockInformation, buffer: &mut Vec<u32>) {
+        let mut tmp: Vec<DocId> = Vec::with_capacity(info.length);
+        self.decode_into_bytes(data, 0, info, &mut tmp);
+        buffer.clear();
+        buffer.extend(tmp.iter().map(|&d| (d - info.min_doc_id) as u32));
+    }
+}
 
 /// Factory for creating [`DocIdCompressor`] instances, potentially
 /// using global index statistics.
@@ -476,13 +499,22 @@ pub struct CompressedIndexIterator<'a> {
     /// Current info
     info: Option<&'a TermBlockInformation>,
 
-    /// Reusable buffer for decoded doc IDs
-    docids: Vec<DocId>,
+    /// Reusable buffer for decoded doc IDs, stored as `u32` OFFSETS from the
+    /// current block's `min_doc_id` (P5). All current codecs (BitPacking,
+    /// PFOR, EliasFano) already encode offsets-from-min that fit in `u32` by
+    /// construction: a block spans at most `max_block_size` sorted, distinct
+    /// document IDs, so `max_doc_id - min_doc_id` fits comfortably in 32
+    /// bits for any realistic collection/block-size combination. Keeping the
+    /// buffer as `u32` halves its footprint versus `u64` and lets the SIMD
+    /// bitpacker (`BitPacker4x`) decompress directly into it with no scalar
+    /// widening loop. The absolute `DocId` is reconstructed only at access
+    /// points via `info.min_doc_id + offset as DocId`.
+    docids: Vec<u32>,
 
     /// Reusable buffer for decoded impact values
     impacts: Vec<ImpactValue>,
 
-    /// Current position within the decoded arrays
+    /// Current position (cursor) within the decoded arrays
     index: usize,
 
     /// Whether the current block has been decoded
@@ -559,7 +591,7 @@ impl<'a> CompressedIndexIterator<'a> {
                 self.sparse_index
                     .information
                     .doc_ids_compressor
-                    .decode_into_bytes(docid_slice, self.term_index, info, &mut self.docids);
+                    .decode_offsets_into(docid_slice, info, &mut self.docids);
 
                 let impact_slice = &ib
                     [info.impact_position_range.0 as usize..info.impact_position_range.1 as usize];
@@ -568,7 +600,9 @@ impl<'a> CompressedIndexIterator<'a> {
                     .values_compressor
                     .decode_into_bytes(impact_slice, self.term_index, info, &mut self.impacts);
             } else {
-                // Fallback: Box<dyn Slice> path
+                // Fallback: Box<dyn Slice> path. `Slice::data()` already
+                // returns a contiguous `&[u8]`, so the u32-offset decode
+                // path can be used directly here too.
                 let slice = self.sparse_index.docid_buffer.slice(
                     info.docid_position_range.0 as usize,
                     info.docid_position_range.1 as usize,
@@ -576,7 +610,7 @@ impl<'a> CompressedIndexIterator<'a> {
                 self.sparse_index
                     .information
                     .doc_ids_compressor
-                    .decode_into(slice, self.term_index, info, &mut self.docids);
+                    .decode_offsets_into(slice.data(), info, &mut self.docids);
 
                 let slice = self.sparse_index.impact_buffer.slice(
                     info.impact_position_range.0 as usize,
@@ -603,13 +637,49 @@ impl<'a> CompressedIndexIterator<'a> {
         }
     }
 
-    /// Binary search for first doc >= min_doc_id from current position
+    /// Galloping (exponential) search for the first offset >= `min_offset`,
+    /// starting at cursor position `start` within the decoded block (P4).
+    ///
+    /// This replaces the previous `partition_point` binary search over the
+    /// whole remaining slice: since callers overwhelmingly advance to the
+    /// very next posting (sequential WAND/MaxScore traversal), the fast
+    /// path below is a single comparison (O(1)); a larger jump costs
+    /// O(log gap) via exponential probing followed by a bounded binary
+    /// search, rather than O(log n) over the whole remaining block.
     #[inline]
-    fn find_geq(&self, min_doc_id: DocId) -> Option<usize> {
-        let search_slice = &self.docids[self.index..];
-        let pos = search_slice.partition_point(|&d| d < min_doc_id);
-        if pos < search_slice.len() {
-            Some(self.index + pos)
+    fn gallop_geq(&self, start: usize, min_offset: u32) -> Option<usize> {
+        let docids = &self.docids;
+        let len = docids.len();
+        if start >= len {
+            return None;
+        }
+
+        // Fast path: already positioned, or the very next posting matches.
+        if docids[start] >= min_offset {
+            return Some(start);
+        }
+
+        // Exponential probing to bracket the target.
+        let mut prev = start;
+        let mut bound = 1usize;
+        let mut cur = start + bound;
+        while cur < len && docids[cur] < min_offset {
+            prev = cur;
+            bound *= 2;
+            cur = start + bound;
+        }
+        let hi = cur.min(len);
+        let lo = prev + 1;
+
+        if lo >= hi {
+            return if hi < len { Some(hi) } else { None };
+        }
+
+        // Bounded binary search within the bracket (lo, hi).
+        let pos = docids[lo..hi].partition_point(|&d| d < min_offset);
+        let result = lo + pos;
+        if result < len {
+            Some(result)
         } else {
             None
         }
@@ -642,8 +712,9 @@ impl<'a> Iterator for CompressedIndexIterator<'a> {
         self.ensure_block_loaded();
 
         if self.index < self.docids.len() {
+            let min_doc_id = self.info.expect("block should be loaded").min_doc_id;
             let impact = TermImpact {
-                docid: self.docids[self.index],
+                docid: min_doc_id + self.docids[self.index] as DocId,
                 value: self.impacts[self.index],
             };
             self.index += 1;
@@ -655,14 +726,25 @@ impl<'a> Iterator for CompressedIndexIterator<'a> {
 }
 
 struct CompressedBlockTermImpactIterator<'a> {
-    /// Iterator for this term (RefCell needed for lazy current() resolution)
+    /// Decoder/cursor for this term's blocks. Needs interior mutability
+    /// because `current()` (`&self`) may need to decode a block and/or
+    /// advance the cursor the first time it is called after a
+    /// `next_min_doc_id` that actually moved forward.
     iterator: RefCell<CompressedIndexIterator<'a>>,
 
-    // Requested minimum document ID
-    current_min_docid: Option<DocId>,
+    /// Requested minimum document ID, updated only by `next_min_doc_id`
+    /// (`&mut self`).
+    current_min_docid: DocId,
 
-    /// Cached current posting (Cell: zero-cost for Copy types, no borrow checking)
-    current_value: Cell<Option<TermImpact>>,
+    /// Whether a posting has ever been resolved (so `current_docid` below
+    /// is meaningful).
+    has_current: Cell<bool>,
+
+    /// Cached resolved posting (split into plain `Cell<Copy>` fields rather
+    /// than a single `Cell<Option<TermImpact>>`: cheaper to read/write and
+    /// avoids `Option` matching on the hot path).
+    current_docid: Cell<DocId>,
+    current_value: Cell<ImpactValue>,
 
     /// Cached block metadata (updated in next_min_doc_id, no RefCell needed)
     cached_block_min_doc_id: DocId,
@@ -684,8 +766,10 @@ impl<'a> CompressedBlockTermImpactIterator<'a> {
         let info = &index.information.terms[term_index];
         Self {
             iterator: RefCell::new(CompressedIndexIterator::new(index, term_index)),
-            current_value: Cell::new(None),
-            current_min_docid: None,
+            current_min_docid: 0,
+            has_current: Cell::new(false),
+            current_docid: Cell::new(0),
+            current_value: Cell::new(0.0),
             cached_block_min_doc_id: 0,
             cached_block_max_doc_id: 0,
             cached_block_max_value: 0.0,
@@ -698,17 +782,22 @@ impl<'a> CompressedBlockTermImpactIterator<'a> {
 
 impl<'a> BlockTermImpactIterator for CompressedBlockTermImpactIterator<'a> {
     fn next_min_doc_id(&mut self, min_doc_id: DocId) -> Option<DocId> {
-        // Sets the current minimum document ID
-        self.current_min_docid = Some(min_doc_id.max(
-            if let Some(impact) = self.current_value.get() {
-                impact.docid + 1
-            } else {
-                0
-            },
-        ));
-        let min_doc_id = self.current_min_docid.expect("Should not be None");
+        // Sets the current minimum document ID. This is a *shallow* move:
+        // it only picks the right block (block-skip logic unchanged) and
+        // does not itself resolve/advance the intra-block cursor — that
+        // stays lazy, in `current()`, so that repeated `next_min_doc_id`
+        // calls (or a `current()` call with no intervening
+        // `next_min_doc_id`, as `transforms/split.rs` does) remain
+        // idempotent and never skip a posting.
+        let min_doc_id = min_doc_id.max(if self.has_current.get() {
+            self.current_docid.get() + 1
+        } else {
+            0
+        });
+        self.current_min_docid = min_doc_id;
 
-        // Move to the block having at least one document >= min_doc_id
+        // Move to the block having at least one document >= min_doc_id.
+        // `get_mut` (not `borrow_mut`): we already hold `&mut self` here.
         let iterator = self.iterator.get_mut();
         if iterator.move_iterator(min_doc_id) {
             // Cache block metadata (avoids RefCell borrow in tight loops)
@@ -728,28 +817,45 @@ impl<'a> BlockTermImpactIterator for CompressedBlockTermImpactIterator<'a> {
         }
     }
 
-    /// Returns the current posting using binary search within the decoded block.
+    /// Returns the current posting.
+    ///
+    /// If already positioned at (or past) `current_min_docid` — the common
+    /// case when `current()` is called more than once without an
+    /// intervening `next_min_doc_id`, e.g. by `transforms/split.rs` — this
+    /// is a plain read of the cached fields (P4): no search, no re-check
+    /// of the decoded block. Otherwise, resolves the exact posting via a
+    /// galloping (exponential) search from the cursor's current position,
+    /// which is O(1) when the target is the very next posting (the common
+    /// case for sequential WAND/MaxScore advance) and O(log gap) otherwise
+    /// — replacing the previous `partition_point` binary search over the
+    /// whole remaining block.
     fn current(&self) -> TermImpact {
-        let min_docid = self.current_min_docid.expect("Should not be null");
-        let cached = self.current_value.get();
+        let min_docid = self.current_min_docid;
 
-        if cached.map_or(true, |cv| cv.docid < min_docid) {
+        if !self.has_current.get() || self.current_docid.get() < min_docid {
             let mut iterator = self.iterator.borrow_mut();
             iterator.ensure_block_loaded();
 
-            if let Some(pos) = iterator.find_geq(min_docid) {
-                let impact = TermImpact {
-                    docid: iterator.docids[pos],
-                    value: iterator.impacts[pos],
-                };
-                self.current_value.set(Some(impact));
-                iterator.index = pos + 1;
-            } else {
-                panic!("Did not find current impact for min_docid={}", min_docid);
-            }
+            let info = iterator.info.expect("Iterator has block");
+            let min_offset = min_docid.saturating_sub(info.min_doc_id) as u32;
+            let start = iterator.index;
+            let pos = iterator.gallop_geq(start, min_offset).unwrap_or_else(|| {
+                panic!("Did not find current impact for min_docid={}", min_docid)
+            });
+
+            let docid = info.min_doc_id + iterator.docids[pos] as DocId;
+            let value = iterator.impacts[pos];
+            iterator.index = pos + 1;
+
+            self.current_docid.set(docid);
+            self.current_value.set(value);
+            self.has_current.set(true);
         }
 
-        self.current_value.get().expect("No current value")
+        TermImpact {
+            docid: self.current_docid.get(),
+            value: self.current_value.get(),
+        }
     }
 
     #[inline]

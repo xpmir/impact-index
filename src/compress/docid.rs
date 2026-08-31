@@ -24,7 +24,21 @@ use sucds::{EliasFano, EliasFanoBuilder, Searial};
 pub struct EliasFanoCompressor {}
 
 #[typetag::serde]
-impl DocIdCompressor for EliasFanoCompressor {}
+impl DocIdCompressor for EliasFanoCompressor {
+    /// The `sucds` `EliasFano` structure already stores offsets from
+    /// `min_doc_id` internally (see `write`, which pushes
+    /// `x - info.min_doc_id`), so decoding offsets is just the raw
+    /// iterator, cast down to `u32` — no `min_doc_id` addition needed.
+    fn decode_offsets_into(&self, data: &[u8], info: &TermBlockInformation, buffer: &mut Vec<u32>) {
+        debug_assert!(
+            info.max_doc_id - info.min_doc_id <= u32::MAX as DocId,
+            "block span exceeds u32 range"
+        );
+        let ef = EliasFano::deserialize_from(data).expect("Error while reading");
+        buffer.clear();
+        buffer.extend(ef.iter(0).map(|v| v as u32));
+    }
+}
 
 impl DocIdCompressorFactory for EliasFanoCompressor {
     fn create(&self, _index: &dyn SparseIndexView) -> Box<dyn DocIdCompressor> {
@@ -123,7 +137,44 @@ const BITPACK_TAIL_MARKER: u8 = 0xFF;
 pub struct BitPackingCompressor {}
 
 #[typetag::serde]
-impl DocIdCompressor for BitPackingCompressor {}
+impl DocIdCompressor for BitPackingCompressor {
+    /// Decode straight into a `u32` offset buffer (P5): `BitPacker4x`'s
+    /// native decompression unit is already `u32`, so for a full block this
+    /// is a single SIMD call with no scalar widen-to-`u64` loop.
+    fn decode_offsets_into(&self, data: &[u8], info: &TermBlockInformation, buffer: &mut Vec<u32>) {
+        debug_assert!(
+            info.max_doc_id - info.min_doc_id <= u32::MAX as DocId,
+            "block span exceeds u32 range"
+        );
+        let marker = data[0];
+        buffer.clear();
+
+        if marker != BITPACK_TAIL_MARKER && info.length == BITPACK_BLOCK_LEN {
+            // Full block: SIMD decompress directly into the buffer.
+            let num_bits = marker;
+            buffer.resize(BITPACK_BLOCK_LEN, 0u32);
+            if num_bits > 0 {
+                let bitpacker = BitPacker4x::new();
+                bitpacker.decompress_sorted(0, &data[1..], buffer.as_mut_slice(), num_bits);
+            }
+        } else {
+            // Tail block: read raw u32 gaps and prefix-sum (no min_doc_id add).
+            buffer.reserve(info.length);
+            let mut cumulative = 0u32;
+            for i in 0..info.length {
+                let offset = 1 + i * 4;
+                let gap = u32::from_le_bytes([
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ]);
+                cumulative += gap;
+                buffer.push(cumulative);
+            }
+        }
+    }
+}
 
 impl DocIdCompressorFactory for BitPackingCompressor {
     fn create(&self, _index: &dyn SparseIndexView) -> Box<dyn DocIdCompressor> {
@@ -283,7 +334,15 @@ impl Compressor<DocId> for BitPackingCompressor {
 pub struct PForCompressor {}
 
 #[typetag::serde]
-impl DocIdCompressor for PForCompressor {}
+impl DocIdCompressor for PForCompressor {
+    fn decode_offsets_into(&self, data: &[u8], info: &TermBlockInformation, buffer: &mut Vec<u32>) {
+        debug_assert!(
+            info.max_doc_id - info.min_doc_id <= u32::MAX as DocId,
+            "block span exceeds u32 range"
+        );
+        self.decode_block_offsets(data, info, buffer);
+    }
+}
 
 impl DocIdCompressorFactory for PForCompressor {
     fn create(&self, _index: &dyn SparseIndexView) -> Box<dyn DocIdCompressor> {
@@ -378,6 +437,71 @@ impl PForCompressor {
         for &d in &deltas {
             cumulative += d;
             buffer.push(cumulative as DocId + min_doc_id);
+        }
+    }
+
+    /// Same as [`Self::decode_block`], but produces `u32` offsets from
+    /// `info.min_doc_id` directly (P5), with no `min_doc_id` addition and
+    /// no `u64` widening.
+    fn decode_block_offsets(
+        &self,
+        data: &[u8],
+        info: &TermBlockInformation,
+        buffer: &mut Vec<u32>,
+    ) {
+        buffer.clear();
+
+        let base_bits = data[0];
+        let num_exceptions = data[1] as usize;
+
+        if base_bits == BITPACK_TAIL_MARKER {
+            // Tail block
+            buffer.reserve(info.length);
+            let mut cumulative = 0u32;
+            for i in 0..info.length {
+                let offset = 2 + i * 4;
+                let gap = u32::from_le_bytes([
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ]);
+                cumulative += gap;
+                buffer.push(cumulative);
+            }
+            return;
+        }
+
+        // Full block: decompress bitpacked deltas
+        let mut deltas = [0u32; BITPACK_BLOCK_LEN];
+        let packed_size = if base_bits > 0 {
+            let bitpacker = BitPacker4x::new();
+            bitpacker.decompress(&data[2..], &mut deltas, base_bits);
+            (BITPACK_BLOCK_LEN * base_bits as usize) / 8
+        } else {
+            0
+        };
+
+        // Patch exceptions
+        let exc_start = 2 + packed_size;
+        for e in 0..num_exceptions {
+            let offset = exc_start + e * 5;
+            let idx = data[offset] as usize;
+            let val = u32::from_le_bytes([
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+                data[offset + 4],
+            ]);
+            deltas[idx] = val;
+        }
+
+        // Prefix-sum to reconstruct offsets (no min_doc_id add, no widen)
+        buffer.reserve(BITPACK_BLOCK_LEN);
+        let mut cumulative = 0u32;
+        for &d in &deltas {
+            cumulative += d;
+            buffer.push(cumulative);
         }
     }
 }
