@@ -2,7 +2,7 @@
 
 A Python/Rust library for efficient sparse retrieval. Built on Rust with PyO3 bindings for high performance.
 
-Supports both neural IR models with floating-point impact scores and traditional BM25 bag-of-words retrieval with performance competitive with Lucene/Pyserini.
+Supports both neural IR models with floating-point impact scores and traditional BM25 bag-of-words retrieval with performance competitive with Lucene/Pyserini and Terrier.
 
 ## Features
 
@@ -29,11 +29,20 @@ x86-64/AVX2):
 | **impact-index** (compressed) | **278** | **101** | 0.69 GB | 0.1858 |
 | **impact-index** (compressed + reordered) | **295** | **106** | 0.66 GB | 0.1858 |
 | Pyserini (Lucene) | 213 | 90 | 0.6 GB | 0.1855 |
+| Terrier 5 (PyTerrier) | 68 | — | 1.3 GB | 0.1879 |
 
 Result overlap with Pyserini: @10=0.985, @100=0.989. Compressed index
 is lossless (same results as raw). Analysis pipeline matches Lucene's
 EnglishAnalyzer: UAX#29 tokenizer, Porter stemmer, English possessive
 filter, and stop words. Per-step measurements live in `optimizations.md`.
+
+Reproduce with `examples/benchmark_bm25.py`. Terrier 5.11 runs through
+PyTerrier (single-pass index, one query at a time via
+`pt.terrier.Retriever`, which adds some Python overhead per query); its
+analysis pipeline (Terrier's own stop word list and stemming) differs
+from the Lucene-matched systems, hence the different MRR@10 and a
+Pyserini overlap of only 0.70@10. Java: Terrier 5 needs Java 11+ and
+Pyserini needs Java 21 — both measured with OpenJDK (Temurin) 21.
 
 ## Installation
 
