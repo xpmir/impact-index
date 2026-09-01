@@ -134,6 +134,7 @@ fn build_raw_index(
             in_memory_threshold: 256,
             checkpoint_frequency: 0,
             checkpoint_flush_ratio: 0.5,
+            positions: false,
         },
     );
 
@@ -155,6 +156,7 @@ fn compression_sink(max_block_size: usize) -> CompressionTransform {
         max_block_size,
         doc_ids_compressor_factory: Box::new(PForCompressor {}),
         impacts_compressor_factory: Box::new(Identity {}),
+        positions_codec: None,
     }
 }
 

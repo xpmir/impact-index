@@ -24,6 +24,7 @@ fn test_split_index() {
             checkpoint_frequency: 0,
             in_memory_threshold: 10,
             checkpoint_flush_ratio: 0.5,
+            positions: false,
         },
         &HashSet::<DocId>::from([]),
     );
@@ -34,6 +35,7 @@ fn test_split_index() {
         max_block_size: 1024,
         doc_ids_compressor_factory: Box::new(EliasFanoCompressor {}),
         impacts_compressor_factory: Box::new(Identity {}),
+        positions_codec: None,
     });
 
     let transform = SplitIndexTransform {

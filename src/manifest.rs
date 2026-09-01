@@ -15,6 +15,13 @@
 //! (see [`check_index_manifest`]) -- a missing manifest is never an error,
 //! only a version *mismatch* is.
 //!
+//! Registered migration steps, by the version they start from: `0`
+//! (legacy/absent manifest) -> v1 stamps a manifest with no data rewrite;
+//! `1` -> v2 (P1a) adds per-block `min_doc_length`; `2` -> v3 (positions)
+//! rewrites a `Compressed` index's `index.bin` to the v5 binary layout
+//! (positions codec slot, always `None` for a pre-existing directory) via
+//! [`crate::compress::migrate_compressed_v4_to_v5`].
+//!
 //! # Extending for a new format version
 //!
 //! When a future change (e.g. P1a's per-block `min_dl` statistics, or
@@ -52,7 +59,7 @@ pub const MANIFEST_FILENAME: &str = "manifest.json";
 /// `FORWARD_INDEX_VERSION` in `index.rs`, `COMPRESSED_INDEX_VERSION` in
 /// `compress/mod.rs`). Those stay as fine-grained safety checks on their
 /// own file formats; this is the version [`update_index`] migrates.
-pub const CURRENT_FORMAT_VERSION: u32 = 2;
+pub const CURRENT_FORMAT_VERSION: u32 = 3;
 
 /// Kind of index directory described by a manifest.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +144,13 @@ pub struct Manifest {
     /// Best-effort build parameters, for human inspection.
     #[serde(default)]
     pub builder: BuilderInfo,
+    /// Opt-in on-disk features this index carries beyond its base
+    /// `index_kind` layout (e.g. `"positions"`). Additive: an old manifest
+    /// with no `features` field parses as an empty list, and readers that
+    /// don't recognize a feature just ignore it -- no `CURRENT_FORMAT_VERSION`
+    /// bump needed for a directory that doesn't use the feature.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
 
 impl Manifest {
@@ -147,7 +161,14 @@ impl Manifest {
             index_kind,
             created: current_iso_date(),
             builder,
+            features: Vec::new(),
         }
+    }
+
+    /// Sets the manifest's feature list (builder-style).
+    pub fn with_features(mut self, features: Vec<String>) -> Self {
+        self.features = features;
+        self
     }
 }
 
@@ -245,6 +266,20 @@ pub fn read_manifest(path: &Path) -> io::Result<Option<Manifest>> {
 /// with the current format version and "now".
 pub fn write_manifest(path: &Path, index_kind: IndexKind, builder: BuilderInfo) -> io::Result<()> {
     write_manifest_raw(path, &Manifest::new(index_kind, builder))
+}
+
+/// Writes a `manifest.json` like [`write_manifest`], additionally
+/// recording `features` (e.g. `["positions"]`).
+pub fn write_manifest_with_features(
+    path: &Path,
+    index_kind: IndexKind,
+    builder: BuilderInfo,
+    features: Vec<String>,
+) -> io::Result<()> {
+    write_manifest_raw(
+        path,
+        &Manifest::new(index_kind, builder).with_features(features),
+    )
 }
 
 /// Writes an already-constructed [`Manifest`] verbatim, without forcing
@@ -372,6 +407,39 @@ fn migrate_v1_to_v2(path: &Path) -> io::Result<()> {
     write_manifest_raw(path, &manifest)
 }
 
+/// v2 -> v3 (positions): rewrites a compressed index's `index.bin` from
+/// the pre-positions v4 binary layout to v5 (see
+/// [`crate::compress::migrate_compressed_v4_to_v5`] for the exact
+/// rewrite -- a v4 index has no positions by construction, so this is
+/// metadata-only: `positions_compressor` becomes `None` and every block's
+/// position fields become the `(0, 0)`/`0` "none" sentinel).
+///
+/// Dispatches on `index_kind` exactly like [`migrate_v1_to_v2`]:
+/// `Compressed` rewrites its own `index.bin`; `Split` has none of its own
+/// and recurses into its `inner` directory; `Forward` has no compressed
+/// binary at all, nothing to rewrite.
+fn migrate_v2_to_v3(path: &Path) -> io::Result<()> {
+    let kind = read_manifest(path)?
+        .map(|m| m.index_kind)
+        .unwrap_or_else(|| detect_index_kind(path));
+
+    match kind {
+        IndexKind::Compressed => crate::compress::migrate_compressed_v4_to_v5(path)?,
+        IndexKind::Split => {
+            let inner = path.join("inner");
+            if inner.is_dir() {
+                update_index(&inner, None)?;
+            }
+        }
+        IndexKind::Forward => {}
+    }
+
+    let mut manifest =
+        read_manifest(path)?.unwrap_or_else(|| Manifest::new(kind, BuilderInfo::new()));
+    manifest.format_version = 3;
+    write_manifest_raw(path, &manifest)
+}
+
 /// Migrates the index directory at `path` to [`CURRENT_FORMAT_VERSION`].
 ///
 /// If `dest` is `Some`, the directory is first copied there and the
@@ -410,8 +478,11 @@ pub fn update_index(path: &Path, dest: Option<&Path>) -> io::Result<PathBuf> {
     // from. Add new entries here as the format evolves further (P1a's
     // `(1, migrate_v1_to_v2)` is the template: recompute/rewrite what
     // changed, write the manifest last).
-    let steps: &[(u32, fn(&Path) -> io::Result<()>)] =
-        &[(0, migrate_legacy_to_v1), (1, migrate_v1_to_v2)];
+    let steps: &[(u32, fn(&Path) -> io::Result<()>)] = &[
+        (0, migrate_legacy_to_v1),
+        (1, migrate_v1_to_v2),
+        (2, migrate_v2_to_v3),
+    ];
 
     while current_version != CURRENT_FORMAT_VERSION {
         if current_version > CURRENT_FORMAT_VERSION {

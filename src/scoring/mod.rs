@@ -185,6 +185,17 @@ impl<'a> BlockTermImpactIterator for ScoringBlockIterator<'a> {
     fn length(&self) -> usize {
         self.cached_length
     }
+
+    /// Forwards to the inner (unscored) iterator: positions don't change
+    /// under scoring. The inner iterator resolves its own current posting
+    /// lazily inside its own `positions()`, so this doesn't disturb
+    /// `self.current_impact`'s cache -- both wrappers are advanced in
+    /// lockstep by `next_min_doc_id`, and `current()`'s caching here is
+    /// purely about the *scored* value, independent of whether positions
+    /// were ever requested.
+    fn positions(&mut self) -> Option<&[u32]> {
+        self.inner.positions()
+    }
 }
 
 /// A wrapper around a [`SparseIndex`] that applies scoring functions to iterators.
@@ -277,6 +288,17 @@ impl SparseIndex for ScoredIndex {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn has_positions(&self) -> bool {
+        SparseIndex::has_positions(&**self.inner)
+    }
+
+    fn positions_iterator<'a>(
+        &'a self,
+        term_ix: TermIndex,
+    ) -> Option<Box<dyn Iterator<Item = Vec<u32>> + 'a>> {
+        SparseIndex::positions_iterator(&**self.inner, term_ix)
     }
 }
 

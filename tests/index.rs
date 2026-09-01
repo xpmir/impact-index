@@ -65,6 +65,7 @@ fn test_index() {
             checkpoint_frequency: 0,
             in_memory_threshold: 10,
             checkpoint_flush_ratio: 0.5,
+            positions: false,
         },
         &HashSet::<DocId>::from([]),
     );
@@ -224,6 +225,7 @@ fn test_search(
             in_memory_threshold: 10,
             checkpoint_frequency: checkpoint_frequency,
             checkpoint_flush_ratio: 0.5,
+            positions: false,
         },
         &index_interruptions_set,
     );
@@ -236,6 +238,7 @@ fn test_search(
                     max_block_size: 1024,
                     doc_ids_compressor_factory: Box::new(EliasFanoCompressor {}),
                     impacts_compressor_factory: Box::new(Identity {}),
+                    positions_codec: None,
                 }),
                 quantiles: [63. / 64.].to_vec(),
             };
@@ -251,6 +254,7 @@ fn test_search(
                 max_block_size: 128,
                 doc_ids_compressor_factory: Box::new(BitPackingCompressor {}),
                 impacts_compressor_factory: Box::new(Identity {}),
+                positions_codec: None,
             };
             let compressed_path = data.dir.path().join("bitpacked");
             transform
@@ -265,6 +269,7 @@ fn test_search(
                 max_block_size: 128,
                 doc_ids_compressor_factory: Box::new(BitPackingCompressor {}),
                 impacts_compressor_factory: Box::new(GlobalQuantizerFactory { nbits: 16 }),
+                positions_codec: None,
             };
             let compressed_path = data.dir.path().join("bitpacked16");
             transform
@@ -279,6 +284,7 @@ fn test_search(
                 max_block_size: 128,
                 doc_ids_compressor_factory: Box::new(BitPackingCompressor {}),
                 impacts_compressor_factory: Box::new(GlobalQuantizerFactory { nbits: 8 }),
+                positions_codec: None,
             };
             let compressed_path = data.dir.path().join("bitpacked8");
             transform
@@ -292,6 +298,7 @@ fn test_search(
                 max_block_size: 128,
                 doc_ids_compressor_factory: Box::new(PForCompressor {}),
                 impacts_compressor_factory: Box::new(Identity {}),
+                positions_codec: None,
             };
             let compressed_path = data.dir.path().join("pfor");
             transform
@@ -306,6 +313,7 @@ fn test_search(
                 max_block_size: 128,
                 doc_ids_compressor_factory: Box::new(BitPackingCompressor {}),
                 impacts_compressor_factory: Box::new(QuantizedBitPackedFactory { nbits: 8 }),
+                positions_codec: None,
             };
             let compressed_path = data.dir.path().join("qbp8");
             transform
@@ -384,6 +392,7 @@ fn test_bmp_conversion_comparison() {
             checkpoint_frequency: 0,
             in_memory_threshold: 10,
             checkpoint_flush_ratio: 0.5,
+            positions: false,
         },
         &HashSet::<DocId>::from([]),
     );
@@ -469,6 +478,7 @@ fn test_bmp_streaming_with_compression() {
             checkpoint_frequency: 0,
             in_memory_threshold: 10,
             checkpoint_flush_ratio: 0.5,
+            positions: false,
         },
         &HashSet::<DocId>::from([]),
     );
@@ -543,6 +553,7 @@ fn test_bmp_conversion_stress(
             checkpoint_frequency: 0,
             in_memory_threshold: 10,
             checkpoint_flush_ratio: 0.5,
+            positions: false,
         },
         &HashSet::<DocId>::from([]),
     );

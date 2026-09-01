@@ -117,32 +117,50 @@ impl TextAnalyzer {
         &self.config
     }
 
+    /// Lowercase a token and, if enabled, strip a trailing English
+    /// possessive ('s with straight or curly apostrophe). Matches Lucene's
+    /// EnglishPossessiveFilter, which handles U+0027 ('), U+2019 ('), and
+    /// U+FF07 (').
+    fn normalize_token(&self, t: &str) -> String {
+        let lowered = t.to_lowercase();
+        if self.english_possessive_filter {
+            if lowered.ends_with("'s")
+                || lowered.ends_with("\u{2019}s")
+                || lowered.ends_with("\u{ff07}s")
+            {
+                // Remove last 2 chars (apostrophe + s)
+                let end = lowered.len() - "'s".len();
+                // Curly apostrophes are multi-byte, find the right cut point
+                let cut = lowered
+                    .rfind(|c: char| c == '\'' || c == '\u{2019}' || c == '\u{ff07}')
+                    .unwrap_or(end);
+                return lowered[..cut].to_string();
+            }
+        }
+        lowered
+    }
+
+    /// Tokenize text using UAX#29 word boundaries (matching Lucene's
+    /// StandardTokenizer), then apply possessive filter, lowercase, and
+    /// stop words -- keeping each surviving token's pre-filtering index as
+    /// its position. This creates position gaps across removed stopwords
+    /// (Lucene's position-increment behavior), which is required for
+    /// correct phrase semantics: `#1(new york)` must not match "new the
+    /// york".
+    fn tokenize_indexed(&self, text: &str) -> Vec<(String, u32)> {
+        text.unicode_words()
+            .enumerate()
+            .map(|(i, t)| (self.normalize_token(t), i as u32))
+            .filter(|(s, _)| !s.is_empty() && !self.stop_words.contains(s))
+            .collect()
+    }
+
     /// Tokenize text using UAX#29 word boundaries (matching Lucene's StandardTokenizer),
     /// then apply possessive filter, lowercase, and stop words.
     fn tokenize(&self, text: &str) -> Vec<String> {
-        text.unicode_words()
-            .map(|t| {
-                let lowered = t.to_lowercase();
-                if self.english_possessive_filter {
-                    // Strip trailing 's with straight or curly apostrophe
-                    // Matches Lucene's EnglishPossessiveFilter which handles
-                    // U+0027 ('), U+2019 ('), and U+FF07 (')
-                    if lowered.ends_with("'s")
-                        || lowered.ends_with("\u{2019}s")
-                        || lowered.ends_with("\u{ff07}s")
-                    {
-                        // Remove last 2 chars (apostrophe + s)
-                        let end = lowered.len() - "'s".len();
-                        // Curly apostrophes are multi-byte, find the right cut point
-                        let cut = lowered
-                            .rfind(|c: char| c == '\'' || c == '\u{2019}' || c == '\u{ff07}')
-                            .unwrap_or(end);
-                        return lowered[..cut].to_string();
-                    }
-                }
-                lowered
-            })
-            .filter(|s| !s.is_empty() && !self.stop_words.contains(s))
+        self.tokenize_indexed(text)
+            .into_iter()
+            .map(|(t, _)| t)
             .collect()
     }
 
@@ -169,6 +187,28 @@ impl TextAnalyzer {
         }
 
         (term_indices, tf_values)
+    }
+
+    /// Analyze document text like [`Self::analyze_doc`], but also record
+    /// each stemmed term's token positions instead of collapsing them to a
+    /// count.
+    ///
+    /// Returns `(term_index, positions)` pairs, one per distinct term.
+    /// `positions` is sorted ascending (tokens are processed in text
+    /// order); tf for a term is `positions.len()`.
+    pub fn analyze_doc_positional(&mut self, text: &str) -> Vec<(TermIndex, Vec<u32>)> {
+        let tokens = self.tokenize_indexed(text);
+
+        let mut positions_map: HashMap<String, Vec<u32>> = HashMap::new();
+        for (token, pos) in tokens {
+            let stemmed = self.stemmer.stem(&token);
+            positions_map.entry(stemmed).or_default().push(pos);
+        }
+
+        positions_map
+            .into_iter()
+            .map(|(term, positions)| (self.vocab.get_or_insert(&term), positions))
+            .collect()
     }
 
     /// Analyze query text: tokenize, stem, lookup in vocabulary.
@@ -201,6 +241,22 @@ impl TextAnalyzer {
             *tf_map.entry(stemmed).or_insert(0.0) += 1.0;
         }
         tf_map.into_iter().collect()
+    }
+
+    /// Thread-safe, position-preserving variant of [`Self::tokenize_and_stem`]
+    /// (no vocabulary insertion), for the parallel batch path
+    /// ([`crate::bow::BOWIndexBuilder::add_texts_batch`]) when positions
+    /// are enabled.
+    ///
+    /// Returns a list of `(stemmed_token, positions)` pairs.
+    pub fn tokenize_and_stem_positional(&self, text: &str) -> Vec<(String, Vec<u32>)> {
+        let tokens = self.tokenize_indexed(text);
+        let mut positions_map: HashMap<String, Vec<u32>> = HashMap::new();
+        for (token, pos) in tokens {
+            let stemmed = self.stemmer.stem(&token);
+            positions_map.entry(stemmed).or_default().push(pos);
+        }
+        positions_map.into_iter().collect()
     }
 
     /// Get a reference to the vocabulary.

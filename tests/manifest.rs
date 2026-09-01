@@ -27,6 +27,7 @@ fn build_test_index() -> TestIndex {
             checkpoint_frequency: 0,
             in_memory_threshold: 16,
             checkpoint_flush_ratio: 0.5,
+            positions: false,
         },
         &HashSet::<DocId>::from([]),
     )
@@ -62,6 +63,7 @@ fn test_compressed_index_writes_manifest() {
         max_block_size: 64,
         doc_ids_compressor_factory: Box::new(EliasFanoCompressor {}),
         impacts_compressor_factory: Box::new(Identity {}),
+        positions_codec: None,
     };
     transform.process(dir.path(), &index).expect("compress");
 
@@ -94,6 +96,7 @@ fn test_split_index_writes_manifest() {
         max_block_size: 64,
         doc_ids_compressor_factory: Box::new(EliasFanoCompressor {}),
         impacts_compressor_factory: Box::new(Identity {}),
+        positions_codec: None,
     });
     let transform = SplitIndexTransform {
         sink,
@@ -174,6 +177,7 @@ fn test_load_index_panics_with_actionable_message_on_mismatch() {
         max_block_size: 64,
         doc_ids_compressor_factory: Box::new(EliasFanoCompressor {}),
         impacts_compressor_factory: Box::new(Identity {}),
+        positions_codec: None,
     };
     transform.process(dir.path(), &index).expect("compress");
 
@@ -213,6 +217,7 @@ fn test_manifest_less_directory_still_loads() {
         max_block_size: 64,
         doc_ids_compressor_factory: Box::new(EliasFanoCompressor {}),
         impacts_compressor_factory: Box::new(Identity {}),
+        positions_codec: None,
     };
     transform.process(dir.path(), &index).expect("compress");
 
@@ -242,6 +247,7 @@ fn test_update_index_migrates_legacy_directory_in_place() {
         max_block_size: 64,
         doc_ids_compressor_factory: Box::new(EliasFanoCompressor {}),
         impacts_compressor_factory: Box::new(Identity {}),
+        positions_codec: None,
     };
     transform.process(dir.path(), &index).expect("compress");
     std::fs::remove_file(dir.path().join(MANIFEST_FILENAME)).expect("remove manifest");
@@ -271,6 +277,7 @@ fn test_update_index_with_dest_leaves_source_untouched() {
         max_block_size: 64,
         doc_ids_compressor_factory: Box::new(EliasFanoCompressor {}),
         impacts_compressor_factory: Box::new(Identity {}),
+        positions_codec: None,
     };
     transform.process(src_dir.path(), &index).expect("compress");
     std::fs::remove_file(src_dir.path().join(MANIFEST_FILENAME)).expect("remove manifest");

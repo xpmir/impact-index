@@ -605,6 +605,8 @@ mod tests {
             min_doc_id: min,
             max_doc_id: max,
             min_doc_length: 0,
+            positions_position_range: (0, 0),
+            num_positions: 0,
         }
     }
 

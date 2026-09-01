@@ -358,6 +358,7 @@ impl PySparseIndex {
             max_block_size: block_size,
             doc_ids_compressor_factory: Box::new(PForCompressor {}),
             impacts_compressor_factory: impacts_factory,
+            positions_codec: None,
         };
         let path = Path::new(output_folder);
         transform
@@ -420,6 +421,7 @@ impl PySparseIndex {
             max_block_size: block_size,
             doc_ids_compressor_factory: Box::new(PForCompressor {}),
             impacts_compressor_factory: impacts_factory,
+            positions_codec: None,
         });
         let transform = crate::transforms::reorder::ReorderTransform {
             sink,
@@ -907,6 +909,7 @@ impl PyTransformFactory for PyCompressionTransformFactory {
         Box::new(CompressionTransform {
             max_block_size: self.max_block_size,
             impacts_compressor_factory: (*impacts.inner).clone(),
+            positions_codec: None,
             doc_ids_compressor_factory: (*docids.inner).clone(),
         })
     }

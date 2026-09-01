@@ -22,6 +22,9 @@ pub struct BOWIndexBuilder<V: PostingValue> {
     doc_lengths: Vec<u32>,
     analyzer: Option<TextAnalyzer>,
     folder: PathBuf,
+    /// Mirrors `options.positions`: routes `add_text`/`add_texts_batch`
+    /// through the positional analyzer and gates `add`/`add_with_positions`.
+    positions: bool,
 }
 
 impl<V: PostingValue> BOWIndexBuilder<V> {
@@ -32,6 +35,7 @@ impl<V: PostingValue> BOWIndexBuilder<V> {
             doc_lengths: Vec::new(),
             analyzer: None,
             folder: folder.to_path_buf(),
+            positions: options.positions,
         }
     }
 
@@ -42,6 +46,7 @@ impl<V: PostingValue> BOWIndexBuilder<V> {
             doc_lengths: Vec::new(),
             analyzer: Some(analyzer),
             folder: folder.to_path_buf(),
+            positions: options.positions,
         }
     }
 
@@ -67,6 +72,10 @@ impl<V: PostingValue> BOWIndexBuilder<V> {
         terms: &[TermIndex],
         values: &[V],
     ) -> Result<(), std::io::Error> {
+        assert!(
+            !self.positions,
+            "index built with positions=true: use add_with_positions"
+        );
         assert_eq!(terms.len(), values.len());
 
         // Compute doc length as sum of values
@@ -85,6 +94,35 @@ impl<V: PostingValue> BOWIndexBuilder<V> {
         self.indexer.add(docid, &terms_array, &values_array)
     }
 
+    /// Add pre-tokenized terms together with each term's token positions.
+    /// Values (tf) are derived as `positions[i].len()`. Requires the index
+    /// to have been built with `BuilderOptions { positions: true, .. }`.
+    pub fn add_with_positions(
+        &mut self,
+        docid: DocId,
+        terms: &[TermIndex],
+        positions: &[Vec<u32>],
+    ) -> Result<(), std::io::Error> {
+        assert_eq!(terms.len(), positions.len());
+
+        let values: Vec<V> = positions
+            .iter()
+            .map(|p| convert_f32_to_v::<V>(p.len() as f32))
+            .collect();
+
+        // Compute doc length as sum of tfs (same definition as `add`)
+        let doc_length: u32 = positions.iter().map(|p| p.len() as u32).sum();
+
+        let idx = docid as usize;
+        if idx >= self.doc_lengths.len() {
+            self.doc_lengths.resize(idx + 1, 0);
+        }
+        self.doc_lengths[idx] = doc_length;
+
+        self.indexer
+            .add_with_positions(docid, terms, &values, positions)
+    }
+
     /// Add raw text (requires analyzer). Tokenizes, stems, computes TF,
     /// grows vocabulary, and records doc length automatically.
     ///
@@ -94,6 +132,31 @@ impl<V: PostingValue> BOWIndexBuilder<V> {
             .analyzer
             .as_mut()
             .expect("add_text requires a TextAnalyzer");
+
+        if self.positions {
+            let terms_positions = analyzer.analyze_doc_positional(text);
+
+            // Doc length is the total number of tokens (sum of tfs), same
+            // definition as the non-positional path below.
+            let doc_length: u32 = terms_positions.iter().map(|(_, p)| p.len() as u32).sum();
+
+            let idx = docid as usize;
+            if idx >= self.doc_lengths.len() {
+                self.doc_lengths.resize(idx + 1, 0);
+            }
+            self.doc_lengths[idx] = doc_length;
+
+            let terms: Vec<TermIndex> = terms_positions.iter().map(|(t, _)| *t).collect();
+            let positions: Vec<Vec<u32>> = terms_positions.into_iter().map(|(_, p)| p).collect();
+            let values: Vec<V> = positions
+                .iter()
+                .map(|p| convert_f32_to_v::<V>(p.len() as f32))
+                .collect();
+
+            self.indexer
+                .add_with_positions(docid, &terms, &values, &positions)?;
+            return Ok(doc_length);
+        }
 
         let (term_indices, tf_values) = analyzer.analyze_doc(text);
 
@@ -134,6 +197,47 @@ impl<V: PostingValue> BOWIndexBuilder<V> {
             .analyzer
             .as_ref()
             .expect("add_texts_batch requires a TextAnalyzer");
+
+        if self.positions {
+            // Phase 1: parallel tokenization + stemming, keeping positions
+            // (read-only on analyzer).
+            let analyzed: Vec<(DocId, Vec<(String, Vec<u32>)>)> = documents
+                .par_iter()
+                .map(|&(docid, text)| (docid, analyzer.tokenize_and_stem_positional(text)))
+                .collect();
+
+            // Phase 2: sequential vocabulary insertion + index building
+            let analyzer = self.analyzer.as_mut().unwrap();
+            for (docid, tokens) in analyzed {
+                let mut term_indices = Vec::with_capacity(tokens.len());
+                let mut positions: Vec<Vec<u32>> = Vec::with_capacity(tokens.len());
+                let mut doc_length: u32 = 0;
+
+                for (stemmed, pos) in tokens {
+                    let idx = analyzer.vocab_mut().get_or_insert(&stemmed);
+                    doc_length += pos.len() as u32;
+                    term_indices.push(idx);
+                    positions.push(pos);
+                }
+
+                // Record doc length
+                let didx = docid as usize;
+                if didx >= self.doc_lengths.len() {
+                    self.doc_lengths.resize(didx + 1, 0);
+                }
+                self.doc_lengths[didx] = doc_length;
+
+                // Add to indexer
+                let values: Vec<V> = positions
+                    .iter()
+                    .map(|p| convert_f32_to_v::<V>(p.len() as f32))
+                    .collect();
+                self.indexer
+                    .add_with_positions(docid, &term_indices, &values, &positions)?;
+            }
+
+            return Ok(());
+        }
 
         // Phase 1: Parallel tokenization + stemming (read-only on analyzer)
         // We tokenize and stem but don't insert into vocabulary yet.

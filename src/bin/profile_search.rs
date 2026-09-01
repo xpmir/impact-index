@@ -31,6 +31,7 @@ fn main() {
             in_memory_threshold: 128,
             checkpoint_frequency: 0,
             checkpoint_flush_ratio: 0.5,
+            positions: false,
         },
     );
 
@@ -76,6 +77,7 @@ fn main() {
         max_block_size: 128,
         doc_ids_compressor_factory: Box::new(BitPackingCompressor {}),
         impacts_compressor_factory: Box::new(GlobalQuantizerFactory { nbits: 16 }),
+        positions_codec: None,
     };
     let compressed_path = tmpdir.join("compressed");
     transform.process(&compressed_path, &raw_index).unwrap();

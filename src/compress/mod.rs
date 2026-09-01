@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod docid;
 pub mod impact;
+pub mod positions;
 
 //
 // ---- Compressed index global information  ---
@@ -72,13 +73,30 @@ pub struct TermBlockInformation {
     /// something smaller, which only ever loosens (never tightens past
     /// safe) the resulting bound.
     pub min_doc_length: u16,
+
+    /// Position within the (flattened, per-block) position-delta stream in
+    /// `positions.dat`. `(0, 0)` means this block has no positions (either
+    /// the whole index has none, or it was read from a pre-positions v4
+    /// binary). `#[serde(default)]` so the CBOR stub written by
+    /// [`CompressionTransform::process`] (which carries no term data) and
+    /// any value predating this field still deserialize.
+    #[serde(default)]
+    pub positions_position_range: (u64, u64),
+
+    /// Sum of this block's tfs, i.e. the number of deltas the position
+    /// codec must decode from `positions_position_range` -- carried
+    /// alongside the byte range because a chunked codec ([`positions::BitPackingPositions`])
+    /// can't recover the count from the byte length alone. `0` when
+    /// `positions_position_range` is `(0, 0)`.
+    #[serde(default)]
+    pub num_positions: u32,
 }
 
 impl std::fmt::Display for TermBlockInformation {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "(docids: {}-{}, impacts: {}-{}, len: {}, max_v: {}, docid: {}-{}, min_dl: {})",
+            "(docids: {}-{}, impacts: {}-{}, len: {}, max_v: {}, docid: {}-{}, min_dl: {}, positions: {}-{} (n={}))",
             self.docid_position_range.0,
             self.docid_position_range.1,
             self.impact_position_range.0,
@@ -87,7 +105,10 @@ impl std::fmt::Display for TermBlockInformation {
             self.max_value,
             self.min_doc_id,
             self.max_doc_id,
-            self.min_doc_length
+            self.min_doc_length,
+            self.positions_position_range.0,
+            self.positions_position_range.1,
+            self.num_positions,
         )
     }
 }
@@ -239,6 +260,9 @@ pub struct CompressedIndexInformation {
     pub terms: Vec<TermBlocksInformation>,
     doc_ids_compressor: Box<dyn DocIdCompressor>,
     values_compressor: Box<dyn ImpactCompressor>,
+    /// `Some` iff the index has positions (`positions.dat` was written by
+    /// [`CompressionTransform::process`]).
+    positions_compressor: Option<Box<dyn positions::PositionsCompressor>>,
 }
 
 const COMPRESSED_INDEX_MAGIC: u32 = 0x49445832; // "IDX2"
@@ -247,7 +271,17 @@ const COMPRESSED_INDEX_MAGIC: u32 = 0x49445832; // "IDX2"
 /// directories must be migrated via `manifest::update_index` (registered
 /// as the `(1, migrate_v1_to_v2)` step) -- `read_binary` below refuses to
 /// silently reinterpret v3 bytes.
-const COMPRESSED_INDEX_VERSION: u32 = 4;
+///
+/// v5 adds an optional position stream: the compressor header becomes a
+/// 3-tuple `(doc_ids, values, positions)` and every block record gains a
+/// `positions_position_range` byte-length + `num_positions` count (both
+/// `0` when the index has no positions). v4 -> v5 directories must be
+/// migrated via `manifest::update_index` (registered as the
+/// `(2, migrate_v2_to_v3)` step, see `manifest.rs`) -- `read_binary` below
+/// refuses to silently reinterpret v4 bytes; only [`read_binary_impl`] (via
+/// [`migrate_compressed_v4_to_v5`]) understands the old 2-tuple/no-positions
+/// layout, for the sake of migrating it away.
+const COMPRESSED_INDEX_VERSION: u32 = 5;
 
 /// Write a u64 as variable-length integer (1-9 bytes).
 fn write_vint(writer: &mut dyn Write, mut v: u64) -> std::io::Result<()> {
@@ -287,6 +321,13 @@ impl CompressedIndexInformation {
     /// Format v4 (P1a) appends one more field per block:
     ///   `min_doc_length: u16` (see [`TermBlockInformation::min_doc_length`]).
     ///
+    /// Format v5 (positions) changes the compressor header to a 3-tuple
+    /// `(doc_ids, values, positions)` and appends two more fields per
+    /// block: `positions_len: VInt` and `num_positions: VInt` (both `0`
+    /// when the index has no positions) -- see
+    /// [`TermBlockInformation::positions_position_range`] /
+    /// [`TermBlockInformation::num_positions`].
+    ///
     /// `pub` (rather than the usual module-private helper) so integration
     /// tests can inspect exactly what was written, e.g. to hand-verify
     /// migrated `min_doc_length` values (`tests/*.rs` link this crate
@@ -302,7 +343,11 @@ impl CompressedIndexInformation {
         // Compressor header (CBOR, small, only once)
         let mut compressor_buf = Vec::new();
         ciborium::ser::into_writer(
-            &(&self.doc_ids_compressor, &self.values_compressor),
+            &(
+                &self.doc_ids_compressor,
+                &self.values_compressor,
+                &self.positions_compressor,
+            ),
             &mut compressor_buf,
         )
         .expect("Failed to serialize compressors");
@@ -350,6 +395,83 @@ impl CompressedIndexInformation {
                 prev_doc_id = block.max_doc_id;
                 // P1a: per-block minimum document length (0 = not available).
                 writer.write_u16::<LittleEndian>(block.min_doc_length)?;
+                // v5: position stream byte length + posting count (0/0 = none).
+                let positions_len =
+                    block.positions_position_range.1 - block.positions_position_range.0;
+                write_vint(writer, positions_len)?;
+                write_vint(writer, block.num_positions as u64)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes the pre-positions (v4) binary layout: 2-tuple compressor
+    /// header, no per-block position fields. `#[doc(hidden)]` -- used only
+    /// by the migration integration test to synthesize a legacy v4 index
+    /// to migrate from; the live writer is [`Self::write_binary`] (v5).
+    ///
+    /// Panics if `self.positions_compressor` is `Some`: v4 has no way to
+    /// represent a positions codec, so writing this layout for a
+    /// positional index would silently drop it.
+    #[doc(hidden)]
+    pub fn write_binary_v4(&self, writer: &mut dyn Write) -> std::io::Result<()> {
+        use byteorder::{LittleEndian, WriteBytesExt};
+
+        assert!(
+            self.positions_compressor.is_none(),
+            "write_binary_v4 cannot represent a positions compressor (v4 predates positions)"
+        );
+
+        // Header
+        writer.write_u32::<LittleEndian>(COMPRESSED_INDEX_MAGIC)?;
+        writer.write_u32::<LittleEndian>(4)?;
+        writer.write_u32::<LittleEndian>(self.terms.len() as u32)?;
+
+        // Compressor header (CBOR, small, only once)
+        let mut compressor_buf = Vec::new();
+        ciborium::ser::into_writer(
+            &(&self.doc_ids_compressor, &self.values_compressor),
+            &mut compressor_buf,
+        )
+        .expect("Failed to serialize compressors");
+        writer.write_u32::<LittleEndian>(compressor_buf.len() as u32)?;
+        writer.write_all(&compressor_buf)?;
+
+        for term in &self.terms {
+            // Term header
+            write_vint(writer, term.pages.len() as u64)?;
+            writer.write_f32::<LittleEndian>(term.max_value)?;
+            write_vint(writer, term.max_doc_id)?;
+            write_vint(writer, term.length as u64)?;
+
+            let min_block_val = term
+                .pages
+                .iter()
+                .map(|b| b.max_value)
+                .fold(f32::INFINITY, f32::min);
+            writer.write_f32::<LittleEndian>(min_block_val)?;
+            let range = term.max_value - min_block_val;
+
+            let mut prev_doc_id: u64 = 0;
+            for block in &term.pages {
+                let docid_len =
+                    (block.docid_position_range.1 - block.docid_position_range.0) as u64;
+                let impact_len =
+                    (block.impact_position_range.1 - block.impact_position_range.0) as u64;
+                write_vint(writer, docid_len)?;
+                write_vint(writer, impact_len)?;
+                write_vint(writer, block.length as u64)?;
+                let q = if range > 0.0 {
+                    (((block.max_value - min_block_val) / range * 255.0).ceil() as u32).min(255)
+                        as u8
+                } else {
+                    255u8
+                };
+                writer.write_all(&[q])?;
+                write_vint(writer, block.min_doc_id - prev_doc_id)?;
+                write_vint(writer, block.max_doc_id - block.min_doc_id)?;
+                prev_doc_id = block.max_doc_id;
+                writer.write_u16::<LittleEndian>(block.min_doc_length)?;
             }
         }
         Ok(())
@@ -358,15 +480,16 @@ impl CompressedIndexInformation {
     /// Read metadata from compact binary format.
     /// Reconstructs absolute byte positions via prefix sum.
     ///
-    /// `pub` for the same reason as [`Self::write_binary`]: integration
-    /// tests need to inspect the structured result (e.g. to verify
-    /// `min_doc_length` after a migration). This is the *live* reader --
-    /// it rejects anything other than [`COMPRESSED_INDEX_VERSION`] via
-    /// [`crate::manifest::check_format_version`], with an actionable error
-    /// pointing at `Index.update`/`update_index` rather than silently
-    /// misreading an older layout (see the `manifest` module docs). Only
-    /// [`migrate_add_min_dl`]'s private `read_binary_v3` understands the
-    /// old (v3) layout, and only for the sake of migrating it away.
+    /// This is the *live* reader -- it rejects anything other than
+    /// [`COMPRESSED_INDEX_VERSION`] via [`crate::manifest::check_format_version`],
+    /// with an actionable error pointing at `Index.update`/`update_index`
+    /// rather than silently misreading an older layout (see the `manifest`
+    /// module docs). Older layouts are understood only by
+    /// [`read_binary_impl`] (this method's shared body, parameterized by
+    /// version) via the migration helpers that call it directly
+    /// ([`migrate_add_min_dl`]'s `read_binary_v3` for v3,
+    /// [`migrate_compressed_v4_to_v5`] for v4), and only for the sake of
+    /// migrating them away.
     pub fn read_binary(reader: &mut dyn std::io::Read) -> std::io::Result<Self> {
         use byteorder::{LittleEndian, ReadBytesExt};
 
@@ -379,22 +502,46 @@ impl CompressedIndexInformation {
         }
         let version = reader.read_u32::<LittleEndian>()?;
         crate::manifest::check_format_version(version, COMPRESSED_INDEX_VERSION)?;
+        Self::read_binary_impl(reader, COMPRESSED_INDEX_VERSION)
+    }
+
+    /// Shared body of [`Self::read_binary`] and [`migrate_compressed_v4_to_v5`],
+    /// parameterized by the on-disk version (already consumed from the
+    /// header by the caller): `4` reads the pre-positions 2-tuple
+    /// compressor header and fills every block's position fields with the
+    /// `(0, 0)`/`0` "none" sentinel; `5` reads the current 3-tuple header
+    /// and the per-block position fields. Any other version is a
+    /// programming error (callers must have already checked), not a
+    /// reachable on-disk state.
+    fn read_binary_impl(reader: &mut dyn std::io::Read, version: u32) -> std::io::Result<Self> {
+        use byteorder::{LittleEndian, ReadBytesExt};
+
         let num_terms = reader.read_u32::<LittleEndian>()? as usize;
 
         // Compressor header
         let compressor_len = reader.read_u32::<LittleEndian>()? as usize;
         let mut compressor_buf = vec![0u8; compressor_len];
         reader.read_exact(&mut compressor_buf)?;
-        let (doc_ids_compressor, values_compressor): (
+        let (doc_ids_compressor, values_compressor, positions_compressor): (
             Box<dyn DocIdCompressor>,
             Box<dyn ImpactCompressor>,
-        ) = ciborium::de::from_reader(&compressor_buf[..])
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+            Option<Box<dyn positions::PositionsCompressor>>,
+        ) = if version >= 5 {
+            ciborium::de::from_reader(&compressor_buf[..])
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?
+        } else {
+            let (doc_ids, values): (Box<dyn DocIdCompressor>, Box<dyn ImpactCompressor>) =
+                ciborium::de::from_reader(&compressor_buf[..]).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+                })?;
+            (doc_ids, values, None)
+        };
 
         // Read terms and blocks (VInt + delta encoded)
         let mut terms = Vec::with_capacity(num_terms);
         let mut docid_pos: u64 = 0;
         let mut impact_pos: u64 = 0;
+        let mut positions_pos: u64 = 0;
 
         for _ in 0..num_terms {
             let num_blocks = read_vint(reader)? as usize;
@@ -419,6 +566,16 @@ impl CompressedIndexInformation {
                 prev_doc_id = block_max_doc_id;
                 let min_doc_length = reader.read_u16::<LittleEndian>()?;
 
+                let (positions_position_range, num_positions) = if version >= 5 {
+                    let positions_len = read_vint(reader)?;
+                    let num_positions = read_vint(reader)? as u32;
+                    let range = (positions_pos, positions_pos + positions_len);
+                    positions_pos += positions_len;
+                    (range, num_positions)
+                } else {
+                    ((0u64, 0u64), 0u32)
+                };
+
                 pages.push(TermBlockInformation {
                     docid_position_range: (docid_pos, docid_pos + docid_len),
                     impact_position_range: (impact_pos, impact_pos + impact_len),
@@ -427,6 +584,8 @@ impl CompressedIndexInformation {
                     min_doc_id,
                     max_doc_id: block_max_doc_id,
                     min_doc_length,
+                    positions_position_range,
+                    num_positions,
                 });
 
                 docid_pos += docid_len;
@@ -454,6 +613,7 @@ impl CompressedIndexInformation {
             terms,
             doc_ids_compressor,
             values_compressor,
+            positions_compressor,
         })
     }
 }
@@ -537,6 +697,8 @@ fn read_binary_v3(reader: &mut dyn std::io::Read) -> std::io::Result<CompressedI
                 min_doc_id,
                 max_doc_id: block_max_doc_id,
                 min_doc_length: 0,
+                positions_position_range: (0, 0),
+                num_positions: 0,
             });
 
             docid_pos += docid_len;
@@ -556,6 +718,8 @@ fn read_binary_v3(reader: &mut dyn std::io::Read) -> std::io::Result<CompressedI
         terms,
         doc_ids_compressor,
         values_compressor,
+        // v3 predates positions entirely.
+        positions_compressor: None,
     })
 }
 
@@ -586,15 +750,18 @@ pub(crate) fn migrate_add_min_dl(path: &Path) -> std::io::Result<()> {
     // Peek the on-disk binary version before committing to the v3 layout:
     // a manifest-less directory can be genuinely legacy (v3 binary, no
     // min_doc_length -- the case this migration exists for) or can already
-    // carry the current (v4) binary layout with just a missing/stale
+    // carry a newer (v4 or v5) binary layout with just a missing/stale
     // manifest (e.g. rebuilt with this library but never re-stamped) --
-    // that needs no data rewrite at all.
+    // that needs no data rewrite at all. Compared against the literal `3`
+    // (not `COMPRESSED_INDEX_VERSION`, which has since moved past v4): this
+    // step only ever understands the v3 -> v4 transition, regardless of
+    // how many format versions exist beyond that.
     let version = {
         let mut reader = std::io::BufReader::new(File::open(&bin_path)?);
         let _magic = reader.read_u32::<LittleEndian>()?;
         reader.read_u32::<LittleEndian>()?
     };
-    if version == COMPRESSED_INDEX_VERSION {
+    if version != 3 {
         return Ok(());
     }
 
@@ -651,6 +818,64 @@ pub(crate) fn migrate_add_min_dl(path: &Path) -> std::io::Result<()> {
     // Write to a temp file, then rename over index.bin: a crash/interrupt
     // partway through never leaves a truncated or half-written metadata
     // file in place.
+    //
+    // `info.write_binary` now writes the *current* (v5) layout, not v4 --
+    // `info.positions_compressor` is `None` (v3 predates positions), so
+    // this just stamps a v5 header/block trailer with empty position
+    // fields. That's correct, not a mismatch with this step's own v1->v2
+    // manifest version: the manifest-level v2->v3 step (`migrate_v2_to_v3`
+    // in `manifest.rs`) will subsequently find the binary already at v5
+    // and no-op its own data rewrite, then stamp manifest v3. Each step in
+    // the chain only cares that the binary is at *least* as new as what it
+    // produces, not exactly equal.
+    let tmp_path = path.join("index.bin.migrating");
+    {
+        let mut writer = std::io::BufWriter::new(File::create(&tmp_path)?);
+        info.write_binary(&mut writer)?;
+    }
+    std::fs::rename(&tmp_path, &bin_path)?;
+
+    Ok(())
+}
+
+/// v4 -> v5 migration step (registered as `(2, migrate_v2_to_v3)` in
+/// `manifest::update_index`'s step table, see `manifest.rs`): rewrites a
+/// compressed index directory's `index.bin` from the pre-positions v4
+/// layout (2-tuple compressor header, no per-block position fields) to v5.
+/// A v4 index has no positions by construction, so this is a metadata-only
+/// rewrite -- `positions_compressor` becomes `None` and every block's
+/// `positions_position_range`/`num_positions` become `(0, 0)`/`0`; the
+/// posting files themselves (`docids.dat`/`impacts.dat`) are never
+/// touched, and no `positions.dat` is created.
+///
+/// No-op if `index.bin` doesn't exist (e.g. a `Split` wrapper's own
+/// directory) or is already at the current version (idempotent, and covers
+/// the case where the binary was rebuilt with this library but its
+/// manifest is merely stale).
+pub(crate) fn migrate_compressed_v4_to_v5(path: &Path) -> std::io::Result<()> {
+    use byteorder::{LittleEndian, ReadBytesExt};
+
+    let bin_path = path.join("index.bin");
+    if !bin_path.exists() {
+        return Ok(());
+    }
+
+    let version = {
+        let mut reader = std::io::BufReader::new(File::open(&bin_path)?);
+        let _magic = reader.read_u32::<LittleEndian>()?;
+        reader.read_u32::<LittleEndian>()?
+    };
+    if version == COMPRESSED_INDEX_VERSION {
+        return Ok(());
+    }
+
+    let info = {
+        let mut reader = std::io::BufReader::new(File::open(&bin_path)?);
+        let _magic = reader.read_u32::<LittleEndian>()?;
+        let _version = reader.read_u32::<LittleEndian>()?;
+        CompressedIndexInformation::read_binary_impl(&mut reader, version)?
+    };
+
     let tmp_path = path.join("index.bin.migrating");
     {
         let mut writer = std::io::BufWriter::new(File::create(&tmp_path)?);
@@ -681,6 +906,8 @@ mod tests {
                             min_doc_id: 0,
                             max_doc_id: 500,
                             min_doc_length: 5,
+                            positions_position_range: (0, 0),
+                            num_positions: 0,
                         },
                         TermBlockInformation {
                             docid_position_range: (100, 180),
@@ -690,6 +917,8 @@ mod tests {
                             min_doc_id: 501,
                             max_doc_id: 999,
                             min_doc_length: 12,
+                            positions_position_range: (0, 0),
+                            num_positions: 0,
                         },
                     ],
                     max_value: 3.14,
@@ -706,6 +935,8 @@ mod tests {
                         min_doc_id: 10,
                         max_doc_id: 800,
                         min_doc_length: 3,
+                        positions_position_range: (0, 0),
+                        num_positions: 0,
                     }],
                     max_value: 1.0,
                     max_doc_id: 800,
@@ -715,6 +946,7 @@ mod tests {
             ],
             doc_ids_compressor: Box::new(EliasFanoCompressor {}),
             values_compressor: Box::new(Identity {}),
+            positions_compressor: None,
         };
 
         // Write
@@ -765,6 +997,12 @@ pub struct CompressedIndex {
     /// View on impact values
     impact_buffer: Box<dyn Buffer>,
 
+    /// View on position deltas, `Some` iff `positions.dat` exists (i.e. the
+    /// index was built from a positional source). Never touched unless a
+    /// caller actually asks for positions -- see
+    /// [`CompressedIndexIterator::ensure_positions_loaded`].
+    positions_buffer: Option<Box<dyn Buffer>>,
+
     /// Source directory path
     source_dir: Option<std::path::PathBuf>,
 
@@ -810,6 +1048,21 @@ pub struct CompressedIndexIterator<'a> {
     /// Whether the current block has been decoded
     block_loaded: bool,
 
+    /// Flattened, decoded (absolute, not delta) positions for every
+    /// posting of the current block, filled lazily by
+    /// [`Self::ensure_positions_loaded`] -- untouched for a query that
+    /// never asks for positions.
+    positions_flat: Vec<u32>,
+
+    /// Prefix sums of `impacts` (tf per posting) for the current block:
+    /// posting `i`'s run is `positions_flat[run_offsets[i]..run_offsets[i + 1]]`.
+    /// Length is block length + 1.
+    run_offsets: Vec<u32>,
+
+    /// Whether `positions_flat`/`run_offsets` are valid for the current
+    /// block (reset in [`Self::next_block`]).
+    positions_loaded: bool,
+
     // Term index (for reference)
     term_index: TermIndex,
 
@@ -835,6 +1088,9 @@ impl<'a> CompressedIndexIterator<'a> {
             impacts: Vec::with_capacity(128),
             index: 0,
             block_loaded: false,
+            positions_flat: Vec::new(),
+            run_offsets: Vec::new(),
+            positions_loaded: false,
             term_index: term_index,
         }
     }
@@ -983,6 +1239,77 @@ impl<'a> CompressedIndexIterator<'a> {
         self.impacts.clear();
         self.index = 0;
         self.block_loaded = false;
+        self.positions_loaded = false;
+    }
+
+    /// Decodes the current block's position runs into
+    /// `positions_flat`/`run_offsets`, if not already done. Never called
+    /// from the hot WAND/MaxScore path -- only from
+    /// [`CompressedBlockTermImpactIterator::positions`], itself only
+    /// reachable via [`BlockTermImpactIterator::positions`], which nothing
+    /// in the search algorithms calls.
+    ///
+    /// Requires the block already decoded (`ensure_block_loaded`): tfs come
+    /// from `self.impacts`, already-scored or not (this iterator only ever
+    /// holds raw values -- scoring happens in a wrapping iterator, see
+    /// `scoring::ScoringBlockIterator`).
+    fn ensure_positions_loaded(&mut self) {
+        if self.positions_loaded {
+            return;
+        }
+        let info = self.info.expect("block should be loaded");
+
+        let positions_buffer = self
+            .sparse_index
+            .positions_buffer
+            .as_ref()
+            .expect("ensure_positions_loaded called on an index with no positions.dat");
+        let positions_compressor = self
+            .sparse_index
+            .information
+            .positions_compressor
+            .as_ref()
+            .expect("ensure_positions_loaded called on an index with no positions compressor");
+
+        let data = positions_buffer
+            .as_bytes()
+            .expect("positions buffer should expose contiguous bytes");
+        let slice = &data
+            [info.positions_position_range.0 as usize..info.positions_position_range.1 as usize];
+        positions_compressor.decode_into(
+            slice,
+            info.num_positions as usize,
+            &mut self.positions_flat,
+        );
+
+        // Run boundaries from this block's tfs (the stored value IS the tf
+        // for a positional/BoW index -- asserted at build time in
+        // `CompressionTransform::process`).
+        self.run_offsets.clear();
+        self.run_offsets.reserve(self.impacts.len() + 1);
+        self.run_offsets.push(0);
+        let mut cumulative = 0u32;
+        for &tf in &self.impacts {
+            cumulative += tf as u32;
+            self.run_offsets.push(cumulative);
+        }
+        debug_assert_eq!(
+            cumulative, info.num_positions,
+            "sum of block tfs does not match num_positions"
+        );
+
+        // Deltas -> absolute positions, per run (first stays, rest add the
+        // previous absolute position within the same run).
+        for w in self.run_offsets.windows(2) {
+            let (start, end) = (w[0] as usize, w[1] as usize);
+            let mut prev = 0u32;
+            for p in &mut self.positions_flat[start..end] {
+                *p += prev;
+                prev = *p;
+            }
+        }
+
+        self.positions_loaded = true;
     }
 }
 
@@ -1054,6 +1381,14 @@ struct CompressedBlockTermImpactIterator<'a> {
 
     /// Minimum document length across the whole term (P1a), 0 = unknown.
     min_dl: u32,
+
+    /// Copy of `current()`'s position run, filled lazily by
+    /// [`BlockTermImpactIterator::positions`]. A copy (not a borrow of the
+    /// iterator's decoded block) because the block buffers live behind the
+    /// `RefCell`'s interior, and `positions(&mut self)` still has to
+    /// return a plain `&[u32]` -- the run is tiny (a document's tf), so
+    /// this is cheap.
+    current_positions: Vec<u32>,
 }
 
 impl<'a> CompressedBlockTermImpactIterator<'a> {
@@ -1073,6 +1408,7 @@ impl<'a> CompressedBlockTermImpactIterator<'a> {
             max_doc_id: info.max_doc_id,
             length: info.length,
             min_dl: info.min_dl,
+            current_positions: Vec::new(),
         }
     }
 }
@@ -1194,6 +1530,45 @@ impl<'a> BlockTermImpactIterator for CompressedBlockTermImpactIterator<'a> {
     #[inline]
     fn length(&self) -> usize {
         self.length
+    }
+
+    /// Positions of `current()`'s document, `None` if the index has no
+    /// positions. Not on the hot path: never called by WAND/MaxScore, and
+    /// touches `positions.dat` (mmap slice + codec decode) only when
+    /// actually invoked.
+    fn positions(&mut self) -> Option<&[u32]> {
+        // Resolve the current posting first (mirrors `current()`'s own
+        // contract): afterwards `iterator.index` is `pos + 1`, so the
+        // block-local index of the resolved posting is `iterator.index - 1`.
+        self.current();
+
+        let has_positions = {
+            let iterator = self.iterator.borrow();
+            iterator.sparse_index.positions_buffer.is_some()
+                && iterator
+                    .sparse_index
+                    .information
+                    .positions_compressor
+                    .is_some()
+        };
+        if !has_positions {
+            return None;
+        }
+
+        let mut iterator = self.iterator.borrow_mut();
+        iterator.ensure_block_loaded();
+        iterator.ensure_positions_loaded();
+
+        let posting_ix = iterator.index - 1;
+        let start = iterator.run_offsets[posting_ix] as usize;
+        let end = iterator.run_offsets[posting_ix + 1] as usize;
+
+        // Copy the (tiny) run out: `iterator` is borrowed from the
+        // `RefCell`, so we can't return a reference into it directly.
+        self.current_positions.clear();
+        self.current_positions
+            .extend_from_slice(&iterator.positions_flat[start..end]);
+        Some(&self.current_positions)
     }
 }
 
@@ -1465,6 +1840,27 @@ impl SparseIndex for CompressedIndex {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    fn has_positions(&self) -> bool {
+        // Both must be present: a compressor with no buffer (shouldn't
+        // happen -- `process` only records one when it also wrote the
+        // file) or a buffer with no compressor (a stale `positions.dat`
+        // left behind by something else) are each treated as "no
+        // positions" rather than panicking later on the mismatched half.
+        self.positions_buffer.is_some() && self.information.positions_compressor.is_some()
+    }
+
+    fn positions_iterator<'a>(
+        &'a self,
+        term_index: TermIndex,
+    ) -> Option<Box<dyn Iterator<Item = Vec<u32>> + 'a>> {
+        if !SparseIndex::has_positions(self) {
+            return None;
+        }
+        Some(Box::new(crate::index::BlockPositionsAdapter(
+            self.block_iterator(term_index),
+        )))
+    }
 }
 
 impl SparseIndexInformation for CompressedIndex {
@@ -1490,6 +1886,16 @@ pub struct CompressionTransform {
 
     /// Factory for creating the impact value compressor.
     pub impacts_compressor_factory: Box<dyn ImpactCompressorFactory>,
+
+    /// Codec for the position stream, used only when the source view has
+    /// positions ([`SparseIndexView::has_positions`]). `None` means: use
+    /// [`positions::BitPackingPositions`] (the default) when the source
+    /// has positions, and write no position stream at all otherwise --
+    /// unlike the doc-id/impact compressors there is no factory here (no
+    /// build-time statistic needs inspecting to choose a position codec),
+    /// so this is a plain optional codec rather than a
+    /// `PositionsCompressorFactory`.
+    pub positions_codec: Option<Box<dyn positions::PositionsCompressor>>,
 }
 
 /// Result of compressing one term's posting list in parallel.
@@ -1497,10 +1903,37 @@ struct CompressedTermResult {
     info: TermBlocksInformation,
     docid_bytes: Vec<u8>,
     impact_bytes: Vec<u8>,
+    /// Empty when the index has no positions.
+    positions_bytes: Vec<u8>,
 }
 
 /// Chunk size for parallel compression (number of terms per batch).
 const COMPRESSION_CHUNK_SIZE: usize = 10_000;
+
+/// Resolves the codec to use for a build with positions: the configured
+/// [`CompressionTransform::positions_codec`], or [`positions::BitPackingPositions`]
+/// (the default) when unset.
+///
+/// `process` only ever has a `&dyn PositionsCompressor` borrow of a
+/// configured codec (through `&self`, which it cannot move out of); a
+/// `typetag`-serialized codec round-trips through CBOR by construction
+/// (that's how `index.bin` itself stores one), so serializing it and
+/// reading the bytes straight back produces an independent owned instance
+/// to store in [`CompressedIndexInformation`] without requiring
+/// [`positions::PositionsCompressor`] to be `Clone`.
+fn resolve_positions_compressor(
+    configured: Option<&dyn positions::PositionsCompressor>,
+) -> Box<dyn positions::PositionsCompressor> {
+    match configured {
+        None => Box::new(positions::BitPackingPositions),
+        Some(codec) => {
+            let mut buf = Vec::new();
+            ciborium::ser::into_writer(codec, &mut buf)
+                .expect("serialize positions codec for cloning");
+            ciborium::de::from_reader(&buf[..]).expect("deserialize cloned positions codec")
+        }
+    }
+}
 
 impl IndexTransform for CompressionTransform {
     /// Compress the impact values using chunked parallel processing.
@@ -1519,6 +1952,16 @@ impl IndexTransform for CompressionTransform {
         let doc_ids_compressor = self.doc_ids_compressor_factory.create(index);
         let values_compressor = self.impacts_compressor_factory.create(index);
         let max_block_size = self.max_block_size;
+
+        // Positions are opt-in per source index: a query that never calls
+        // `positions()` must never read a byte of `positions.dat`, so a
+        // non-positional index gets byte-identical output to before this
+        // feature existed -- no file created, no compressor recorded.
+        let has_positions = index.has_positions();
+        let positions_codec: Option<Box<dyn positions::PositionsCompressor>> =
+            has_positions.then(|| resolve_positions_compressor(self.positions_codec.as_deref()));
+        let positions_codec_ref: Option<&dyn positions::PositionsCompressor> =
+            positions_codec.as_deref();
 
         // P1a: per-block minimum document length, computed here (at build
         // time) when doc lengths are available. `None` (no docmeta) means
@@ -1554,9 +1997,23 @@ impl IndexTransform for CompressionTransform {
                 .expect("Could not create the document IDs file"),
         );
 
+        // Only created when the source has positions -- an index without
+        // positions never gets a `positions.dat` at all.
+        let mut positions_writer: Option<BufWriter<File>> = has_positions.then(|| {
+            BufWriter::new(
+                File::options()
+                    .write(true)
+                    .truncate(true)
+                    .create(true)
+                    .open(path.join("positions.dat"))
+                    .expect("Could not create the positions file"),
+            )
+        });
+
         let mut terms_info = Vec::with_capacity(index.len());
         let mut docid_offset: u64 = 0;
         let mut impact_offset: u64 = 0;
+        let mut positions_offset: u64 = 0;
 
         // Process terms in chunks to limit memory usage
         for chunk_start in (0..index.len()).step_by(COMPRESSION_CHUNK_SIZE) {
@@ -1568,8 +2025,18 @@ impl IndexTransform for CompressionTransform {
                 .map(|term_index| {
                     let mut docid_buf: Vec<u8> = Vec::new();
                     let mut impact_buf: Vec<u8> = Vec::new();
+                    let mut positions_buf: Vec<u8> = Vec::new();
 
                     let mut it = index.iterator(term_index);
+                    // Aligned 1:1 with `it` (same length/order, see
+                    // `SparseIndexView::positions_iterator`'s contract):
+                    // every posting pulled from `it` below also pulls one
+                    // run from `pos_it`.
+                    let mut pos_it = has_positions.then(|| {
+                        index.positions_iterator(term_index).expect(
+                            "has_positions() true but positions_iterator returned None for a term",
+                        )
+                    });
                     let mut flag = true;
                     let mut term_information = TermBlocksInformation {
                         pages: Vec::new(),
@@ -1581,10 +2048,18 @@ impl IndexTransform for CompressionTransform {
                     let mut max_doc_id = 0;
                     let mut docid_position: u64 = 0;
                     let mut impact_position: u64 = 0;
+                    let mut positions_position: u64 = 0;
 
                     while flag {
                         let mut impacts = Vec::new();
                         let mut docids = Vec::<DocId>::new();
+                        // Flattened position deltas for this block (Lucene
+                        // `.pos` model): per posting, first position
+                        // absolute then gaps, runs concatenated in posting
+                        // order -- boundaries are implied by each
+                        // posting's tf (`impacts[i] as usize`), not stored.
+                        let mut block_deltas: Vec<u32> = Vec::new();
+                        let mut block_num_positions: u32 = 0;
                         flag = false;
                         let mut min_doc_id: DocId = DocId::MAX;
 
@@ -1601,6 +2076,26 @@ impl IndexTransform for CompressionTransform {
                             max_doc_id = ti.docid;
                             docids.push(ti.docid);
                             impacts.push(ti.value);
+
+                            if let Some(pos_it) = pos_it.as_mut() {
+                                let run = pos_it.next().expect(
+                                    "positions_iterator ended before the impact iterator for the same term",
+                                );
+                                assert_eq!(
+                                    ti.value as usize,
+                                    run.len(),
+                                    "positional index: stored value must equal tf \
+                                     (positions.len()) for docid {}",
+                                    ti.docid
+                                );
+                                let mut prev = 0u32;
+                                for (i, &p) in run.iter().enumerate() {
+                                    block_deltas.push(if i == 0 { p } else { p - prev });
+                                    prev = p;
+                                }
+                                block_num_positions += run.len() as u32;
+                            }
+
                             if docids.len() == max_block_size {
                                 flag = true;
                                 break;
@@ -1638,6 +2133,8 @@ impl IndexTransform for CompressionTransform {
                             min_doc_id,
                             max_doc_id,
                             min_doc_length,
+                            positions_position_range: (positions_position, 0),
+                            num_positions: block_num_positions,
                         };
 
                         assert!(max_doc_id >= min_doc_id);
@@ -1650,6 +2147,12 @@ impl IndexTransform for CompressionTransform {
 
                         impact_position = impact_buf.len() as u64;
                         block_info.impact_position_range.1 = impact_position;
+
+                        if let Some(codec) = positions_codec_ref {
+                            codec.write(&mut positions_buf, &block_deltas);
+                            positions_position = positions_buf.len() as u64;
+                            block_info.positions_position_range.1 = positions_position;
+                        }
 
                         term_information.max_value =
                             term_information.max_value.max(block_info.max_value);
@@ -1672,6 +2175,7 @@ impl IndexTransform for CompressionTransform {
                         info: term_information,
                         docid_bytes: docid_buf,
                         impact_bytes: impact_buf,
+                        positions_bytes: positions_buf,
                     }
                 })
                 .collect();
@@ -1683,24 +2187,34 @@ impl IndexTransform for CompressionTransform {
                     page.docid_position_range.1 += docid_offset;
                     page.impact_position_range.0 += impact_offset;
                     page.impact_position_range.1 += impact_offset;
+                    page.positions_position_range.0 += positions_offset;
+                    page.positions_position_range.1 += positions_offset;
                 }
 
                 docid_writer.write_all(&result.docid_bytes)?;
                 impact_writer.write_all(&result.impact_bytes)?;
+                if let Some(w) = positions_writer.as_mut() {
+                    w.write_all(&result.positions_bytes)?;
+                }
 
                 docid_offset += result.docid_bytes.len() as u64;
                 impact_offset += result.impact_bytes.len() as u64;
+                positions_offset += result.positions_bytes.len() as u64;
 
                 terms_info.push(result.info);
             }
         }
 
         pb.finish();
+        if let Some(w) = positions_writer.as_mut() {
+            w.flush()?;
+        }
 
         let information = CompressedIndexInformation {
             terms: terms_info,
             doc_ids_compressor,
             values_compressor,
+            positions_compressor: positions_codec,
         };
 
         // Write compact binary metadata
@@ -1722,24 +2236,38 @@ impl IndexTransform for CompressionTransform {
                 terms: Vec::new(),
                 doc_ids_compressor: information.doc_ids_compressor,
                 values_compressor: information.values_compressor,
+                positions_compressor: information.positions_compressor,
             },
         };
 
         // Record the on-disk format version + build parameters so a future
         // format change can be detected on load (see `manifest` module).
-        let codecs = format!(
+        let mut codecs = format!(
             "{}+{}",
             stub.information.doc_ids_compressor.codec_name(),
             stub.information.values_compressor.codec_name(),
         );
+        if let Some(pc) = &stub.information.positions_compressor {
+            codecs.push('+');
+            codecs.push_str(pc.codec_name());
+        }
         let builder_info = crate::manifest::BuilderInfo::new()
             .with_block_size(max_block_size)
             .with_codecs(codecs);
-        crate::manifest::write_manifest(
-            path,
-            crate::manifest::IndexKind::Compressed,
-            builder_info,
-        )?;
+        if has_positions {
+            crate::manifest::write_manifest_with_features(
+                path,
+                crate::manifest::IndexKind::Compressed,
+                builder_info,
+                vec!["positions".to_string()],
+            )?;
+        } else {
+            crate::manifest::write_manifest(
+                path,
+                crate::manifest::IndexKind::Compressed,
+                builder_info,
+            )?;
+        }
 
         save_index(Box::new(stub), path)
     }
@@ -1780,6 +2308,21 @@ impl IndexLoader for CompressedIndexLoader {
 
         let reorder_map = crate::transforms::reorder::ReorderMap::load(path).ok();
 
+        // `positions.dat` is only opened (mmap'd or loaded into memory) if
+        // it exists; a non-positional index never even has this file, and
+        // this is the ONLY place its bytes are touched during loading --
+        // it's not decoded until a caller actually asks for positions.
+        let positions_path = path.join("positions.dat");
+        let positions_buffer: Option<Box<dyn Buffer>> = if positions_path.exists() {
+            Some(if in_memory {
+                Box::new(MemoryBuffer::new(&positions_path))
+            } else {
+                Box::new(MmapBuffer::new(&positions_path))
+            })
+        } else {
+            None
+        };
+
         Box::new(CompressedIndex {
             information,
             docid_buffer: if in_memory {
@@ -1792,6 +2335,7 @@ impl IndexLoader for CompressedIndexLoader {
             } else {
                 Box::new(MmapBuffer::new(&impact_path))
             },
+            positions_buffer,
             source_dir: Some(path.to_path_buf()),
             doc_meta,
             analyzer_config,

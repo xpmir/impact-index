@@ -40,6 +40,12 @@ pub struct TermIndexPageInformation {
     pub max_doc_id: DocId,
     // /// Minimum document ID for this page
     // pub min_doc_id: DocId
+    /// Start offset of this page's position runs in `positions.dat`, `0`
+    /// when unused. `#[serde(default)]` so checkpoints written before
+    /// positions existed still deserialize (ciborium serializes structs
+    /// as maps, so a missing field just falls back to the default).
+    #[serde(default)]
+    pub positions_position: u64,
 }
 
 impl TermIndexPageInformation {
@@ -51,6 +57,7 @@ impl TermIndexPageInformation {
             max_value: 0.,
             max_doc_id: 0,
             // min_doc_id: 0
+            positions_position: 0,
         }
     }
 }
@@ -96,17 +103,24 @@ impl IndexInformation {
     /// Write in compact binary format.
     ///
     /// Per-term: 20 bytes (num_pages:u32, max_value:f32, max_doc_id:u64, length:u32)
-    /// Per-page: 20 bytes (docid_position:u64, length:u32, max_value:f32, max_doc_id:u64)
+    /// Per-page: 20 bytes (docid_position:u64, length:u32, max_value:f32, max_doc_id:u64),
+    /// plus 8 bytes (positions_position:u64) when `has_positions` (version 2).
     /// (value_position is same as docid_position for forward index, omitted)
     pub fn write_binary(
         &self,
         value_type: crate::base::ValueType,
+        has_positions: bool,
         writer: &mut dyn std::io::Write,
     ) -> std::io::Result<()> {
         use byteorder::{LittleEndian, WriteBytesExt};
 
+        let version = if has_positions {
+            2
+        } else {
+            FORWARD_INDEX_VERSION
+        };
         writer.write_u32::<LittleEndian>(FORWARD_INDEX_MAGIC)?;
-        writer.write_u32::<LittleEndian>(FORWARD_INDEX_VERSION)?;
+        writer.write_u32::<LittleEndian>(version)?;
         writer.write_u32::<LittleEndian>(self.terms.len() as u32)?;
         writer.write_u32::<LittleEndian>(value_type as u32)?;
 
@@ -121,12 +135,16 @@ impl IndexInformation {
                 writer.write_u32::<LittleEndian>(page.length as u32)?;
                 writer.write_f32::<LittleEndian>(page.max_value)?;
                 writer.write_u64::<LittleEndian>(page.max_doc_id)?;
+                if has_positions {
+                    writer.write_u64::<LittleEndian>(page.positions_position)?;
+                }
             }
         }
         Ok(())
     }
 
-    /// Read from compact binary format.
+    /// Read from compact binary format. Accepts version 1 (no positions --
+    /// `positions_position` filled with `0`) and version 2 (positional).
     pub fn read_binary(
         reader: &mut dyn std::io::Read,
     ) -> std::io::Result<(crate::base::ValueType, Self)> {
@@ -140,12 +158,13 @@ impl IndexInformation {
             ));
         }
         let version = reader.read_u32::<LittleEndian>()?;
-        if version != FORWARD_INDEX_VERSION {
+        if version != 1 && version != 2 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Unsupported forward index version: {}", version),
             ));
         }
+        let has_positions = version == 2;
         let num_terms = reader.read_u32::<LittleEndian>()? as usize;
         let value_type_u32 = reader.read_u32::<LittleEndian>()?;
         let value_type = match value_type_u32 {
@@ -176,6 +195,11 @@ impl IndexInformation {
                 let page_length = reader.read_u32::<LittleEndian>()? as usize;
                 let page_max_value = reader.read_f32::<LittleEndian>()?;
                 let page_max_doc_id = reader.read_u64::<LittleEndian>()?;
+                let positions_position = if has_positions {
+                    reader.read_u64::<LittleEndian>()?
+                } else {
+                    0
+                };
 
                 pages.push(TermIndexPageInformation {
                     docid_position,
@@ -183,6 +207,7 @@ impl IndexInformation {
                     length: page_length,
                     max_value: page_max_value,
                     max_doc_id: page_max_doc_id,
+                    positions_position,
                 });
             }
 
@@ -221,6 +246,25 @@ pub trait SparseIndexView: Send + Sync + SparseIndexInformation {
     /// minimum. `None` by default -- the blanket [`SparseIndex`] impl below
     /// forwards to [`SparseIndex::doc_meta`].
     fn doc_meta(&self) -> Option<&crate::docmeta::DocMetadata> {
+        None
+    }
+
+    /// Whether this index stores token positions (`positions.dat`
+    /// present). `false` by default -- the blanket [`SparseIndex`] impl
+    /// below forwards to [`SparseIndex::has_positions`].
+    fn has_positions(&self) -> bool {
+        false
+    }
+
+    /// Per-term iterator of each posting's positions, aligned with
+    /// [`Self::iterator`] (same length, same order -- the `i`-th yielded
+    /// `Vec<u32>` is the position list for the `i`-th posting returned by
+    /// `iterator(term_ix)`). `None` if the index stores no positions.
+    fn positions_iterator<'a>(
+        &'a self,
+        term_ix: TermIndex,
+    ) -> Option<Box<dyn Iterator<Item = Vec<u32>> + 'a>> {
+        let _ = term_ix;
         None
     }
 }
@@ -280,6 +324,15 @@ pub trait BlockTermImpactIterator: Send {
 
     /// Returns the total number of records
     fn length(&self) -> usize;
+
+    /// Positions of `current()`'s document, ascending. `None` if the
+    /// index stores no positions for this term (or at all). Note this
+    /// takes `&mut self` while `current()` takes `&self` -- fine for a
+    /// trait object; implementations that decode lazily need the mutable
+    /// access to cache the decoded run.
+    fn positions(&mut self) -> Option<&[u32]> {
+        None
+    }
 }
 
 impl<'a> Iterator for dyn BlockTermImpactIterator + 'a {
@@ -341,6 +394,22 @@ pub trait SparseIndex: Send + Sync + SparseIndexView + AsSparseIndexView {
 
     /// Analyzer config. None if not available.
     fn analyzer_config(&self) -> Option<&crate::vocab::analyzer::AnalyzerConfig> {
+        None
+    }
+
+    /// Whether this index stores token positions. `false` by default.
+    fn has_positions(&self) -> bool {
+        false
+    }
+
+    /// Per-term iterator of each posting's positions, aligned with
+    /// [`SparseIndex::block_iterator`]/[`SparseIndexView::iterator`] (same
+    /// length and order). `None` if the index stores no positions.
+    fn positions_iterator<'a>(
+        &'a self,
+        term_ix: TermIndex,
+    ) -> Option<Box<dyn Iterator<Item = Vec<u32>> + 'a>> {
+        let _ = term_ix;
         None
     }
 
@@ -607,6 +676,38 @@ where
 
     fn doc_meta(&self) -> Option<&crate::docmeta::DocMetadata> {
         SparseIndex::doc_meta(self)
+    }
+
+    fn has_positions(&self) -> bool {
+        SparseIndex::has_positions(self)
+    }
+
+    fn positions_iterator<'a>(
+        &'a self,
+        term_ix: TermIndex,
+    ) -> Option<Box<dyn Iterator<Item = Vec<u32>> + 'a>> {
+        SparseIndex::positions_iterator(self, term_ix)
+    }
+}
+
+/// Adapts a raw [`BlockTermImpactIterator`] into a positions-only
+/// iterator, aligned 1:1 with [`SparseIndexView::iterator`] (same order,
+/// same length). Index implementations that store positions use this for
+/// their `positions_iterator` override.
+pub(crate) struct BlockPositionsAdapter<'a>(pub Box<dyn BlockTermImpactIterator + 'a>);
+
+impl<'a> Iterator for BlockPositionsAdapter<'a> {
+    type Item = Vec<u32>;
+
+    fn next(&mut self) -> Option<Vec<u32>> {
+        self.0.next_min_doc_id(0)?;
+        self.0.current();
+        Some(
+            self.0
+                .positions()
+                .expect("has_positions() true but positions() returned None for a posting")
+                .to_vec(),
+        )
     }
 }
 

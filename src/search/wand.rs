@@ -398,6 +398,7 @@ mod tests {
             max_block_size: 128,
             doc_ids_compressor_factory: Box::new(BitPackingCompressor {}),
             impacts_compressor_factory: Box::new(GlobalQuantizerFactory { nbits: 16 }),
+            positions_codec: None,
         };
         let compressed_path = tmpdir.join("compressed");
         transform.process(&compressed_path, &raw_index).unwrap();

@@ -464,6 +464,7 @@ fn test_compressed_index_standalone() {
         max_block_size: 128,
         doc_ids_compressor_factory: Box::new(PForCompressor {}),
         impacts_compressor_factory: Box::new(GlobalQuantizerFactory { nbits: 8 }),
+        positions_codec: None,
     };
     transform.process(&compressed_path, &raw_index).unwrap();
 

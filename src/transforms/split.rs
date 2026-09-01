@@ -34,6 +34,12 @@ pub struct SplitIndexTransform {
     pub quantiles: Vec<f64>,
 }
 
+// Split indices drop positions by design (v1, positions-plan.md Phase 2
+// §2.4): `SplitIndexView` below doesn't override `SparseIndexView::has_positions`/
+// `positions_iterator`, so it inherits the trait's `false`/`None` defaults
+// regardless of whether the source has positions -- no explicit guard
+// needed, `has_positions()` on the resulting index is just always `false`.
+
 impl IndexTransform for SplitIndexTransform {
     fn process(
         &self,

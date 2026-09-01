@@ -60,6 +60,13 @@ pub struct BuilderOptions {
     /// will be flushed to disk before checkpointing to reduce checkpoint size.
     #[derivative(Default(value = "0.5"))]
     pub checkpoint_flush_ratio: f64,
+
+    /// Store token positions alongside postings (`positions.dat`), for
+    /// phrase/window queries later. Opt-in and all-or-nothing per index:
+    /// every posting must carry positions when enabled (see
+    /// [`Indexer::add_with_positions`]).
+    #[derivative(Default(value = "false"))]
+    pub positions: bool,
 }
 
 /// Holds a block of impacts together
@@ -69,12 +76,20 @@ pub struct BuilderOptions {
 struct PostingsInformation<V: PostingValue> {
     postings: Vec<GenericTermImpact<V>>,
     information: TermIndexPageInformation,
+    /// Parallel to `postings` (one entry per posting) when positions are
+    /// enabled, empty otherwise. `#[serde(default)]` so a non-positional
+    /// checkpoint (which never wrote this field) still deserializes --
+    /// ciborium serializes structs as maps, so a missing field falls back
+    /// to `Vec::default()`.
+    #[serde(default)]
+    pub(crate) positions: Vec<Vec<u32>>,
 }
 impl<V: PostingValue> PostingsInformation<V> {
     fn new() -> Self {
         Self {
             postings: Vec::new(),
             information: TermIndexPageInformation::new(),
+            positions: Vec::new(),
         }
     }
 
@@ -92,6 +107,10 @@ struct TermsImpacts<V: PostingValue> {
     postings_file: std::io::BufWriter<std::fs::File>,
     /// Track file position manually to avoid flushing BufWriter on stream_position()
     postings_file_position: u64,
+    /// `positions.dat` writer, `Some` iff `options.positions`.
+    positions_file: Option<std::io::BufWriter<std::fs::File>>,
+    /// Tracked position in `positions.dat` (see `postings_file_position`).
+    positions_file_position: u64,
     information: IndexInformation,
     postings_information: Vec<PostingsInformation<V>>,
 }
@@ -112,6 +131,27 @@ impl<V: PostingValue> TermsImpacts<V> {
             file_options.truncate(false);
         }
 
+        // `positions.dat` follows the exact same truncate-vs-resume rule
+        // as `postings.dat` -- both streams advance together (checkpoint
+        // stores an offset into each, see the 4-tuple below).
+        let positions_file = if options.positions {
+            let mut positions_file_options = File::options();
+            positions_file_options.read(true).write(true).create(true);
+            if options.checkpoint_frequency == 0 {
+                positions_file_options.truncate(true);
+            } else {
+                positions_file_options.truncate(false);
+            }
+            Some(std::io::BufWriter::with_capacity(
+                1 << 20, // 1 MB buffer
+                positions_file_options
+                    .open(folder.join("positions.dat"))
+                    .expect("Error while creating positions file."),
+            ))
+        } else {
+            None
+        };
+
         let mut _self = TermsImpacts {
             checkpoint_doc_id: None,
             options: options.clone(),
@@ -123,6 +163,8 @@ impl<V: PostingValue> TermsImpacts<V> {
                     .expect("Error while creating postings file."),
             ),
             postings_file_position: 0,
+            positions_file,
+            positions_file_position: 0,
             postings_information: Vec::new(),
             information: IndexInformation::new(),
         };
@@ -148,9 +190,33 @@ impl<V: PostingValue> TermsImpacts<V> {
                         panic!("Cannot read checkpoint: incompatible format. Delete checkpoint.cbor and re-index.");
                     });
                 _self.information = info;
-                (_self.postings_information, pos, _self.checkpoint_doc_id) =
-                    ciborium::de::from_reader(decoder)
-                        .expect("error while reading checkpoint postings");
+
+                // Positional checkpoints carry a 4th tuple element (the
+                // `positions.dat` offset); non-positional checkpoints keep
+                // the original 3-tuple exactly, so old checkpoint files
+                // for non-positional indices are unaffected.
+                if options.positions {
+                    let positions_pos: u64;
+                    (
+                        _self.postings_information,
+                        pos,
+                        positions_pos,
+                        _self.checkpoint_doc_id,
+                    ) = ciborium::de::from_reader(decoder).expect(
+                        "Cannot read checkpoint: incompatible format. Delete checkpoint.cbor and re-index.",
+                    );
+                    _self
+                        .positions_file
+                        .as_mut()
+                        .expect("positions enabled")
+                        .seek(std::io::SeekFrom::Start(positions_pos))
+                        .expect("Error while moving in the positions file");
+                    _self.positions_file_position = positions_pos;
+                } else {
+                    (_self.postings_information, pos, _self.checkpoint_doc_id) =
+                        ciborium::de::from_reader(decoder)
+                            .expect("error while reading checkpoint postings");
+                }
 
                 // Note that we don't truncate the file since we will overwrite
                 // everything from there
@@ -187,6 +253,11 @@ impl<V: PostingValue> TermsImpacts<V> {
         self.postings_file
             .flush()
             .expect("error when flushing the posting file");
+        if let Some(positions_file) = self.positions_file.as_mut() {
+            positions_file
+                .flush()
+                .expect("error when flushing the positions file");
+        }
 
         let info_path = self.folder.join("checkpoint.cbor");
         let tmp_info_path = self.folder.join("checkpoint.cbor.tmp");
@@ -207,12 +278,28 @@ impl<V: PostingValue> TermsImpacts<V> {
         // Write IndexInformation as compact binary (the bulk of the data)
         let value_type = crate::base::value_type_of::<V>();
         self.information
-            .write_binary(value_type, &mut encoder)
+            .write_binary(value_type, self.options.positions, &mut encoder)
             .expect("Error writing binary metadata in checkpoint");
 
-        // Write remaining state as CBOR (in-memory postings + position + doc_id)
-        ciborium::ser::into_writer(&(&self.postings_information, pos, doc_id), &mut encoder)
+        // Write remaining state as CBOR (in-memory postings + position(s) +
+        // doc_id). Positional indices add the `positions.dat` offset as a
+        // 4th tuple element; non-positional checkpoints keep the original
+        // 3-tuple exactly.
+        if self.options.positions {
+            ciborium::ser::into_writer(
+                &(
+                    &self.postings_information,
+                    pos,
+                    self.positions_file_position,
+                    doc_id,
+                ),
+                &mut encoder,
+            )
             .expect("Error while serializing checkpoint");
+        } else {
+            ciborium::ser::into_writer(&(&self.postings_information, pos, doc_id), &mut encoder)
+                .expect("Error while serializing checkpoint");
+        }
 
         // Ensure encoder is flushed before rename
         drop(encoder);
@@ -229,10 +316,49 @@ impl<V: PostingValue> TermsImpacts<V> {
         docid: DocId,
         value: V,
     ) -> Result<(), std::io::Error> {
+        self.add_impact_with_positions(term_ix, docid, value, None)
+    }
+
+    /// Adds a term for a given document, optionally with its token
+    /// positions.
+    ///
+    /// When `options.positions` is set, `positions` must be `Some`,
+    /// non-empty, strictly increasing, and `value` (the tf) must equal
+    /// `positions.len()` -- in BoW/positional mode the stored value IS the
+    /// term frequency. When positions are disabled, a `Some` argument is a
+    /// programming error.
+    fn add_impact_with_positions(
+        &mut self,
+        term_ix: TermIndex,
+        docid: DocId,
+        value: V,
+        positions: Option<&[u32]>,
+    ) -> Result<(), std::io::Error> {
         assert!(
             value.is_positive(),
             "Impact values should be greater than 0"
         );
+
+        if self.options.positions {
+            let positions = positions
+                .expect("index built with positions=true: positions are required per posting");
+            assert!(!positions.is_empty(), "positions must be non-empty");
+            assert!(
+                positions.windows(2).all(|w| w[0] < w[1]),
+                "positions must be strictly increasing: {:?}",
+                positions
+            );
+            assert_eq!(
+                value.to_f32() as usize,
+                positions.len(),
+                "in positional mode the stored value must equal the term frequency (positions.len())"
+            );
+        } else {
+            assert!(
+                positions.is_none(),
+                "positions given but index was not built with positions=true"
+            );
+        }
 
         // Adds new vectors for missing words
         if term_ix >= self.postings_information.len() {
@@ -255,6 +381,9 @@ impl<V: PostingValue> TermsImpacts<V> {
             docid: docid,
             value: value,
         });
+        if let Some(positions) = positions {
+            p_info.positions.push(positions.to_vec());
+        }
 
         let value_f32 = value.to_f32();
         if p_info.information.max_value < value_f32 {
@@ -311,6 +440,11 @@ impl<V: PostingValue> TermsImpacts<V> {
             .docid;
         postings_info.information.value_position = position; // will be ignored anyways
         postings_info.information.length = len_postings;
+        postings_info.information.positions_position = if self.options.positions {
+            self.positions_file_position
+        } else {
+            0
+        };
         self.information.terms[term_ix]
             .pages
             .push(postings_info.information);
@@ -323,6 +457,27 @@ impl<V: PostingValue> TermsImpacts<V> {
         }
         self.postings_file_position += record_size * len_postings as u64;
 
+        // Each posting's positions as a vbyte run: first position
+        // absolute, then successive gaps (always >= 1, positions are
+        // strictly increasing). Runs are concatenated in posting order,
+        // starting at this page's `positions_position` -- no per-posting
+        // count byte, the reader gets tf from the value stream.
+        if self.options.positions {
+            let positions_file = self
+                .positions_file
+                .as_mut()
+                .expect("options.positions is set but positions_file is missing");
+            for positions in postings_info.positions.iter() {
+                let mut prev = 0u32;
+                for (i, &pos) in positions.iter().enumerate() {
+                    let delta = if i == 0 { pos } else { pos - prev };
+                    self.positions_file_position +=
+                        crate::utils::vbyte::write_vbyte_u32(positions_file, delta)? as u64;
+                    prev = pos;
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -331,6 +486,9 @@ impl<V: PostingValue> TermsImpacts<V> {
             self.flush(term_ix)?;
         }
         self.postings_file.flush()?;
+        if let Some(positions_file) = self.positions_file.as_mut() {
+            positions_file.flush()?;
+        }
         Ok(())
     }
 }
@@ -398,11 +556,63 @@ impl<V: PostingValue> Indexer<V> {
             "Index cannot be changed since it has been built"
         );
         assert!(
+            !self.impacts.options.positions,
+            "index built with positions=true: use add_with_positions"
+        );
+        assert!(
             terms.len() == values.len(),
             "Value and term lists should have the same length"
         );
         for ix in 0..terms.len() {
             self.impacts.add_impact(terms[ix], docid, values[ix])?;
+        }
+
+        // Flush terms that have not been flushed for a long time (recovery)
+        if (self.impacts.options.checkpoint_frequency > 0)
+            && (docid
+                >= self.impacts.options.checkpoint_frequency
+                    + self.impacts.checkpoint_doc_id.unwrap_or(0))
+        {
+            // Perform a checkpoint
+            self.impacts.checkpoint(docid);
+        }
+
+        Ok(())
+    }
+
+    /// Adds a document's sparse impact vector together with each term's
+    /// token positions. Requires the index to have been built with
+    /// `BuilderOptions { positions: true, .. }` -- see
+    /// [`TermsImpacts::add_impact_with_positions`] for the per-posting
+    /// constraints (positions non-empty, strictly increasing, `value ==
+    /// positions.len()`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `terms`, `values`, and `positions` have different
+    /// lengths, or if the index has already been built.
+    pub fn add_with_positions(
+        &mut self,
+        docid: DocId,
+        terms: &[TermIndex],
+        values: &[V],
+        positions: &[Vec<u32>],
+    ) -> Result<(), std::io::Error> {
+        assert!(
+            !self.built,
+            "Index cannot be changed since it has been built"
+        );
+        assert!(
+            terms.len() == values.len() && terms.len() == positions.len(),
+            "Term, value, and position lists should have the same length"
+        );
+        for ix in 0..terms.len() {
+            self.impacts.add_impact_with_positions(
+                terms[ix],
+                docid,
+                values[ix],
+                Some(&positions[ix]),
+            )?;
         }
 
         // Flush terms that have not been flushed for a long time (recovery)
@@ -430,6 +640,7 @@ impl<V: PostingValue> Indexer<V> {
 
             // Write compact binary metadata
             let value_type = crate::base::value_type_of::<V>();
+            let has_positions = self.impacts.options.positions;
             let bin_path = self.folder.join("information.bin");
             let bin_file = File::options()
                 .write(true)
@@ -439,7 +650,11 @@ impl<V: PostingValue> Indexer<V> {
                 .expect("Error creating information.bin");
             self.impacts
                 .information
-                .write_binary(value_type, &mut std::io::BufWriter::new(bin_file))
+                .write_binary(
+                    value_type,
+                    has_positions,
+                    &mut std::io::BufWriter::new(bin_file),
+                )
                 .expect("Error writing binary metadata");
 
             // Write stub CBOR (just value type, empty terms) for backward compat.
@@ -469,10 +684,16 @@ impl<V: PostingValue> Indexer<V> {
             // block size (postings buffered per term before a flush).
             let builder_info = crate::manifest::BuilderInfo::new()
                 .with_block_size(self.impacts.options.in_memory_threshold);
-            crate::manifest::write_manifest(
+            let features = if has_positions {
+                vec!["positions".to_string()]
+            } else {
+                Vec::new()
+            };
+            crate::manifest::write_manifest_with_features(
                 &self.folder,
                 crate::manifest::IndexKind::Forward,
                 builder_info,
+                features,
             )
             .expect("Error writing index manifest");
         } else {
@@ -505,6 +726,10 @@ pub struct SparseBuilderIndex<V: PostingValue = f32> {
     /// View on the postings
     buffer: Box<dyn Buffer>,
 
+    /// View on `positions.dat`, `Some` iff the directory has one (i.e. the
+    /// index was built with `BuilderOptions { positions: true, .. }`).
+    positions_buffer: Option<Box<dyn Buffer>>,
+
     /// Phantom for the value type
     _phantom: std::marker::PhantomData<V>,
 
@@ -530,6 +755,17 @@ impl<V: PostingValue> SparseBuilderIndex<V> {
             Some(analyzer_config)
         };
 
+        let positions_path = dir.join("positions.dat");
+        let positions_buffer: Option<Box<dyn Buffer>> = if positions_path.exists() {
+            Some(if in_memory {
+                Box::new(MemoryBuffer::new(&positions_path))
+            } else {
+                Box::new(MmapBuffer::new(&positions_path))
+            })
+        } else {
+            None
+        };
+
         Self {
             terms: terms,
             source_dir: Some(dir.to_path_buf()),
@@ -540,6 +776,7 @@ impl<V: PostingValue> SparseBuilderIndex<V> {
             } else {
                 Box::new(MmapBuffer::new(path))
             },
+            positions_buffer,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -868,6 +1105,18 @@ struct SparseBuilderBlockTermImpactIterator<'a, V: PostingValue> {
     max_value: ImpactValue,
     max_doc_id: DocId,
     length: usize,
+
+    /// Flattened, decoded positions for every posting of the currently
+    /// decoded page (see `decoded_positions_page`).
+    block_positions: Vec<u32>,
+    /// Prefix offsets into `block_positions`: posting `i`'s run is
+    /// `block_positions[block_run_offsets[i]..block_run_offsets[i + 1]]`.
+    /// One entry per posting, plus a final entry.
+    block_run_offsets: Vec<u32>,
+    /// The `positions_position` of the page currently decoded into
+    /// `block_positions`/`block_run_offsets`. `u64::MAX` when none decoded
+    /// yet, so it never collides with a real (0-based) offset.
+    decoded_positions_page: u64,
 }
 
 impl<'a, V: PostingValue> SparseBuilderBlockTermImpactIterator<'a, V> {
@@ -882,6 +1131,9 @@ impl<'a, V: PostingValue> SparseBuilderBlockTermImpactIterator<'a, V> {
             max_value: info.max_value,
             max_doc_id: info.max_doc_id,
             length: info.length,
+            block_positions: Vec::new(),
+            block_run_offsets: Vec::new(),
+            decoded_positions_page: u64::MAX,
         }
     }
 }
@@ -985,6 +1237,60 @@ impl<'a, V: PostingValue> BlockTermImpactIterator for SparseBuilderBlockTermImpa
     fn length(&self) -> usize {
         return self.length;
     }
+
+    /// Positions of `current()`'s document. `None` when this forward
+    /// index has no `positions.dat`.
+    ///
+    /// Decodes the WHOLE current page's positions once per page (cached in
+    /// `block_positions`/`block_run_offsets` until the page changes): each
+    /// posting's tf is read off the record stream (`record_at(i).value` --
+    /// an exact integer count in positional indices), then that many
+    /// vbytes (first-absolute, then gaps) are decoded sequentially from
+    /// `positions.dat` starting at the page's `positions_position`.
+    fn positions(&mut self) -> Option<&[u32]> {
+        // Resolve the current posting first: this loads/advances the
+        // block via the immutable `current()` path, so `iterator.info` and
+        // `iterator.index` below reflect the resolved posting.
+        BlockTermImpactIterator::current(self);
+
+        let iterator = self.iterator.get_mut();
+        let positions_buffer = iterator.sparse_index.positions_buffer.as_ref()?;
+        let info = iterator.info.expect("Iterator was over");
+
+        if self.decoded_positions_page != info.positions_position {
+            let data = positions_buffer
+                .as_bytes()
+                .expect("positions buffer should expose contiguous bytes");
+            let mut offset = info.positions_position as usize;
+
+            self.block_positions.clear();
+            self.block_run_offsets.clear();
+            self.block_run_offsets.push(0);
+
+            for i in 0..info.length {
+                let tf = iterator.record_at(i).value as usize;
+                let mut prev = 0u32;
+                for j in 0..tf {
+                    let delta = crate::utils::vbyte::read_vbyte_u32(data, &mut offset);
+                    let pos = if j == 0 { delta } else { prev + delta };
+                    self.block_positions.push(pos);
+                    prev = pos;
+                }
+                self.block_run_offsets
+                    .push(self.block_positions.len() as u32);
+            }
+
+            self.decoded_positions_page = info.positions_position;
+        }
+
+        // `current()` leaves the intra-block cursor `iterator.index` at
+        // `pos + 1`, so the resolved posting's index within the page is
+        // `iterator.index - 1`.
+        let posting_ix = iterator.index - 1;
+        let start = self.block_run_offsets[posting_ix] as usize;
+        let end = self.block_run_offsets[posting_ix + 1] as usize;
+        Some(&self.block_positions[start..end])
+    }
 }
 
 impl<V: PostingValue> SparseIndex for SparseBuilderIndex<V> {
@@ -1014,6 +1320,22 @@ impl<V: PostingValue> SparseIndex for SparseBuilderIndex<V> {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn has_positions(&self) -> bool {
+        self.positions_buffer.is_some()
+    }
+
+    fn positions_iterator<'a>(
+        &'a self,
+        term_ix: TermIndex,
+    ) -> Option<Box<dyn Iterator<Item = Vec<u32>> + 'a>> {
+        if self.positions_buffer.is_none() {
+            return None;
+        }
+        Some(Box::new(crate::index::BlockPositionsAdapter(
+            self.block_iterator(term_ix),
+        )))
     }
 }
 

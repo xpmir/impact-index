@@ -557,6 +557,19 @@ pub struct ReorderTransform {
 
 impl IndexTransform for ReorderTransform {
     fn process(&self, path: &Path, index: &dyn SparseIndexView) -> Result<(), std::io::Error> {
+        if index.has_positions() {
+            // v1: reordering a positional index is not implemented --
+            // `ReorderedIndexView` doesn't carry positions through, and
+            // silently dropping them (rather than erroring) would produce
+            // an index whose manifest lost the `positions` feature with no
+            // trace of why. See positions-plan.md, Phase 2 (2.4).
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "reordering a positional index is not yet supported; rebuild + reorder \
+                 without positions, or skip reordering",
+            ));
+        }
+
         if !path.is_dir() {
             std::fs::create_dir(path)?;
         }

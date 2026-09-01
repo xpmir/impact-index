@@ -15,11 +15,13 @@ use temp_dir::TempDir;
     max_block_size: 1024,
     doc_ids_compressor_factory: Box::new(EliasFanoCompressor {}),
     impacts_compressor_factory: Box::new(Quantizer::new(4, 0., 5.)),
+    positions_codec: None,
 })]
 #[case(0., CompressionTransform {
     max_block_size: 1024,
     doc_ids_compressor_factory: Box::new(EliasFanoCompressor {}),
-    impacts_compressor_factory: Box::new(Identity {})
+    impacts_compressor_factory: Box::new(Identity {}),
+    positions_codec: None,
 })]
 fn test_compressed_index(#[case] step: f64, #[case] transform: CompressionTransform) {
     use std::collections::HashSet;
@@ -36,6 +38,7 @@ fn test_compressed_index(#[case] step: f64, #[case] transform: CompressionTransf
             checkpoint_frequency: 0,
             in_memory_threshold: 10,
             checkpoint_flush_ratio: 0.5,
+            positions: false,
         },
         &HashSet::<DocId>::from([]),
     );
