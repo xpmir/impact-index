@@ -227,7 +227,22 @@ pub trait DocIdCompressorFactory: Sync + Send {
 
 /// A serializable compressor for impact values.
 #[typetag::serde(tag = "type")]
-pub trait ImpactCompressor: Compressor<ImpactValue> {}
+pub trait ImpactCompressor: Compressor<ImpactValue> {
+    /// Whether decoding returns exactly the values that were encoded.
+    ///
+    /// Positional indices REQUIRE a lossless impact codec: the stored value
+    /// is the term frequency, and position-run boundaries are recovered at
+    /// read time from the *decoded* values
+    /// ([`CompressedIndexIterator::ensure_positions_loaded`]). A lossy
+    /// codec that returns `0.99998` for a stored `1.0` would shift every
+    /// later run in the block -- silently, in release builds. Defaults to
+    /// `false` so a new codec must opt in explicitly;
+    /// [`CompressionTransform::process`] refuses to build a positional
+    /// index with a codec that doesn't.
+    fn lossless(&self) -> bool {
+        false
+    }
+}
 
 /// Factory for creating [`ImpactCompressor`] instances, potentially
 /// using global index statistics.
@@ -1290,12 +1305,22 @@ impl<'a> CompressedIndexIterator<'a> {
         self.run_offsets.push(0);
         let mut cumulative = 0u32;
         for &tf in &self.impacts {
-            cumulative += tf as u32;
+            // `round`, not truncation: even a lossless integer codec goes
+            // through f32, and the transform-time gate (`lossless()`)
+            // guarantees the decoded value is the exact tf -- rounding
+            // keeps that true against any benign representation change.
+            cumulative += tf.round() as u32;
             self.run_offsets.push(cumulative);
         }
-        debug_assert_eq!(
+        // Hard check (not debug_assert): this is the cold positions-decode
+        // path, and a mismatch here means every later run in the block
+        // would be silently mis-sliced -- fail loudly instead.
+        assert_eq!(
             cumulative, info.num_positions,
-            "sum of block tfs does not match num_positions"
+            "sum of block tfs ({}) does not match stored num_positions ({}): \
+             positional data is corrupt (was this index compressed with a \
+             lossy impact codec by an older library version?)",
+            cumulative, info.num_positions
         );
 
         // Deltas -> absolute positions, per run (first stays, rest add the
@@ -1958,6 +1983,15 @@ impl IndexTransform for CompressionTransform {
         // non-positional index gets byte-identical output to before this
         // feature existed -- no file created, no compressor recorded.
         let has_positions = index.has_positions();
+        if has_positions && !values_compressor.lossless() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "positional indices require a lossless impact codec (the stored value is the \
+                 term frequency, and position-run boundaries are recovered from decoded \
+                 values): use Identity or BitPackedIntCompressor instead of a quantizer, or \
+                 rebuild the source index without positions",
+            ));
+        }
         let positions_codec: Option<Box<dyn positions::PositionsCompressor>> =
             has_positions.then(|| resolve_positions_compressor(self.positions_codec.as_deref()));
         let positions_codec_ref: Option<&dyn positions::PositionsCompressor> =

@@ -196,7 +196,11 @@ impl<'a> Compressor<ImpactValue> for Quantizer {
 pub struct Identity {}
 
 #[typetag::serde]
-impl ImpactCompressor for Identity {}
+impl ImpactCompressor for Identity {
+    fn lossless(&self) -> bool {
+        true
+    }
+}
 
 impl ImpactCompressorFactory for Identity {
     fn create(&self, _index: &dyn crate::index::SparseIndexView) -> Box<dyn ImpactCompressor> {
@@ -278,7 +282,14 @@ impl<'a> Iterator for IdentityIterator<'a> {
 pub struct BitPackedIntCompressor {}
 
 #[typetag::serde]
-impl ImpactCompressor for BitPackedIntCompressor {}
+impl ImpactCompressor for BitPackedIntCompressor {
+    /// Values are stored as `round(value)`: exact for integer-valued
+    /// inputs, which positional/BoW indices guarantee by construction
+    /// (the builder asserts tf == positions.len()).
+    fn lossless(&self) -> bool {
+        true
+    }
+}
 
 impl ImpactCompressorFactory for BitPackedIntCompressor {
     fn create(&self, _index: &dyn SparseIndexView) -> Box<dyn ImpactCompressor> {

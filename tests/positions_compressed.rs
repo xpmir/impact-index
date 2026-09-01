@@ -475,3 +475,34 @@ fn test_reorder_refuses_positional_index() {
         err
     );
 }
+
+/// A lossy impact codec must be REFUSED for positional indices at
+/// transform time: run boundaries are recovered from decoded tf values
+/// (see `ensure_positions_loaded`), so a quantizer that returns 0.99998
+/// for a stored 1.0 would silently mis-slice every later run in the block
+/// in release builds. Regression for the footgun found while writing
+/// benches/structured.rs.
+#[test]
+fn test_lossy_impact_codec_refused_for_positional_index() {
+    init_logger();
+    let dir = temp_dir::TempDir::new().unwrap();
+    let forward = build_forward_index(dir.path(), 4);
+
+    let out = dir.path().join("compressed-lossy");
+    let transform = CompressionTransform {
+        max_block_size: 4,
+        doc_ids_compressor_factory: Box::new(BitPackingCompressor {}),
+        impacts_compressor_factory: Box::new(
+            impact_index::compress::impact::GlobalQuantizerFactory { nbits: 8 },
+        ),
+        positions_codec: None,
+    };
+    let err = transform
+        .process(&out, &forward)
+        .expect_err("lossy impact codec on a positional index must be refused");
+    assert!(
+        err.to_string().contains("lossless impact codec"),
+        "error message should be actionable: {}",
+        err
+    );
+}
