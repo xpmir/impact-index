@@ -264,6 +264,37 @@ fn search_wand_bm25_compressed(
     search_wand_core(iterators, top_k)
 }
 
+/// Runs the WAND core loop over pre-evaluated `(weight, cursor)` pairs --
+/// the entry point structured queries use (see
+/// `crate::query::search_wand_query`) once `crate::query::evaluate` has
+/// turned a `QueryNode` tree into flat cursors (composites from
+/// `crate::search::ops` included -- they're just another
+/// `BlockTermImpactIterator`, so the loop below doesn't know the
+/// difference).
+///
+/// Unlike [`search_wand`], this does NOT call
+/// [`crate::search::remap_to_original_ids`] -- there's no `&dyn
+/// SparseIndex` here to ask for a reorder map. Callers that need
+/// reordered-index doc-id translation (i.e. `search_wand_query`, which
+/// does have the index) must call it themselves on the result.
+pub fn search_wand_cursors<'a>(
+    cursors: Vec<(f32, Box<dyn crate::index::BlockTermImpactIterator + 'a>)>,
+    top_k: usize,
+) -> Vec<ScoredDocument> {
+    let mut iterators = Vec::with_capacity(cursors.len());
+    for (weight, mut iterator) in cursors {
+        if iterator.next_min_doc_id(0).is_some() {
+            let cached_docid = iterator.current().docid;
+            iterators.push(BlockTermImpactIteratorWrapper {
+                iterator,
+                query_weight: weight,
+                cached_docid,
+            });
+        }
+    }
+    search_wand_core(iterators, top_k)
+}
+
 /// Shared WAND loop, generic over the cursor type `C` (P3): monomorphized
 /// once per (index, scorer) combination that reaches it.
 fn search_wand_core<C: TermCursor>(

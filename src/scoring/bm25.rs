@@ -98,17 +98,36 @@ impl ScoringModel for BM25Scoring {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+
+    /// Compound scorer for a virtual term (phrase/window/synonym): idf is
+    /// the SUM of the children's idfs -- Lucene's convention for phrase
+    /// scoring (a phrase is "rarer" than any single child term, and
+    /// summing idfs is the standard proxy for that without computing a
+    /// real joint document frequency).
+    fn compound_scorer(&self, dfs: &[u64], _max_value: f32) -> Box<dyn ScoringFunction> {
+        let idf: f32 = dfs.iter().map(|&df| Self::idf(self.num_docs, df)).sum();
+        Box::new(self.build_term_scorer_with_idf(idf))
+    }
 }
 
 impl BM25Scoring {
+    /// BM25 idf: `ln(1 + (N - df + 0.5) / (df + 0.5))`.
+    fn idf(num_docs: u64, df: u64) -> f32 {
+        let n = num_docs as f64;
+        let df_f64 = df as f64;
+        ((n - df_f64 + 0.5) / (df_f64 + 0.5) + 1.0).ln() as f32
+    }
+
     /// Builds the concrete per-term scorer (shared by `term_scorer` and
     /// `term_scorer_typed`).
     fn build_term_scorer(&self, df: u64) -> BM25TermScorer {
-        // IDF: ln(1 + (N - df + 0.5) / (df + 0.5))
-        let n = self.num_docs as f64;
-        let df_f64 = df as f64;
-        let idf = ((n - df_f64 + 0.5) / (df_f64 + 0.5) + 1.0).ln() as f32;
+        self.build_term_scorer_with_idf(Self::idf(self.num_docs, df))
+    }
 
+    /// Builds a scorer from an already-computed idf -- shared by
+    /// `build_term_scorer` (single term) and `compound_scorer` (sum of
+    /// several terms' idfs).
+    fn build_term_scorer_with_idf(&self, idf: f32) -> BM25TermScorer {
         BM25TermScorer {
             idf,
             min_dl_norm: self.min_dl_norm,

@@ -47,6 +47,7 @@ pub mod docmeta;
 pub mod docstore;
 pub mod index;
 pub mod manifest;
+pub mod query;
 pub mod scoring;
 pub mod search;
 pub mod transforms;

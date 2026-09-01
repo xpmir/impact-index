@@ -17,6 +17,7 @@ Supports both neural IR models with floating-point impact scores and traditional
 - **Document store** with zstd compression and key-based retrieval
 - **Async support** for non-blocking search and document retrieval
 - **Parallel index compression** with rayon
+- **Structured queries**: matchop-style `#combine`/`#syn`/`#band`/`#1` (phrase)/`#uwN` (window) operators, evaluated directly by WAND/MaxScore (`search_wand_query`/`search_maxscore_query`); the positional ones (`#1`, `#uwN`) need an index built with `positions=True`
 
 ## Performance
 
@@ -89,6 +90,54 @@ results = scored.search_maxscore(query, top_k=10)
 for doc in results:
     print(f"Document {doc.docid}: {doc.score:.4f}")
 ```
+
+## Structured Queries
+
+Beyond the flat `{term_id: weight}` queries above, `search_wand_query`/
+`search_maxscore_query` accept Terrier-matchop-style structured queries.
+Each operator (`#combine`, `#syn`, `#band`, `#1`, `#uwN`) is evaluated as
+a "virtual" posting list on top of the same WAND/MaxScore dynamic pruning
+used for flat queries — no separate exhaustive path. `#1` (phrase) and
+`#uwN` (window) need positional information, which is opt-in:
+`BOWIndexBuilder(..., positions=True)`. Positions cost extra disk and are
+read lazily, so queries without positional operators (`#combine`, `#syn`,
+`#band`, or flat queries) pay nothing for it.
+
+| Syntax | Meaning | Needs positions? |
+|--------|---------|-------------------|
+| `#combine(...)` / `#combine:0=W0:1=W1(...)` | Weighted sum of children's scores | No |
+| `#syn(t1 t2 ...)` | Synonym/OR: term frequencies summed, scored as one virtual term | No |
+| `#band(n1 n2 ...)` | Boolean AND: matches docs containing every child, score = sum | No |
+| `#1(t1 t2 ...)` | Exact phrase: adjacent positions | Yes |
+| `#uwN(t1 t2 ...)` | Unordered window of width `N` tokens | Yes |
+
+A query is either a matchop string (terms resolved via the index's own
+analyzer/vocabulary — requires an index built with `BOWIndexBuilder`) or
+a nested Python structure of the same shape, with term ids in place of
+words: `{"term": ix}` (or `{"term": [ix, weight]}`), `{"combine": [[w,
+node], ...]}`, `{"syn": [ix, ...]}`, `{"band": [node, ...]}`, `{"phrase":
+[ix, ...]}`, `{"window": {"terms": [ix, ...], "width": N}}`.
+
+```python
+builder = impact_index.BOWIndexBuilder(
+    "/path/to/index", stemmer="porter", stop_words=True, positions=True,
+)
+builder.add_text(0, "the quick brown fox jumps over the lazy dog")
+index = builder.build(in_memory=True)
+scored = index.with_scoring(impact_index.BM25Scoring())
+
+results = scored.search_wand_query(
+    "#combine(quick #1(brown fox) #band(lazy dog))", top_k=10
+)
+for doc in results:
+    print(f"Document {doc.docid}: {doc.score:.4f}")
+```
+
+Scoring: `#1`/`#uwN` are scored as a single virtual term by the query-time
+model (sum-of-idfs for BM25, same convention as `#syn`); `#band` is a
+match-all filter whose score is the sum of its children's scores; `#syn`
+sums term frequencies across its children and scores the merge once (not
+once per child).
 
 ## Compression
 

@@ -110,6 +110,14 @@ class BuilderOptions:
     def in_memory_threshold(self) -> builtins.int: ...
     @in_memory_threshold.setter
     def in_memory_threshold(self, value: builtins.int) -> None: ...
+    @property
+    def positions(self) -> builtins.bool:
+        r"""
+        Store token positions alongside postings, for phrase/window
+        structured queries later. See ``BOWIndexBuilder(..., positions=True)``.
+        """
+    @positions.setter
+    def positions(self, value: builtins.bool) -> None: ...
     def __new__(cls) -> BuilderOptions: ...
 
 @typing.final
@@ -337,6 +345,26 @@ class Index(impactindex.IndexView):
             The directory holding the migrated index (``dest`` if given,
             otherwise ``path``).
         """
+    def search_wand_query(self, query: typing.Any, top_k: builtins.int) -> typing.Any:
+        r"""
+        Search using WAND over a structured (matchop-style) query.
+
+        ``query`` is a matchop string (e.g.
+        ``"#combine(quick #1(brown fox) #band(lazy dog))"``), a bare term id
+        (int), or a nested dict: ``{"term": ix}``/``{"term": [ix, weight]}``,
+        ``{"combine": [[w1, node1], [w2, node2], ...]}``, ``{"syn": [ix,
+        ...]}``, ``{"band": [node, ...]}``, ``{"phrase": [ix, ...]}``, or
+        ``{"window": {"terms": [ix, ...], "width": N}}``. Matchop strings
+        need an analyzer/vocab (built via ``BOWIndexBuilder``); phrase/
+        window operators need an index built with ``positions=True``.
+        """
+    def search_maxscore_query(
+        self, query: typing.Any, top_k: builtins.int
+    ) -> typing.Any:
+        r"""
+        Search using MaxScore over a structured (matchop-style) query. Same
+        ``query`` forms as [`search_wand_query`](Self::search_wand_query).
+        """
 
 @typing.final
 class IndexBuilder:
@@ -427,6 +455,18 @@ class ScoredIndex(impactindex.IndexView):
     """
     def search_wand(self, py_query: dict, top_k: builtins.int) -> typing.Any: ...
     def search_maxscore(self, py_query: dict, top_k: builtins.int) -> typing.Any: ...
+    def search_wand_query(self, query: typing.Any, top_k: builtins.int) -> typing.Any:
+        r"""
+        Search using WAND over a structured (matchop-style) query. See
+        ``Index.search_wand_query`` for the accepted ``query`` forms.
+        """
+    def search_maxscore_query(
+        self, query: typing.Any, top_k: builtins.int
+    ) -> typing.Any:
+        r"""
+        Search using MaxScore over a structured (matchop-style) query. See
+        ``Index.search_wand_query`` for the accepted ``query`` forms.
+        """
 
 @typing.final
 class SparseIndexIterator:

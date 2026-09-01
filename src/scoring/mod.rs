@@ -88,6 +88,22 @@ pub trait ScoringModel: Send + Sync {
     /// `search_maxscore`/`search_wand` detect a specific model (e.g. BM25)
     /// at query entry. See [`crate::index::SparseIndex::as_any`].
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Scorer for a "virtual term" made of several underlying terms
+    /// (phrase, window, synonym -- see `crate::query::QueryNode`): `dfs`
+    /// are the children's document frequencies, `max_value` the virtual
+    /// term's max raw value (e.g. a phrase's max possible occurrence
+    /// count).
+    ///
+    /// Default: conservative fallback -- score like a single term whose df
+    /// is the smallest child df (the highest single-term idf, so still a
+    /// safe/reasonable bound for models that don't define anything
+    /// smarter). Override for models with a real compound-scoring
+    /// convention, e.g. [`bm25::BM25Scoring`] sums the children's idfs
+    /// (Lucene's convention for phrase scoring).
+    fn compound_scorer(&self, dfs: &[u64], max_value: f32) -> Box<dyn ScoringFunction> {
+        self.term_scorer(dfs.iter().copied().min().unwrap_or(1), max_value)
+    }
 }
 
 /// Wraps a [`BlockTermImpactIterator`], applying a [`ScoringFunction`] to each posting.
@@ -198,6 +214,39 @@ impl<'a> BlockTermImpactIterator for ScoringBlockIterator<'a> {
     }
 }
 
+/// Wraps a raw (unscored) cursor with a [`ScoringFunction`], the way
+/// [`ScoredIndex::block_iterator`] wraps a plain term's inner iterator --
+/// exposed so structured-query evaluation (`crate::query::evaluate`) can
+/// wrap the raw virtual-tf cursor a phrase/window/synonym composite
+/// produces (`crate::search::ops`) with a [`ScoringModel::compound_scorer`]
+/// the same way.
+///
+/// `max_value` is computed the same way `ScoredIndex::block_iterator` does:
+/// `scorer.max_score_with_dl(inner.max_value(), inner.min_dl())` -- safe
+/// because `inner.min_dl()` is either a real per-term bound or the `0`
+/// "not available" sentinel every dl-aware [`ScoringFunction`] must treat
+/// as "fall back to the looser bound".
+pub(crate) fn wrap_scored_cursor<'a>(
+    inner: Box<dyn BlockTermImpactIterator + 'a>,
+    scorer: Box<dyn ScoringFunction>,
+) -> Box<dyn BlockTermImpactIterator + 'a> {
+    let cached_max_doc_id = inner.max_doc_id();
+    let cached_length = inner.length();
+    let max_value = scorer.max_score_with_dl(inner.max_value(), inner.min_dl());
+
+    Box::new(ScoringBlockIterator {
+        cached_max_doc_id,
+        cached_length,
+        inner,
+        scorer,
+        current_impact: Cell::new(None),
+        cached_block_min_doc_id: 0,
+        cached_block_max_doc_id: 0,
+        cached_scored_block_max: 0.0,
+        max_value,
+    })
+}
+
 /// A wrapper around a [`SparseIndex`] that applies scoring functions to iterators.
 ///
 /// Created via [`ScoredIndex::new`]. The resulting index can be searched with
@@ -236,6 +285,13 @@ impl ScoredIndex {
     /// The scoring model, as `Any` (for downcasting to a concrete model).
     pub(crate) fn model_any(&self) -> &dyn std::any::Any {
         self.model.as_any()
+    }
+
+    /// The scoring model (for structured-query evaluation, which needs
+    /// [`ScoringModel::compound_scorer`] -- `model_any` only offers a
+    /// downcast to one specific known model).
+    pub(crate) fn model(&self) -> &dyn ScoringModel {
+        &*self.model
     }
 }
 

@@ -209,6 +209,49 @@ fn search_maxscore_bm25_compressed(
     search_maxscore_core(active, top_k, options.length_based_ordering)
 }
 
+/// Runs the MaxScore core loop over pre-evaluated `(weight, cursor)` pairs
+/// -- the entry point structured queries use (see
+/// `crate::query::search_maxscore_query`) once `crate::query::evaluate` has
+/// turned a `QueryNode` tree into flat cursors (composites from
+/// `crate::search::ops` included -- from here they're just another
+/// `BlockTermImpactIterator`). `term_index` for each entry is its position
+/// in `cursors`, matching how the impact-decomposition bookkeeping in
+/// `search_maxscore_dyn` assigns it.
+///
+/// Unlike [`search_maxscore`], this does NOT call
+/// [`crate::search::remap_to_original_ids`] -- there's no `&dyn
+/// SparseIndex` here to ask for a reorder map. Callers that need
+/// reordered-index doc-id translation (i.e. `search_maxscore_query`, which
+/// does have the index) must call it themselves on the result.
+pub fn search_maxscore_cursors<'a>(
+    cursors: Vec<(f32, Box<dyn crate::index::BlockTermImpactIterator + 'a>)>,
+    top_k: usize,
+    options: MaxScoreOptions,
+) -> Vec<ScoredDocument> {
+    let mut active = Vec::with_capacity(cursors.len());
+
+    for (term_index, (weight, iterator)) in cursors.into_iter().enumerate() {
+        let max_value = (iterator.max_value() * weight) as f64;
+
+        let mut wrapper = MaxScoreTermIterator {
+            iterator,
+            query_weight: weight,
+            term_index,
+            impact: TermImpact {
+                value: 0.,
+                docid: 0,
+            },
+            max_value,
+        };
+
+        if wrapper.next() {
+            active.push(wrapper);
+        }
+    }
+
+    search_maxscore_core(active, top_k, options.length_based_ordering)
+}
+
 /// Shared MaxScore loop, generic over the cursor type `C` (P3): monomorphized
 /// once per (index, scorer) combination that reaches it, so the body below
 /// compiles to a fully statically-dispatched loop for each instantiation.

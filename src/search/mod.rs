@@ -6,6 +6,7 @@
 
 pub mod cursor;
 pub mod maxscore;
+pub(crate) mod ops;
 pub mod wand;
 
 /// Reordered indices renumber documents internally (see

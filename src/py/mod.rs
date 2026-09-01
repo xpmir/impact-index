@@ -2,7 +2,7 @@ use log::debug;
 use pyo3::PyClassInitializer;
 use pyo3::{
     pyclass, pymethods, pymodule,
-    types::{PyAnyMethods, PyDict, PyModule, PyModuleMethods},
+    types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods},
     Bound, Py, PyAny, PyRef, PyResult, Python,
 };
 
@@ -34,6 +34,7 @@ use bmp::search::b_search_verbose;
 use crate::base::load_index;
 use crate::base::{DocId, ImpactValue, PostingValue, TermIndex};
 use crate::index::SparseIndex;
+use crate::query::{self, QueryError, QueryNode};
 use crate::search::maxscore::{search_maxscore, MaxScoreOptions};
 use crate::transforms::IndexTransform;
 use crate::{
@@ -50,6 +51,203 @@ type SearchFn = fn(
     query: &HashMap<TermIndex, ImpactValue>,
     top_k: usize,
 ) -> Vec<crate::search::ScoredDocument>;
+
+// ---------------------------------------------------------------------
+// Structured queries (src/query.rs bindings)
+// ---------------------------------------------------------------------
+
+/// Maps a [`QueryError`] to a `PyValueError` carrying the Rust message
+/// (`PositionsNotAvailable`/`Parse` are already actionable; `EmptyQuery`
+/// should never reach a caller here since `search_wand_query`/
+/// `search_maxscore_query` already turn it into an empty result set, but is
+/// mapped defensively for direct callers of `evaluate`).
+fn map_query_error(e: QueryError) -> pyo3::PyErr {
+    pyo3::exceptions::PyValueError::new_err(e.to_string())
+}
+
+/// The underlying (raw, unscored) index to load a `TextAnalyzer` from for
+/// matchop token resolution: `index` itself, or -- when `index` is a
+/// `ScoredIndex` -- its wrapped raw index (a `ScoredIndex` never has its own
+/// source path).
+fn source_path_for_resolver(index: &dyn SparseIndex) -> Option<&Path> {
+    if let Some(scored) = index.as_any().downcast_ref::<ScoredIndex>() {
+        scored.inner_index().source_path()
+    } else {
+        index.source_path()
+    }
+}
+
+/// Loads the `TextAnalyzer` used to resolve matchop query tokens to term
+/// ids, from `index`'s (or its inner index's) source directory.
+fn load_matchop_analyzer(index: &dyn SparseIndex) -> PyResult<TextAnalyzer> {
+    let no_analyzer_err = || {
+        pyo3::exceptions::PyValueError::new_err(
+            "index has no analyzer/vocab (build with BOWIndexBuilder to enable matchop query \
+             strings); pass the structured query form with term ids instead",
+        )
+    };
+    let source = source_path_for_resolver(index).ok_or_else(no_analyzer_err)?;
+    let path_str = source.to_str().ok_or_else(no_analyzer_err)?;
+    PyTextAnalyzer::from_index(path_str)
+        .map(|a| a.inner)
+        .map_err(|_| no_analyzer_err())
+}
+
+/// Converts a `{"term": ix}` / `{"term": [ix, weight]}` dict value into a
+/// [`QueryNode::Term`].
+fn build_term_node(value: &Bound<'_, PyAny>) -> PyResult<QueryNode> {
+    if let Ok(ix) = value.extract::<TermIndex>() {
+        return Ok(QueryNode::Term {
+            term: ix,
+            weight: 1.0,
+        });
+    }
+    if let Ok(items) = value.extract::<Vec<Bound<'_, PyAny>>>() {
+        if items.len() == 2 {
+            if let (Ok(ix), Ok(weight)) =
+                (items[0].extract::<TermIndex>(), items[1].extract::<f32>())
+            {
+                return Ok(QueryNode::Term { term: ix, weight });
+            }
+        }
+    }
+    Err(pyo3::exceptions::PyValueError::new_err(
+        "'term' value must be an int term id or a [term_id, weight] pair",
+    ))
+}
+
+/// Converts a `{"combine": [[w1, node1], [w2, node2], ...]}` dict value
+/// into a [`QueryNode::Combine`].
+fn build_combine_node(value: &Bound<'_, PyAny>) -> PyResult<QueryNode> {
+    let items: Vec<Bound<'_, PyAny>> = value.extract().map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err(
+            "'combine' value must be a list of [weight, node] pairs",
+        )
+    })?;
+    let mut children = Vec::with_capacity(items.len());
+    for item in items {
+        let pair: Vec<Bound<'_, PyAny>> = item.extract().map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err(
+                "'combine' entries must be [weight, node] pairs",
+            )
+        })?;
+        if pair.len() != 2 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "'combine' entries must be [weight, node] pairs",
+            ));
+        }
+        let weight: f32 = pair[0].extract().map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err("'combine' pair weight must be a number")
+        })?;
+        let node = build_query_node(&pair[1])?;
+        children.push((weight, node));
+    }
+    Ok(QueryNode::Combine { children })
+}
+
+/// Converts a `{"band": [node, node, ...]}` dict value into a
+/// [`QueryNode::Band`].
+fn build_band_node(value: &Bound<'_, PyAny>) -> PyResult<QueryNode> {
+    let items: Vec<Bound<'_, PyAny>> = value.extract().map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err("'band' value must be a list of query nodes")
+    })?;
+    let mut children = Vec::with_capacity(items.len());
+    for item in &items {
+        children.push(build_query_node(item)?);
+    }
+    Ok(QueryNode::Band { children })
+}
+
+/// Extracts a plain `[ix, ix, ...]` list of term ids, for `syn`/`phrase`/
+/// `window.terms`.
+fn extract_term_list(value: &Bound<'_, PyAny>, op: &str) -> PyResult<Vec<TermIndex>> {
+    value.extract::<Vec<TermIndex>>().map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "'{}' value must be a list of term ids (ints)",
+            op
+        ))
+    })
+}
+
+/// Converts a `{"window": {"terms": [ix, ...], "width": N}}` dict value
+/// into a [`QueryNode::Window`].
+fn build_window_node(value: &Bound<'_, PyAny>) -> PyResult<QueryNode> {
+    let dict = value.downcast::<PyDict>().map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err(
+            "'window' value must be a dict with 'terms' and 'width' keys",
+        )
+    })?;
+    let terms_obj = dict.get_item("terms")?.ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err("'window' dict is missing the 'terms' key")
+    })?;
+    let terms = extract_term_list(&terms_obj, "window.terms")?;
+    let width_obj = dict.get_item("width")?.ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err("'window' dict is missing the 'width' key")
+    })?;
+    let width: u32 = width_obj
+        .extract()
+        .map_err(|_| pyo3::exceptions::PyValueError::new_err("'window.width' must be an int"))?;
+    Ok(QueryNode::Window { terms, width })
+}
+
+/// Converts a structured (pyclass-free) Python query node -- an int term
+/// id, or a single-key dict (`term`/`combine`/`syn`/`band`/`phrase`/
+/// `window`) -- into a [`QueryNode`]. Does not handle the matchop string
+/// form (see [`query_node_from_py`], the entry point that also accepts
+/// `str`).
+fn build_query_node(obj: &Bound<'_, PyAny>) -> PyResult<QueryNode> {
+    if let Ok(ix) = obj.extract::<TermIndex>() {
+        return Ok(QueryNode::Term {
+            term: ix,
+            weight: 1.0,
+        });
+    }
+    let dict = obj.downcast::<PyDict>().map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err(
+            "query node must be an int (term id) or a single-key dict \
+             ('term'/'combine'/'syn'/'band'/'phrase'/'window')",
+        )
+    })?;
+    if dict.len() != 1 {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "query dict must have exactly one key, got {}",
+            dict.len()
+        )));
+    }
+    let (key_obj, value) = dict.iter().next().expect("dict.len() == 1 checked above");
+    let key: String = key_obj
+        .extract()
+        .map_err(|_| pyo3::exceptions::PyValueError::new_err("query dict key must be a string"))?;
+
+    match key.as_str() {
+        "term" => build_term_node(&value),
+        "combine" => build_combine_node(&value),
+        "syn" => Ok(QueryNode::Syn {
+            terms: extract_term_list(&value, "syn")?,
+        }),
+        "band" => build_band_node(&value),
+        "phrase" => Ok(QueryNode::Phrase {
+            terms: extract_term_list(&value, "phrase")?,
+        }),
+        "window" => build_window_node(&value),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown query operator '{}', expected one of: term, combine, syn, band, phrase, window",
+            other
+        ))),
+    }
+}
+
+/// Converts a Python `query` argument (`str | dict | int`) into a
+/// [`QueryNode`], resolving matchop text against `index`'s `TextAnalyzer`
+/// when `query` is a string.
+fn query_node_from_py(obj: &Bound<'_, PyAny>, index: &dyn SparseIndex) -> PyResult<QueryNode> {
+    if let Ok(text) = obj.extract::<String>() {
+        let analyzer = load_matchop_analyzer(index)?;
+        let resolve = |tok: &str| analyzer.analyze_query(tok).keys().next().copied();
+        return query::parse_matchop(&text, &resolve).map_err(map_query_error);
+    }
+    build_query_node(obj)
+}
 
 /// A single term impact: a (document ID, impact value) pair.
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
@@ -496,6 +694,57 @@ impl PySparseIndex {
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         Ok(result_path.to_string_lossy().into_owned())
     }
+
+    /// Search using WAND over a structured (matchop-style) query.
+    ///
+    /// ``query`` is a matchop string (e.g.
+    /// ``"#combine(quick #1(brown fox) #band(lazy dog))"``), a bare term id
+    /// (int), or a nested dict: ``{"term": ix}``/``{"term": [ix, weight]}``,
+    /// ``{"combine": [[w1, node1], [w2, node2], ...]}``, ``{"syn": [ix,
+    /// ...]}``, ``{"band": [node, ...]}``, ``{"phrase": [ix, ...]}``, or
+    /// ``{"window": {"terms": [ix, ...], "width": N}}``. Matchop strings
+    /// need an analyzer/vocab (built via ``BOWIndexBuilder``); phrase/
+    /// window operators need an index built with ``positions=True``.
+    fn search_wand_query(
+        &self,
+        py: Python<'_>,
+        query: &Bound<'_, PyAny>,
+        top_k: usize,
+    ) -> PyResult<Py<PyAny>> {
+        let node = query_node_from_py(query, &**self.index)?;
+        let results =
+            query::search_wand_query(&**self.index, &node, top_k).map_err(map_query_error)?;
+        let v: Vec<PyScoredDocument> = results
+            .into_iter()
+            .map(|r| PyScoredDocument {
+                docid: r.docid,
+                score: r.score,
+            })
+            .collect();
+        Ok(pyo3::IntoPyObject::into_pyobject(v, py)?.into())
+    }
+
+    /// Search using MaxScore over a structured (matchop-style) query. Same
+    /// ``query`` forms as [`search_wand_query`](Self::search_wand_query).
+    fn search_maxscore_query(
+        &self,
+        py: Python<'_>,
+        query: &Bound<'_, PyAny>,
+        top_k: usize,
+    ) -> PyResult<Py<PyAny>> {
+        let node = query_node_from_py(query, &**self.index)?;
+        let options = MaxScoreOptions::default();
+        let results = query::search_maxscore_query(&**self.index, &node, top_k, options)
+            .map_err(map_query_error)?;
+        let v: Vec<PyScoredDocument> = results
+            .into_iter()
+            .map(|r| PyScoredDocument {
+                docid: r.docid,
+                score: r.score,
+            })
+            .collect();
+        Ok(pyo3::IntoPyObject::into_pyobject(v, py)?.into())
+    }
 }
 
 /// Configuration options for IndexBuilder.
@@ -530,6 +779,18 @@ impl PyBuilderOptions {
     #[setter]
     fn set_in_memory_threshold(&mut self, value: usize) {
         self.0.in_memory_threshold = value;
+    }
+
+    /// Store token positions alongside postings, for phrase/window
+    /// structured queries later. See ``BOWIndexBuilder(..., positions=True)``.
+    #[getter]
+    fn positions(&self) -> bool {
+        self.0.positions
+    }
+
+    #[setter]
+    fn set_positions(&mut self, value: bool) {
+        self.0.positions = value;
     }
 }
 
@@ -1437,6 +1698,49 @@ impl PyScoredIndex {
             search_maxscore(index, query, top_k, options)
         })
     }
+
+    /// Search using WAND over a structured (matchop-style) query. See
+    /// ``Index.search_wand_query`` for the accepted ``query`` forms.
+    fn search_wand_query(
+        &self,
+        py: Python<'_>,
+        query: &Bound<'_, PyAny>,
+        top_k: usize,
+    ) -> PyResult<Py<PyAny>> {
+        let node = query_node_from_py(query, &**self.index)?;
+        let results =
+            query::search_wand_query(&**self.index, &node, top_k).map_err(map_query_error)?;
+        let v: Vec<PyScoredDocument> = results
+            .into_iter()
+            .map(|r| PyScoredDocument {
+                docid: r.docid,
+                score: r.score,
+            })
+            .collect();
+        Ok(pyo3::IntoPyObject::into_pyobject(v, py)?.into())
+    }
+
+    /// Search using MaxScore over a structured (matchop-style) query. See
+    /// ``Index.search_wand_query`` for the accepted ``query`` forms.
+    fn search_maxscore_query(
+        &self,
+        py: Python<'_>,
+        query: &Bound<'_, PyAny>,
+        top_k: usize,
+    ) -> PyResult<Py<PyAny>> {
+        let node = query_node_from_py(query, &**self.index)?;
+        let options = MaxScoreOptions::default();
+        let results = query::search_maxscore_query(&**self.index, &node, top_k, options)
+            .map_err(map_query_error)?;
+        let v: Vec<PyScoredDocument> = results
+            .into_iter()
+            .map(|r| PyScoredDocument {
+                docid: r.docid,
+                score: r.score,
+            })
+            .collect();
+        Ok(pyo3::IntoPyObject::into_pyobject(v, py)?.into())
+    }
 }
 
 /// Bag-of-words index builder for traditional IR (BM25, TF-IDF, etc.).
@@ -1454,6 +1758,8 @@ impl PyScoredIndex {
 #[pyclass(name = "BOWIndexBuilder")]
 pub struct PyBOWIndexBuilder {
     inner: Arc<Mutex<Option<BOWBuilderEnum>>>,
+    /// Mirrors `options.positions`; gates `add()` (see [`PyBOWIndexBuilder::add`]).
+    positions: bool,
 }
 
 enum BOWBuilderEnum {
@@ -1477,8 +1783,14 @@ impl PyBOWIndexBuilder {
     ///     language: Language for the stemmer (default: "english").
     ///     stop_words: Stop words to filter. Either a list of strings, or
     ///         ``True`` to use the default Lucene stop words for the language.
+    ///     positions: Store token positions alongside postings, enabling
+    ///         phrase (``#1``) / window (``#uwN``) structured queries later
+    ///         (``search_wand_query``/``search_maxscore_query``). Opt-in:
+    ///         positions cost extra disk and are read lazily, so queries
+    ///         without positional operators pay nothing. Overrides
+    ///         ``options.positions`` when both are given.
     #[new]
-    #[pyo3(signature = (folder, options=None, dtype=None, stemmer=None, language=None, stop_words=None))]
+    #[pyo3(signature = (folder, options=None, dtype=None, stemmer=None, language=None, stop_words=None, positions=false))]
     fn new(
         folder: &str,
         options: Option<&PyBuilderOptions>,
@@ -1486,11 +1798,13 @@ impl PyBOWIndexBuilder {
         stemmer: Option<&str>,
         language: Option<&str>,
         stop_words: Option<&Bound<'_, PyAny>>,
+        positions: bool,
     ) -> PyResult<Self> {
-        let builder_options = match options {
+        let mut builder_options = match options {
             Some(o) => o.0.clone(),
             None => BuilderOptions::default(),
         };
+        builder_options.positions = positions;
         let path = Path::new(folder);
         let dtype_str = dtype.unwrap_or("int32");
         let lang = language.unwrap_or("english");
@@ -1598,6 +1912,7 @@ impl PyBOWIndexBuilder {
 
         Ok(Self {
             inner: Arc::new(Mutex::new(Some(inner))),
+            positions,
         })
     }
 
@@ -1607,6 +1922,16 @@ impl PyBOWIndexBuilder {
         terms: &Bound<'_, PyArray1<TermIndex>>,
         values: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
+        if self.positions {
+            // Mirrors the Rust-layer assert in `BOWIndexBuilder::add` --
+            // checked here so Python users get a catchable exception
+            // instead of an abort (pyo3 turns panics into exceptions, but
+            // this is more direct and matches the message exactly).
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "index built with positions=true: use add_with_positions",
+            ));
+        }
+
         let py = values.py();
         let np = py.import("numpy")?;
         let values_f32: Bound<'_, PyArray1<f32>> = np
