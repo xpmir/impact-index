@@ -406,6 +406,8 @@ def terrier_worker_search(index_dir: Path, queries, top_k, k1, b, out_file: Path
     pt = init_pyterrier()
 
     index = pt.IndexFactory.of(str(index_dir))
+    # Exhaustive DAAT (daat.Full) — the only matching in stock Terrier 5.11;
+    # WAND/block-max dynamic pruning is not shipped in the terrier assemblies
     retriever = pt.terrier.Retriever(
         index,
         wmodel="BM25",
