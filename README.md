@@ -38,8 +38,11 @@ filter, and stop words. Per-step measurements live in `optimizations.md`.
 
 Reproduce with `examples/benchmark_bm25.py`. Terrier 5.11 runs through
 PyTerrier (single-pass index, one query at a time via
-`pt.terrier.Retriever`, which adds some Python overhead per query); its
-analysis pipeline (Terrier's own stop word list and stemming) differs
+`pt.terrier.Retriever`, which adds some Python overhead per query).
+Terrier uses its default exhaustive DAAT matching (`daat.Full`) — stock
+Terrier 5.11 ships no WAND/block-max dynamic pruning, unlike
+impact-index (MaxScore/BMW) and Lucene (Block-Max WAND). Terrier's
+analysis pipeline (its own stop word list and stemming) differs
 from the Lucene-matched systems, hence the different MRR@10 and a
 Pyserini overlap of only 0.70@10. Java: Terrier 5 needs Java 11+ and
 Pyserini needs Java 21 — both measured with OpenJDK (Temurin) 21.
