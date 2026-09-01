@@ -37,6 +37,10 @@ required-features = ["stub-gen"]
 name = "sparse"
 harness = false
 
+[[bench]]
+name = "structured"
+harness = false
+
 [[bin]]
 name = "profile_search"
 path = "src/bin/profile_search.rs"

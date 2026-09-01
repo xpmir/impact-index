@@ -16,7 +16,7 @@ use impact_index::compress::docid::BitPackingCompressor;
 use impact_index::compress::impact::Identity;
 use impact_index::compress::CompressionTransform;
 use impact_index::docmeta::DocMetadata;
-use impact_index::index::SparseIndex;
+use impact_index::index::{BlockTermImpactIterator, SparseIndex};
 use impact_index::query::{evaluate, parse_matchop, search_maxscore_query, search_wand_query};
 use impact_index::query::{QueryError, QueryNode};
 use impact_index::scoring::bm25::BM25Scoring;
@@ -725,6 +725,118 @@ fn test_reordered_index_structured_query() {
         );
     }
 }
+
+// =======================================================================
+// Composite block-max bounds (Phase 4 / Part F, src/search/ops.rs)
+// =======================================================================
+
+/// Drives every `(weight, cursor)` in `cursors` end to end, checking at
+/// each successfully resolved doc that:
+/// - `max_block_doc_id() >= ` the current docid (the window end can't be
+///   behind where we're standing),
+/// - `max_block_value() <= max_value() + eps` (a block bound is never
+///   looser than the whole-term bound),
+/// - the current value never exceeds its own freshly computed block bound,
+/// - and -- the actual pruning-safety property -- every doc that arrives
+///   while still inside a previously reported window `[d, end]` still
+///   respects that window's `bound`, not just its own freshly recomputed
+///   one (a composite could recompute a smaller, still-safe bound for a
+///   later doc and this must not be mistaken for the earlier window being
+///   violated retroactively; conversely an unsafe implementation that
+///   under-reports `end` or over-tightens `bound` would be caught here).
+fn check_block_bounds_dominate<'a>(
+    cursors: Vec<(f32, Box<dyn BlockTermImpactIterator + 'a>)>,
+    label: &str,
+) {
+    const EPS: ImpactValue = 1e-4;
+    for (_, mut cursor) in cursors {
+        let term_max = cursor.max_value();
+        let mut anchor: Option<(DocId, ImpactValue)> = None; // (window end, window bound)
+        let mut target: DocId = 0;
+
+        while let Some(docid) = cursor.next_min_doc_id(target) {
+            let value = cursor.current().value;
+            let bound = cursor.max_block_value();
+            let end = cursor.max_block_doc_id();
+
+            assert!(
+                end >= docid,
+                "{label}: max_block_doc_id {end} < current docid {docid}"
+            );
+            assert!(
+                bound <= term_max + EPS,
+                "{label}: block bound {bound} looser than term bound {term_max} at doc {docid}"
+            );
+            assert!(
+                value <= bound + EPS,
+                "{label}: value {value} exceeds its own block bound {bound} at doc {docid}"
+            );
+
+            if let Some((anchor_end, anchor_bound)) = anchor {
+                if docid <= anchor_end {
+                    assert!(
+                        value <= anchor_bound + EPS,
+                        "{label}: doc {docid} value {value} exceeds earlier window's block \
+                         bound {anchor_bound} (window end {anchor_end}) -- pruning-safety \
+                         violation"
+                    );
+                }
+            }
+            if anchor.map_or(true, |(anchor_end, _)| docid > anchor_end) {
+                anchor = Some((end, bound));
+            }
+
+            target = docid + 1;
+        }
+    }
+}
+
+/// Test 1 (spec): the composite block-max bounds must dominate every
+/// value they cover, both at the doc where the bound is read and at every
+/// later doc still inside that bound's `[docid, max_block_doc_id()]`
+/// window. Exercises `AndCursor`/`SumCursor`/`PositionalCursor` via a mix
+/// of `mixed_queries` over the multi-block compressed corpus (band, syn,
+/// nested combine, phrase) plus the small single-block corpus's
+/// interleaved rock/jazz window query -- the same case
+/// `test_window_count_exceeds_child_tf_bound_stays_safe` uses to prove
+/// `max_value()` isn't a `min`-of-children bound, now checked at the
+/// block level too.
+#[test]
+fn test_composite_block_bounds_dominate() {
+    init_logger();
+
+    let (forward, terms) = build_big(true);
+    let scored = compress_and_score(&forward);
+    let queries = mixed_queries(&terms);
+    for (label, idx) in [
+        ("band", 1usize),
+        ("syn", 2),
+        ("nested_combine", 3),
+        ("phrase", 4),
+    ] {
+        let cursors = evaluate(&scored, &queries[idx]).expect("evaluate should succeed");
+        check_block_bounds_dominate(cursors, label);
+    }
+
+    let (small_index, small_terms) = build_small();
+    let window = QueryNode::Window {
+        terms: vec![small_terms["rock"], small_terms["jazz"]],
+        width: 3,
+    };
+    let cursors = evaluate(&small_index, &window).expect("evaluate should succeed");
+    check_block_bounds_dominate(cursors, "window_rock_jazz");
+}
+
+// NOTE: composite block-max bounds (Phase 4 / Part F of positions-plan.md)
+// were implemented, measured, and REVERTED: with a single top-level cursor
+// the search loops consult block bounds once per candidate (1:1 with
+// advances), so the O(children) bound computation cost +17-19% on bare
+// #syn over mid-frequency terms while no structured query improved beyond
+// noise -- at max_block_size 128 and top_k 10, term-level bounds already
+// terminate the search before block granularity matters. The domination
+// test above is KEPT: it holds for the default (term-level) bounds and
+// guards any future re-attempt. See positions-plan.md (Phase 4 outcome)
+// for the measured tables.
 
 // =======================================================================
 // Parser

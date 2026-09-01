@@ -324,6 +324,37 @@ New `src/search/ops.rs`:
 
 ## Phase 4 — Optimizations (only if profiling asks)
 
+**Outcome (measured 2026-09-01, `benches/structured.rs`, 50k docs / 1k
+vocab / seeded, top_k 10, max_block_size 128):**
+
+- **Composite block-max bounds: implemented, measured, REVERTED.** Both an
+  eager (per-advance) and a lazy (per-consulted-docid, `Cell`-cached)
+  variant of honest composite block bounds (`E = min` child block end;
+  sum/min of child block maxes per operator; correctness verified by
+  domination + pruning-identity tests) showed **no improvement beyond
+  noise on any structured query** — at this block size and k, term-level
+  bounds already terminate the search before block granularity matters —
+  while costing **+17–19 % on bare `#syn`**: with a single top-level
+  cursor, WAND/MaxScore consult `max_block_value()` once per candidate
+  (1:1 with advances; ~8.7k union candidates for a 3-term mid-df `#syn`),
+  so the O(children) bound computation is pure per-candidate overhead and
+  laziness has nothing to memoize. Re-attempt only with a design whose
+  per-candidate cost is O(1) (e.g. incremental bound maintenance), and
+  re-measure with larger top_k / smaller blocks where block bounds have
+  headroom. The `test_composite_block_bounds_dominate` invariant test
+  remains in `tests/query.rs` as the safety harness for any re-attempt.
+- **Two-phase positional verification: deferred on data.** A standalone
+  phrase/window query cannot benefit (there are no other clauses to fail
+  first — every reported doc must be verified regardless), and the
+  targeted shape (`combine_mixed`: cheap terms + `#1` phrase) already
+  runs at ~0.75× the flat 4-term query's cost, so verification is not the
+  dominating term there. Revisit only if a real workload shows
+  phrase-under-combine dominating.
+- `benches/structured.rs` (14 benchmarks: flat/phrase/window/band/syn/
+  mixed × wand/maxscore, seeded) is the harness for any future attempt.
+
+The items below are kept for reference:
+
 - **Two-phase iteration**: split `PhraseCursor` matching into doc-level
   approximation + `matches()` verification, invoked after the cheap clauses
   in WAND's scoring loop (Lucene's biggest positional win; requires a small
