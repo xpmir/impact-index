@@ -4,6 +4,7 @@
 # dependencies = [
 #     "ir-datasets",
 #     "pyserini",
+#     "python-terrier>=0.11",
 #     "tqdm",
 #     "numpy",
 #     "cbor2",
@@ -11,10 +12,14 @@
 # ]
 # ///
 """
-Benchmark BM25: impact-index vs Pyserini on MS MARCO passage.
+Benchmark BM25: impact-index vs Pyserini vs Terrier 5 on MS MARCO passage.
+
+Java requirements: Terrier 5 (via PyTerrier) needs Java 11+, Pyserini needs
+Java 21 — a single OpenJDK 21 install (e.g. Temurin) satisfies both. Set
+JAVA_HOME if it is not picked up automatically.
 
 Usage:
-    # First time: build both indices and benchmark
+    # First time: build all indices and benchmark
     uv run --with . examples/benchmark_bm25.py --output-dir /tmp/bm25_bench
 
     # Re-run search only (indices already built)
@@ -34,10 +39,11 @@ Usage:
 
 import argparse
 import json
+import os
 import re
 import subprocess
+import sys
 import time
-from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -261,6 +267,75 @@ def build_pyserini_index(dataset, index_dir: Path):
     return lucene_dir
 
 
+# PyTerrier and Pyserini cannot share a process: both use pyjnius, and the
+# JVM classpath is fixed by whichever library starts it first. Everything
+# touching Terrier therefore runs in a worker subprocess (its own JVM),
+# spawned via `--terrier-worker`.
+
+
+def init_pyterrier():
+    """Initialize PyTerrier (starts the JVM; Terrier 5 requires Java 11+)."""
+    import pyterrier as pt
+
+    if not pt.java.started():
+        pt.java.init()
+    return pt
+
+
+def run_terrier_subprocess(spec: dict, work_dir: Path):
+    """Run a Terrier action (index/search) in a subprocess with its own JVM."""
+    spec_file = work_dir / "terrier_worker_spec.json"
+    with open(spec_file, "w") as f:
+        json.dump(spec, f)
+    subprocess.run(
+        [sys.executable, __file__, "--terrier-worker", str(spec_file)],
+        check=True,
+    )
+    spec_file.unlink()
+
+
+def build_terrier_index(dataset_name: str, index_dir: Path):
+    """Build a Terrier 5 index (in a subprocess). Skips if already built."""
+    done_file = index_dir / ".done"
+
+    if done_file.exists():
+        print(f"Terrier index already built at {index_dir}")
+        return index_dir
+
+    run_terrier_subprocess(
+        {"action": "index", "dataset": dataset_name, "index_dir": str(index_dir)},
+        index_dir.parent,
+    )
+    return index_dir
+
+
+def terrier_worker_index(dataset, index_dir: Path):
+    """Worker-side Terrier index build."""
+    pt = init_pyterrier()
+    done_file = index_dir / ".done"
+    print(f"Building Terrier index at {index_dir}...")
+    index_dir.mkdir(parents=True, exist_ok=True)
+
+    def doc_iter():
+        for doc in tqdm(dataset.docs_iter(), desc="Indexing (Terrier)"):
+            text = doc.text if hasattr(doc, "text") else str(doc)
+            yield {"docno": doc.doc_id, "text": text}
+
+    # Terrier defaults: UTF tokenizer, Porter stemmer, Terrier stop word list.
+    # Single-pass indexing: inverted index only (no direct index), matching
+    # the search-only Pyserini index
+    indexer = pt.IterDictIndexer(
+        str(index_dir),
+        meta={"docno": 20},
+        threads=4,
+        type=pt.terrier.IndexingType.SINGLEPASS,
+    )
+    indexer.index(doc_iter())
+    done_file.touch()
+
+    return index_dir
+
+
 # --- Search ---
 
 
@@ -286,6 +361,9 @@ def search_impact_index(analyzer, scored_index, queries, top_k, method="wand"):
 
 def search_pyserini(lucene_dir, queries, top_k, k1=0.9, b=0.4):
     """Search with Pyserini BM25 and return results + timing."""
+    # pyserini.encode instantiates an OpenAI client at import time; a dummy
+    # key avoids an import error (the client is never used here)
+    os.environ.setdefault("OPENAI_API_KEY", "unused")
     from pyserini.search.lucene import LuceneSearcher
 
     searcher = LuceneSearcher(str(lucene_dir))
@@ -300,6 +378,76 @@ def search_pyserini(lucene_dir, queries, top_k, k1=0.9, b=0.4):
 
     elapsed = time.perf_counter() - start
     return results, elapsed
+
+
+def search_terrier(index_dir: Path, queries, top_k, k1=0.9, b=0.4):
+    """Search with Terrier 5 BM25 (in a subprocess) and return results + timing."""
+    out_file = index_dir.parent / "terrier_results.json"
+    run_terrier_subprocess(
+        {
+            "action": "search",
+            "index_dir": str(index_dir),
+            "queries": queries,
+            "top_k": top_k,
+            "k1": k1,
+            "b": b,
+            "out": str(out_file),
+        },
+        index_dir.parent,
+    )
+    with open(out_file) as f:
+        payload = json.load(f)
+    out_file.unlink()
+    return payload["results"], payload["elapsed"]
+
+
+def terrier_worker_search(index_dir: Path, queries, top_k, k1, b, out_file: Path):
+    """Worker-side Terrier BM25 search; writes results + timing to out_file."""
+    pt = init_pyterrier()
+
+    index = pt.IndexFactory.of(str(index_dir))
+    retriever = pt.terrier.Retriever(
+        index,
+        wmodel="BM25",
+        controls={"bm25.k_1": k1, "bm25.b": b},
+        num_results=top_k,
+    )
+
+    results = {}
+    start = time.perf_counter()
+
+    for qid, text in tqdm(queries, desc="Searching (Terrier)"):
+        # Terrier's query parser chokes on punctuation; keep alphanumerics only
+        clean = re.sub(r"[^A-Za-z0-9 ]", " ", text).strip()
+        if not clean:
+            results[qid] = []
+            continue
+        hits = retriever.search(clean)
+        results[qid] = [
+            (str(d), float(s)) for d, s in zip(hits["docno"], hits["score"])
+        ]
+
+    elapsed = time.perf_counter() - start
+    with open(out_file, "w") as f:
+        json.dump({"results": results, "elapsed": elapsed}, f)
+
+
+def terrier_worker_main(spec_file: str):
+    """Entry point for the Terrier worker subprocess."""
+    with open(spec_file) as f:
+        spec = json.load(f)
+    if spec["action"] == "index":
+        dataset = ir_datasets.load(spec["dataset"])
+        terrier_worker_index(dataset, Path(spec["index_dir"]))
+    else:
+        terrier_worker_search(
+            Path(spec["index_dir"]),
+            [(qid, text) for qid, text in spec["queries"]],
+            spec["top_k"],
+            spec["k1"],
+            spec["b"],
+            Path(spec["out"]),
+        )
 
 
 # --- Comparison ---
@@ -382,9 +530,10 @@ def get_dir_size_mb(path: Path) -> float:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark BM25: impact-index vs Pyserini"
+        description="Benchmark BM25: impact-index vs Pyserini vs Terrier 5"
     )
-    parser.add_argument("--output-dir", type=str, required=True)
+    parser.add_argument("--output-dir", type=str)
+    parser.add_argument("--terrier-worker", type=str, help=argparse.SUPPRESS)
     parser.add_argument("--dataset", type=str, default="msmarco-passage/dev/small")
     parser.add_argument(
         "--max-queries", type=int, default=0, help="Limit number of queries (0 = all)"
@@ -407,6 +556,14 @@ def main():
     )
     args = parser.parse_args()
 
+    # Terrier runs in its own subprocess (separate JVM from Pyserini)
+    if args.terrier_worker:
+        terrier_worker_main(args.terrier_worker)
+        return
+
+    if not args.output_dir:
+        parser.error("--output-dir is required")
+
     # Parse compressed index configurations
     index_configs = []
     if args.compressed_indices:
@@ -423,6 +580,7 @@ def main():
     impact_dir = output_dir / "impact_index"
     pyserini_dir = output_dir / "pyserini"
     pyserini_dir.mkdir(parents=True, exist_ok=True)
+    terrier_dir = output_dir / "terrier"
 
     print(f"Dataset: {args.dataset}")
     print(f"BM25 params: k1={args.k1}, b={args.b}")
@@ -435,6 +593,7 @@ def main():
         dataset, impact_dir, k1=args.k1, b=args.b
     )
     lucene_dir = build_pyserini_index(dataset, pyserini_dir)
+    build_terrier_index(args.dataset, terrier_dir)
 
     # Build compressed indices if requested
     compressed_scored = []
@@ -488,6 +647,13 @@ def main():
     all_results["Pyserini"] = (pyserini_results, pyserini_time)
     print(f"Time: {pyserini_time:.2f}s ({len(queries) / pyserini_time:.1f} q/s)")
 
+    print("\n--- Terrier 5 BM25 ---")
+    terrier_results, terrier_time = search_terrier(
+        terrier_dir, queries, args.top_k, k1=args.k1, b=args.b
+    )
+    all_results["Terrier 5"] = (terrier_results, terrier_time)
+    print(f"Time: {terrier_time:.2f}s ({len(queries) / terrier_time:.1f} q/s)")
+
     # --- Summary ---
     print("\n" + "=" * 60)
     print("SUMMARY")
@@ -500,6 +666,7 @@ def main():
         config_dir = output_dir / f"index_{config.get_dir_name()}"
         print(f"  {config.get_display_name()}: {get_dir_size_mb(config_dir):.2f} MB")
     print(f"  Pyserini:      {get_dir_size_mb(lucene_dir):.2f} MB")
+    print(f"  Terrier 5:     {get_dir_size_mb(terrier_dir):.2f} MB")
 
     # Search performance
     print("\nSearch performance:")
