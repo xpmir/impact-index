@@ -34,7 +34,7 @@ x86-64/AVX2):
 Result overlap with Pyserini: @10=0.985, @100=0.989. Compressed index
 is lossless (same results as raw). Analysis pipeline matches Lucene's
 EnglishAnalyzer: UAX#29 tokenizer, Porter stemmer, English possessive
-filter, and stop words. Per-step measurements live in `optimizations.md`.
+filter, and stop words.
 
 Reproduce with `examples/benchmark_bm25.py`. Terrier 5.11 runs through
 PyTerrier (single-pass index, one query at a time via
