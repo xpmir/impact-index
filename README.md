@@ -21,32 +21,96 @@ Supports both neural IR models with floating-point impact scores and traditional
 
 ## Performance
 
-BM25 on MS MARCO passage (8.8M docs, 6,980 queries, top-100, single-threaded,
-compressed index with MaxScore; measured 2026-08 on Apple M-series and
-x86-64/AVX2):
+BM25 on MS MARCO passage (8.8M docs, 6,980 queries, top-100, single-threaded;
+ARM measured 2026-08 on Apple M-series, x86 measured 2026-09 on x86-64/AVX2,
+all x86 numbers from one session so they're directly comparable):
 
 | System | ARM q/s | x86 q/s | Index size | MRR@10 |
 |--------|---------|---------|-----------|--------|
-| **impact-index** (compressed) | **278** | **101** | 0.69 GB | 0.1858 |
-| **impact-index** (compressed + reordered) | **295** | **106** | 0.66 GB | 0.1858 |
-| Pyserini (Lucene) | 213 | 90 | 0.6 GB | 0.1855 |
-| Terrier 5 (PyTerrier) | 68 | — | 1.3 GB | 0.1879 |
+| **impact-index** (compressed, MaxScore) | **278** | **99** | 0.64 GB | 0.1858 |
+| **impact-index** (compressed + reordered, MaxScore) | **295** | **106** | 0.66 GB | 0.1858 |
+| impact-index (compressed, WAND/BMW) | — | 71 | 0.64 GB | 0.1858 |
+| Pyserini (Lucene) | 213 | 109 | 0.6 GB | 0.1855 |
+| Terrier 5 (PyTerrier) | 68 | 27 | 1.3 GB | 0.1876 |
+| PISA (Block-Max WAND) | — | 172 | 0.60 GB | 0.1854 |
+| PISA (MaxScore) | — | 149 | 0.60 GB | 0.1854 |
 
-Result overlap with Pyserini: @10=0.985, @100=0.989. Compressed index
-is lossless (same results as raw). Analysis pipeline matches Lucene's
-EnglishAnalyzer: UAX#29 tokenizer, Porter stemmer, English possessive
-filter, and stop words.
+MaxScore is impact-index's headline algorithm — its own WAND/BMW is included
+above for transparency but is markedly slower at this top-k (see below), so
+comparisons elsewhere on this page use MaxScore. PISA is included with both
+of its own algorithms the same way. impact-index's WAND/BMW throughput was
+raised 50% on x86 (and 5% on ARM) by maintaining cursor order incrementally
+(a single bubble-down swap after each cursor advance) instead of a full
+`sort_by` every iteration, mirroring PISA's own `block_max_wand_query` —
+see the WAND source for details.
+
+**Every comparison above uses impact-index configured to match that row's
+own analysis pipeline, not one fixed config compared against everyone.**
+Reference systems disagree on tokenizer/stemmer/stopwords, so a single
+impact-index build compared against all of them would be an apples-to-oranges
+result for whichever ones it doesn't match. `examples/benchmark_bm25.py`
+therefore builds impact-index twice and reports two aligned comparisons:
+
+- **Lucene-aligned** (Porter stemmer, Lucene's ~33-word stopword list) —
+  matches Pyserini's own defaults. Result overlap vs Pyserini: @10=0.978,
+  @100=0.985 (identical for impact-index's MaxScore and WAND — both are
+  exact top-k algorithms, not approximate, so they must and do agree).
+- **Terrier-aligned** (Snowball/Porter2 stemmer, Terrier's own ~730-word
+  stopword list) — matches PISA's and Terrier 5's defaults. Result overlap
+  vs PISA (Block-Max WAND): @10=0.883, @100=0.908; Terrier 5 itself only
+  reaches @10=0.878 against PISA (its stemmer is classic Porter, not
+  Porter2 — a smaller residual mismatch than stopwords, which PISA and
+  Terrier 5 do share).
+
+Compressed index is lossless (same results as raw) in both configurations.
+
+Getting the Terrier-aligned overlap in that range required fixing two real
+bugs, both in impact-index's stop-word handling (surfaced by this
+alignment work, since Terrier's much larger stopword list exercises
+stemmer interaction far more than Lucene's small one does):
+1. An inflected or misspelled variant of a stop word (e.g. "whats" instead
+   of "what's"/"what is" — common in web text) doesn't exact-match the raw
+   stopword list, survives that filter, and then stems right back down to
+   the stop word itself (Snowball: "whats" → "what"), quietly re-admitting
+   it into the vocabulary as a real, scored term. Stop words are now also
+   checked *after* stemming, against a pre-stemmed copy of the stopword
+   list.
+2. Query-time analysis (`index.analyzer()`) always reconstructed stop words
+   from the language's *built-in default* list, discarding whatever custom
+   `stop_words=[...]` list the index was actually built with — so a custom
+   list like Terrier's never actually governed query-time filtering. The
+   index format now persists the real list it was built with.
+Before these fixes, the Terrier-aligned overlap vs PISA was only 0.78@10 —
+not a config mismatch, but impact-index silently scoring stray stopword
+matches that PISA correctly ignored.
 
 Reproduce with `examples/benchmark_bm25.py`. Terrier 5.11 runs through
 PyTerrier (single-pass index, one query at a time via
 `pt.terrier.Retriever`, which adds some Python overhead per query).
 Terrier uses its default exhaustive DAAT matching (`daat.Full`) — stock
 Terrier 5.11 ships no WAND/block-max dynamic pruning, unlike
-impact-index (MaxScore/BMW) and Lucene (Block-Max WAND). Terrier's
-analysis pipeline (its own stop word list and stemming) differs
-from the Lucene-matched systems, hence the different MRR@10 and a
-Pyserini overlap of only 0.70@10. Java: Terrier 5 needs Java 11+ and
-Pyserini needs Java 21 — both measured with OpenJDK (Temurin) 21.
+impact-index (MaxScore/BMW) and Lucene (Block-Max WAND). Java: Terrier 5
+needs Java 11+ and Pyserini needs Java 21 — both measured with OpenJDK
+(Temurin) 21.
+
+PISA runs through [`pyterrier-pisa`](https://github.com/terrierteam/pyterrier_pisa),
+which needs no JVM (pure C++/pybind11 bindings) but ships wheels for Linux
+x86_64 only, so there's no ARM number. Its 0.60 GB excludes the raw
+forward/inverted-index files PISA keeps on disk alongside the final index
+(same convention as impact-index's own raw-vs-compressed split).
+
+impact-index's own WAND/BMW trailing its MaxScore this much is a known,
+measured effect of top_k=100: WAND-family pruning relies on the top-k
+threshold θ rising fast enough to let the block-max bound reject candidates
+outright, but at top_k=100, θ stays low for a long time — instrumented
+counters over the full query set show 92% of the core WAND loop's
+iterations are single-document cursor catch-ups with no pruning benefit at
+all (only ~18,500 of ~234,600 loop iterations per query actually score,
+reject-on-tightening, or block-skip a candidate). This is a real property
+of the algorithm at this top-k, not a broken implementation — though PISA's
+own WAND still beating its MaxScore under the same top-k suggests there's
+implementation headroom here beyond what the algorithmic effect alone
+explains.
 
 ## Installation
 
