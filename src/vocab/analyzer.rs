@@ -24,6 +24,23 @@ fn stem_stop_words(stemmer: &dyn Stemmer, stop_words: &[&str]) -> HashSet<String
         .collect()
 }
 
+/// Tokenizer variant governing word-splitting rules.
+///
+/// `Standard` splits on UAX#29 word boundaries only. `LuceneEnglish` does
+/// the same splitting, then additionally strips a trailing English
+/// possessive ('s) before lowercasing -- matching Lucene's `EnglishAnalyzer`
+/// tokenizer chain (`StandardTokenizer` -> `EnglishPossessiveFilter`). This
+/// is a tokenizer-stage concern, not a stemming one: Porter/Snowball are
+/// defined on already-clean word forms and never see the apostrophe, so
+/// `LuceneEnglish` can be paired with any stemmer (or none).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Tokenizer {
+    #[default]
+    Standard,
+    LuceneEnglish,
+}
+
 /// Analyzer configuration, serialized with the index for reproducibility.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AnalyzerConfig {
@@ -44,8 +61,17 @@ pub struct AnalyzerConfig {
     /// bool + built-in-list behavior).
     #[serde(default)]
     pub stop_words_list: Vec<String>,
-    /// Whether English possessive filter is enabled (strip 's)
+    /// Deprecated, superseded by `tokenizer`. Still written (kept in sync
+    /// with `tokenizer`) so indices built before `tokenizer` existed still
+    /// deserialize correctly; read via [`Self::effective_tokenizer`], never
+    /// directly.
     pub english_possessive_filter: bool,
+    /// Tokenizer variant (word-splitting rules). `#[serde(default)]` so
+    /// older indices (no `tokenizer` field) deserialize as `Standard` here
+    /// and fall back to the legacy `english_possessive_filter` bool via
+    /// [`Self::effective_tokenizer`].
+    #[serde(default)]
+    pub tokenizer: Tokenizer,
 }
 
 impl Default for AnalyzerConfig {
@@ -56,6 +82,20 @@ impl Default for AnalyzerConfig {
             stop_words: false,
             stop_words_list: Vec::new(),
             english_possessive_filter: false,
+            tokenizer: Tokenizer::Standard,
+        }
+    }
+}
+
+impl AnalyzerConfig {
+    /// The tokenizer variant actually in effect, falling back to the
+    /// legacy `english_possessive_filter` bool for indices built before
+    /// `tokenizer` existed.
+    pub fn effective_tokenizer(&self) -> Tokenizer {
+        if self.tokenizer == Tokenizer::LuceneEnglish || self.english_possessive_filter {
+            Tokenizer::LuceneEnglish
+        } else {
+            Tokenizer::Standard
         }
     }
 }
@@ -143,8 +183,18 @@ impl TextAnalyzer {
     /// Enable English possessive filter (strip 's from tokens).
     /// This matches Lucene's EnglishPossessiveFilter.
     pub fn set_english_possessive_filter(&mut self, enabled: bool) {
-        self.english_possessive_filter = enabled;
-        self.config.english_possessive_filter = enabled;
+        self.set_tokenizer(if enabled {
+            Tokenizer::LuceneEnglish
+        } else {
+            Tokenizer::Standard
+        });
+    }
+
+    /// Set the tokenizer variant (word-splitting rules). See [`Tokenizer`].
+    pub fn set_tokenizer(&mut self, tokenizer: Tokenizer) {
+        self.english_possessive_filter = tokenizer == Tokenizer::LuceneEnglish;
+        self.config.tokenizer = tokenizer;
+        self.config.english_possessive_filter = self.english_possessive_filter;
     }
 
     /// Set the analyzer config (for serialization).
@@ -369,7 +419,7 @@ impl TextAnalyzer {
             stemmer,
             stop_words: HashSet::new(),
             stemmed_stop_words: HashSet::new(),
-            english_possessive_filter: config.english_possessive_filter,
+            english_possessive_filter: config.effective_tokenizer() == Tokenizer::LuceneEnglish,
             config,
         })
     }
@@ -388,7 +438,7 @@ impl TextAnalyzer {
             stemmer,
             stop_words: stop_words.iter().map(|s| s.to_string()).collect(),
             stemmed_stop_words,
-            english_possessive_filter: config.english_possessive_filter,
+            english_possessive_filter: config.effective_tokenizer() == Tokenizer::LuceneEnglish,
             config,
         })
     }
@@ -514,5 +564,36 @@ mod tests {
         assert_eq!(query.len(), 1);
         let hello_idx = analyzer.vocab().get("hello").unwrap();
         assert!(query.contains_key(&hello_idx));
+    }
+}
+
+#[cfg(test)]
+mod tokenizer_compat_tests {
+    use super::*;
+
+    #[test]
+    fn old_config_without_tokenizer_field_falls_back_to_bool() {
+        // Simulates an `analyzer.cbor` written before `tokenizer` existed:
+        // no `tokenizer` key at all, only the legacy bool.
+        #[derive(Serialize)]
+        struct OldAnalyzerConfig {
+            stemmer: String,
+            language: String,
+            stop_words: bool,
+            english_possessive_filter: bool,
+        }
+        let old = OldAnalyzerConfig {
+            stemmer: "porter".to_string(),
+            language: "english".to_string(),
+            stop_words: true,
+            english_possessive_filter: true,
+        };
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&old, &mut bytes).unwrap();
+        let config: AnalyzerConfig = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+
+        assert!(config.stop_words_list.is_empty());
+        assert_eq!(config.tokenizer, Tokenizer::Standard);
+        assert_eq!(config.effective_tokenizer(), Tokenizer::LuceneEnglish);
     }
 }

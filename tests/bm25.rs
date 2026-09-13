@@ -446,6 +446,7 @@ fn test_compressed_index_standalone() {
             stop_words: true,
             stop_words_list: stop_words.iter().map(|s| s.to_string()).collect(),
             english_possessive_filter: true,
+            tokenizer: impact_index::vocab::analyzer::Tokenizer::LuceneEnglish,
         });
 
     let docs = vec![

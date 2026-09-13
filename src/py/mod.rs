@@ -1855,12 +1855,18 @@ impl PyBOWIndexBuilder {
             // `PyTextAnalyzer::from_index` can reconstruct the real custom
             // list at query time instead of substituting the language's
             // built-in default.
+            let tokenizer = if english {
+                crate::vocab::analyzer::Tokenizer::LuceneEnglish
+            } else {
+                crate::vocab::analyzer::Tokenizer::Standard
+            };
             a.set_config(crate::vocab::analyzer::AnalyzerConfig {
                 stemmer: stemmer_name.to_string(),
                 language: lang.to_string(),
                 stop_words: !stop_word_refs.is_empty(),
                 stop_words_list: resolved_stop_words.clone(),
                 english_possessive_filter: english,
+                tokenizer,
             });
             a
         };
@@ -2182,8 +2188,9 @@ impl PyTextAnalyzer {
             ))
         })?;
 
-        analyzer.set_english_possessive_filter(config.english_possessive_filter);
+        let tokenizer = config.effective_tokenizer();
         analyzer.set_config(config);
+        analyzer.set_tokenizer(tokenizer);
 
         Ok(Self { inner: analyzer })
     }
