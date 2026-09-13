@@ -51,20 +51,44 @@ impl<C: TermCursor> BlockTermImpactIteratorWrapper<C> {
 
 struct WandSearch<C: TermCursor> {
     cur_doc: Option<DocId>,
-    iterators: Vec<BlockTermImpactIteratorWrapper<C>>,
+    // Boxed: `sort_by` below swaps elements on every pivot search (up to
+    // ~230K times per query, see wand.rs profiling notes), and this struct
+    // embeds a full compressed cursor with its own decode buffers --
+    // sorting `Vec<BlockTermImpactIteratorWrapper<C>>` directly means each
+    // swap memmoves the whole thing (144+ bytes measured for just the
+    // cursor's inner iterator). Boxing makes every swap an 8-byte pointer
+    // move instead, which is what PISA effectively gets for free by
+    // sorting `Vec<Cursor*>`.
+    iterators: Vec<Box<BlockTermImpactIteratorWrapper<C>>>,
 }
 
 impl<C: TermCursor> WandSearch<C> {
+    /// Restores sorted-by-`cached_docid` order after the cursor at `idx` has
+    /// advanced (docids only ever increase). Every call site that mutates a
+    /// cursor's position touches exactly one cursor at a time, so a full
+    /// `sort_by` after each step is wasted work once the array is already
+    /// sorted: only the moved element can be out of place, and since it only
+    /// got *larger* it can only need to move right. This mirrors PISA's
+    /// `block_max_wand_query`, which sorts once up front and then bubbles
+    /// the advanced cursor into place (`ordered_cursors[i] <=> [i-1]` swap
+    /// loop) instead of re-sorting -- see block_max_wand_query.hpp.
+    fn bubble_right(&mut self, mut idx: usize) {
+        while idx + 1 < self.iterators.len()
+            && self.iterators[idx].cached_docid > self.iterators[idx + 1].cached_docid
+        {
+            self.iterators.swap(idx, idx + 1);
+            idx += 1;
+        }
+    }
+
     /// Phase 1: Find pivot using global max scores.
     ///
-    /// Sorts iterators by cached docid and accumulates global `max_value()` until the
-    /// sum exceeds `theta`. Returns the pivot index extended to include all
+    /// Assumes `self.iterators` is already sorted by `cached_docid` (an
+    /// invariant maintained by `advance`/`bubble_right`, established once at
+    /// construction) and accumulates global `max_value()` until the sum
+    /// exceeds `theta`. Returns the pivot index extended to include all
     /// cursors at the same docid.
     fn find_pivot_term(&mut self, theta: f32) -> Option<usize> {
-        // Sort iterators by cached docid (no vtable calls)
-        self.iterators
-            .sort_by(|a, b| a.cached_docid.cmp(&b.cached_docid));
-
         // Accumulate global max scores until we exceed theta
         let mut upper_bound = 0.;
         for (ix, iterator) in self.iterators.iter().enumerate() {
@@ -89,6 +113,8 @@ impl<C: TermCursor> WandSearch<C> {
         // Pick term 0: smallest docid after sort, makes the most alignment progress
         if !self.iterators[0].advance_to(pivot) {
             self.iterators.remove(0);
+        } else {
+            self.bubble_right(0);
         }
     }
 
@@ -156,6 +182,8 @@ impl<C: TermCursor> WandSearch<C> {
 
                         if !self.iterators[best_ix].advance_to(next) {
                             self.iterators.remove(best_ix);
+                        } else {
+                            self.bubble_right(best_ix);
                         }
                     }
                 } else {
@@ -215,11 +243,11 @@ fn search_wand_dyn<'a>(
 
         let iterator = index.block_iterator(ix);
 
-        let mut wrapper = BlockTermImpactIteratorWrapper {
+        let mut wrapper = Box::new(BlockTermImpactIteratorWrapper {
             iterator,
             query_weight: weight,
             cached_docid: 0,
-        };
+        });
         if wrapper.iterator.next_min_doc_id(0).is_some() {
             wrapper.cached_docid = wrapper.iterator.current().docid;
             iterators.push(wrapper)
@@ -253,11 +281,11 @@ fn search_wand_bm25_compressed(
 
         if cursor.next_min_doc_id(0).is_some() {
             let cached_docid = cursor.current().docid;
-            iterators.push(BlockTermImpactIteratorWrapper {
+            iterators.push(Box::new(BlockTermImpactIteratorWrapper {
                 iterator: cursor,
                 query_weight: weight,
                 cached_docid,
-            });
+            }));
         }
     }
 
@@ -285,11 +313,11 @@ pub fn search_wand_cursors<'a>(
     for (weight, mut iterator) in cursors {
         if iterator.next_min_doc_id(0).is_some() {
             let cached_docid = iterator.current().docid;
-            iterators.push(BlockTermImpactIteratorWrapper {
+            iterators.push(Box::new(BlockTermImpactIteratorWrapper {
                 iterator,
                 query_weight: weight,
                 cached_docid,
-            });
+            }));
         }
     }
     search_wand_core(iterators, top_k)
@@ -298,13 +326,20 @@ pub fn search_wand_cursors<'a>(
 /// Shared WAND loop, generic over the cursor type `C` (P3): monomorphized
 /// once per (index, scorer) combination that reaches it.
 fn search_wand_core<C: TermCursor>(
-    iterators: Vec<BlockTermImpactIteratorWrapper<C>>,
+    iterators: Vec<Box<BlockTermImpactIteratorWrapper<C>>>,
     top_k: usize,
 ) -> Vec<ScoredDocument> {
     let mut search = WandSearch {
         cur_doc: None,
         iterators,
     };
+    // One-time sort: `find_pivot_term` assumes `iterators` is sorted by
+    // `cached_docid` and relies on `advance`/`bubble_right` to maintain that
+    // invariant afterwards (see `bubble_right` doc comment) -- insertion
+    // order here is arbitrary (construction order follows query term order).
+    search
+        .iterators
+        .sort_by(|a, b| a.cached_docid.cmp(&b.cached_docid));
 
     let mut results = TopScoredDocuments::new(top_k);
     let mut theta: ImpactValue = 0.;
@@ -393,6 +428,7 @@ mod tests {
                 in_memory_threshold: 128,
                 checkpoint_frequency: 0,
                 checkpoint_flush_ratio: 0.5,
+                positions: false,
             },
         );
 

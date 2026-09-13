@@ -420,6 +420,7 @@ mod tests {
                 in_memory_threshold: 128,
                 checkpoint_frequency: 0,
                 checkpoint_flush_ratio: 0.5,
+                positions: false,
             },
         );
 
