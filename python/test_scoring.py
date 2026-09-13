@@ -119,6 +119,110 @@ class TestBOWIndexBuilder:
         results = scored.search_wand(query, 10)
         assert len(results) > 0
 
+    def test_stop_words_true_matches_lucene(self, tmp_path):
+        # `stop_words=True` is a back-compat alias for `stop_words="lucene"`
+        # and must stay that way -- see get_stop_words tests below and
+        # src/vocab/stopwords.rs::test_lucene_family_matches_get_stop_words.
+        text = "the cat and the dog are running in the wide open field"
+
+        d_true = str(tmp_path / "bow_true")
+        import os
+
+        os.makedirs(d_true)
+        b_true = impact_index.BOWIndexBuilder(
+            d_true,
+            dtype="int32",
+            stemmer="snowball",
+            language="english",
+            stop_words=True,
+        )
+        b_true.add_text(0, text)
+        index_true = b_true.build(True)
+
+        d_lucene = str(tmp_path / "bow_lucene")
+        os.makedirs(d_lucene)
+        b_lucene = impact_index.BOWIndexBuilder(
+            d_lucene,
+            dtype="int32",
+            stemmer="snowball",
+            language="english",
+            stop_words="lucene",
+        )
+        b_lucene.add_text(0, text)
+        index_lucene = b_lucene.build(True)
+
+        # Same vocabulary size: both builds dropped exactly the same words.
+        assert index_true.num_postings() == index_lucene.num_postings()
+
+        analyzer_true = impact_index.TextAnalyzer.from_index(d_true)
+        analyzer_lucene = impact_index.TextAnalyzer.from_index(d_lucene)
+        # "the" and "are" are Lucene stop words; both builds must drop them.
+        assert analyzer_true.analyze_query("the are") == {}
+        assert analyzer_lucene.analyze_query("the are") == {}
+        assert analyzer_true.analyze_query(text) == analyzer_lucene.analyze_query(text)
+
+    def test_stop_words_terrier_is_a_superset_of_lucene(self, tmp_path):
+        # "however", "particular", "several" are in Terrier's list but not
+        # Lucene's 33-word list -- verified against
+        # src/vocab/stopwords/{terrier,lucene}/english*.txt.
+        #
+        # Terrier's family filters post-stem only, against the RAW word
+        # list (matching real PISA -- see `StopWordFilterMode::PostStem`),
+        # so a word is only actually caught if its own stem happens to
+        # equal its raw form. "particular" stems to itself ("particular"),
+        # so it's still caught. "however" and "several" stem to "howev"
+        # and "sever" respectively -- neither matches the raw list entry,
+        # so PISA's real algorithm (faithfully reproduced here) does NOT
+        # remove them, even though they're nominally "in the list". This
+        # is an intentional, documented quirk of matching PISA exactly, not
+        # a bug.
+        text = (
+            "the cat and the dog are however running in a particular "
+            "and several wide open field"
+        )
+
+        d_lucene = str(tmp_path / "bow_lucene2")
+        import os
+
+        os.makedirs(d_lucene)
+        b_lucene = impact_index.BOWIndexBuilder(
+            d_lucene,
+            dtype="int32",
+            stemmer="snowball",
+            language="english",
+            stop_words="lucene",
+        )
+        b_lucene.add_text(0, text)
+        index_lucene = b_lucene.build(True)
+
+        d_terrier = str(tmp_path / "bow_terrier")
+        os.makedirs(d_terrier)
+        b_terrier = impact_index.BOWIndexBuilder(
+            d_terrier,
+            dtype="int32",
+            stemmer="snowball",
+            language="english",
+            stop_words="terrier",
+        )
+        b_terrier.add_text(0, text)
+        index_terrier = b_terrier.build(True)
+
+        # Terrier's much longer list removes more words than Lucene's on
+        # this sentence (it drops "particular" too, which Lucene doesn't).
+        assert index_terrier.num_postings() < index_lucene.num_postings()
+
+        # Reload each from its saved config and confirm the family that was
+        # actually used survives a reload (not silently falling back).
+        analyzer_terrier = impact_index.TextAnalyzer.from_index(d_terrier)
+        # "particular" stems to itself, so Terrier's post-stem-against-raw
+        # check catches it.
+        assert analyzer_terrier.analyze_query("particular") == {}
+        # "however" stems to "howev", which isn't in the raw list -- PISA's
+        # literal algorithm does not catch this, and neither do we.
+        assert len(analyzer_terrier.analyze_query("however")) > 0
+        analyzer_lucene = impact_index.TextAnalyzer.from_index(d_lucene)
+        assert len(analyzer_lucene.analyze_query("however")) > 0
+
     def test_doc_metadata_copy_files(self, rng, tmp_path):
         src = str(tmp_path / "src")
         dst = str(tmp_path / "dst")

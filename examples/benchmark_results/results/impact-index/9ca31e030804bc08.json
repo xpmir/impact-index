@@ -1,0 +1,48 @@
+{
+  "config_name": "no-stopwords",
+  "fields": {
+    "algorithm": "maxscore",
+    "b": 0.4,
+    "dataset": "msmarco-passage/dev/small",
+    "index_key": "861d50ea236cd9dd",
+    "k1": 0.9,
+    "max_queries": 0,
+    "top_k": 100
+  },
+  "group": "ablation-porter",
+  "mrr_at_10": 0.1863264656387868,
+  "n_queries": 6980,
+  "samples": [
+    {
+      "elapsed_s": 91.7022029813379,
+      "host": "xian",
+      "qps": 76.11594676106618,
+      "timestamp": "2026-09-13T16:24:59.244741+00:00"
+    },
+    {
+      "elapsed_s": 91.52352381497622,
+      "host": "xian",
+      "qps": 76.2645460866515,
+      "timestamp": "2026-09-13T16:26:30.838014+00:00"
+    },
+    {
+      "elapsed_s": 91.38996551185846,
+      "host": "xian",
+      "qps": 76.37599993507271,
+      "timestamp": "2026-09-13T16:28:02.303883+00:00"
+    },
+    {
+      "elapsed_s": 91.55234764330089,
+      "host": "xian",
+      "qps": 76.24053538413817,
+      "timestamp": "2026-09-13T16:29:33.924871+00:00"
+    },
+    {
+      "elapsed_s": 91.37082435004413,
+      "host": "xian",
+      "qps": 76.39199984952997,
+      "timestamp": "2026-09-13T16:31:05.355170+00:00"
+    }
+  ],
+  "system": "impact-index"
+}

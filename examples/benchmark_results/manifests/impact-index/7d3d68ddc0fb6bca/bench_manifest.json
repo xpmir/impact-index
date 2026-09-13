@@ -1,0 +1,21 @@
+{
+  "build_seconds": 886.4614936672151,
+  "built_at": "2026-09-13T17:34:07.003146+00:00",
+  "config_name": "impact-index (compressed + reordered, MaxScore)",
+  "fields": {
+    "compression": {
+      "block_size": 128,
+      "nbits": 0,
+      "reorder": true,
+      "split_quantiles": null
+    },
+    "dataset": "msmarco-passage/dev/small",
+    "positions": false,
+    "stemmer": "porter",
+    "stop_words": "lucene",
+    "system": "impact-index"
+  },
+  "host": "xian",
+  "impact_index_version": null,
+  "index_key": "7d3d68ddc0fb6bca"
+}

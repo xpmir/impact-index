@@ -125,6 +125,18 @@ For traditional IR with BM25 scoring, use
 :class:`~impact_index.IndexBuilder`. It automatically tracks document
 lengths and optionally integrates text analysis (tokenization + stemming).
 
+.. note::
+
+    :class:`~impact_index.BOWIndexBuilder` is a layer on top of the same
+    storage engine as :class:`~impact_index.IndexBuilder`: a BOW index
+    *is* a sparse impact index (postings, WAND/MaxScore search,
+    compression, BMP conversion all apply unchanged), where the "impact
+    value" happens to be a raw or analyzer-computed term frequency. What
+    ``BOWIndexBuilder`` adds on top is bookkeeping BM25 needs but a raw
+    impact index doesn't: per-document length tracking and, optionally,
+    the text analysis pipeline (tokenizer, stemmer, stop words,
+    vocabulary) described below.
+
 Pre-tokenized input
 ~~~~~~~~~~~~~~~~~~~
 
@@ -188,12 +200,54 @@ vocabulary management:
     query = index.analyzer().analyze_query("quick fox")
     results = scored.search_maxscore(query, top_k=10)
 
+Choosing a stemmer
+~~~~~~~~~~~~~~~~~~
+
+Two stemmers are available via ``stemmer=``:
+
+- ``"porter"`` — a direct port of Lucene's ``PorterStemFilter``. Pick this
+  to match Lucene/Anserini/Pyserini defaults as closely as possible
+  (useful when comparing results against, or reproducing, Pyserini runs).
+- ``"snowball"`` — the classic Porter2/Snowball algorithm. Pick this to
+  match PISA/Terrier defaults instead — both use Snowball-family stemmers.
+- ``None`` (default) — no stemming.
+
+The two disagree on some common words (e.g. "community", "day", "use"
+stem differently), so pick based on which system you're comparing against
+or reproducing rather than assuming they're interchangeable. See the
+top-level README's Performance section for a benchmark of both
+configurations against their respective reference systems.
+
+Tokenizer variant
+~~~~~~~~~~~~~~~~~~
+
+Besides stemming, the analyzer also picks a tokenizer variant at the Rust
+level (``Tokenizer::Standard`` vs ``Tokenizer::LuceneEnglish``,
+``src/vocab/analyzer.rs``). ``LuceneEnglish`` additionally strips a
+trailing English possessive (``'s``) before lowercasing, matching
+Lucene's ``EnglishAnalyzer`` tokenizer chain (``StandardTokenizer`` ->
+``EnglishPossessiveFilter``); this is a tokenization concern, not a
+stemming one, so it composes with any stemmer choice (or none).
+
+.. note::
+
+    This isn't a separate ``BOWIndexBuilder`` argument: the possessive
+    filter is enabled automatically whenever ``language="english"`` (the
+    default), for *any* stemmer choice, and left off for every other
+    language. There is currently no way to analyze English text without
+    possessive-stripping through ``BOWIndexBuilder`` — use the lower-level
+    Rust ``TextAnalyzer`` API directly if you need that.
+
 Stop words
 ~~~~~~~~~~
 
 Stop words (common words like "the", "is", "a") can be filtered during
 indexing and querying to reduce index size and improve search speed.
-Built-in stop word lists from Lucene are available for 17 languages.
+Two built-in *families* are available, selectable independently of the
+stemmer/language settings: ``"lucene"`` (default; short, per-language
+lists matching Lucene's language analyzers, 17 languages) and
+``"terrier"`` (Terrier's own, much longer list — the default PISA and
+Terrier 5 themselves use; English only).
 
 .. code-block:: python
 
@@ -207,6 +261,14 @@ Built-in stop word lists from Lucene are available for 17 languages.
         stop_words=True,
     )
 
+    # Or select the Terrier family (matches PISA/Terrier 5 defaults)
+    builder = impact_index.BOWIndexBuilder(
+        "/path/to/index",
+        stemmer="snowball",
+        language="english",
+        stop_words="terrier",
+    )
+
     # Or provide an explicit list
     builder = impact_index.BOWIndexBuilder(
         "/path/to/index",
@@ -214,20 +276,41 @@ Built-in stop word lists from Lucene are available for 17 languages.
         stop_words=["the", "a", "is", "in"],
     )
 
-    # Get the stop word list for any supported language
-    words = impact_index.get_stop_words("english")   # 33 words (Lucene default)
-    words = impact_index.get_stop_words("french")     # 154 words
-    words = impact_index.get_stop_words("german")     # 231 words
+    # Get the stop word list for any supported language/family
+    words = impact_index.get_stop_words("english")              # 33 words (Lucene default)
+    words = impact_index.get_stop_words("french")                # 154 words (Lucene)
+    words = impact_index.get_stop_words("german")                 # 231 words (Lucene)
+    words = impact_index.get_stop_words("english", "terrier")     # 733 words (Terrier)
 
-Supported languages: arabic, danish, dutch, english, finnish, french,
-german, greek, hungarian, italian, norwegian, portuguese, romanian,
-russian, spanish, swedish, turkish.
+Supported Lucene-family languages: arabic, danish, dutch, english,
+finnish, french, german, greek, hungarian, italian, norwegian,
+portuguese, romanian, russian, spanish, swedish, turkish. The Terrier
+family covers English only; requesting it for another language raises
+an error rather than silently substituting a Lucene list.
+
+``stop_words=True`` is a permanent alias for ``stop_words="lucene"``, and
+the family (or custom list) an index was built with is saved and
+restored automatically on reload.
 
 .. note::
 
     For fair comparison with Pyserini/Lucene, always enable stop words.
     Without them, high-frequency terms like "the" create very long
     posting lists that slow down search significantly.
+
+.. note::
+
+    Stop-word filtering is applied at a different pipeline stage per
+    family, matching each family's reference system exactly: the
+    ``"lucene"`` family filters the raw token *before* stemming (as
+    Lucene's ``EnglishAnalyzer`` does), while the ``"terrier"`` family
+    stems first and then filters the *stemmed* token against the raw
+    (never-stemmed) stop-word list (as PISA's analyzer does) — so an
+    inflected form like "however" (stemming to "howev") is *not* caught
+    even under the Terrier family, matching PISA's own behavior rather
+    than being over-aggressively filtered. A custom ``stop_words=[...]``
+    list checks both stages, since there's no single reference pipeline
+    to match.
 
 Loading a saved index
 ~~~~~~~~~~~~~~~~~~~~~
@@ -246,6 +329,78 @@ The index automatically detects and loads auxiliary components
     analyzer = index.analyzer()
     query = analyzer.analyze_query("quick fox")
     results = scored.search_maxscore(query, top_k=10)
+
+Token positions
+~~~~~~~~~~~~~~~
+
+By default, a BOW index stores only term frequencies — enough for BM25,
+but not enough to know whether two terms were adjacent. Building with
+``positions=True`` additionally records each term's token positions
+within each document, which the phrase (``#1``) and window (``#uwN``)
+structured query operators below need to evaluate.
+
+.. code-block:: python
+
+    builder = impact_index.BOWIndexBuilder(
+        "/path/to/index",
+        stemmer="porter",
+        stop_words=True,
+        positions=True,
+    )
+    builder.add_text(0, "the quick brown fox jumps over the lazy dog")
+    builder.add_text(1, "a quick brown cat jumps high")
+    index = builder.build(in_memory=True)
+
+.. note::
+
+    From Python, positional indexing only goes through text: with
+    ``positions=True``, ``add_text``/``add_texts`` work as usual, but the
+    pre-tokenized ``add(docid, terms, values)`` method raises an error
+    instead (its message points to a Rust-only ``add_with_positions``
+    method that isn't exposed to Python). Positions are stored per block
+    and decoded lazily, so a query without ``#1``/``#uwN`` pays no extra
+    cost at search time — the cost is the extra on-disk positions data
+    written at build time.
+
+Structured queries
+~~~~~~~~~~~~~~~~~~
+
+Beyond flat ``{term_id: weight}`` dicts,
+:meth:`~impact_index.Index.search_wand_query` /
+:meth:`~impact_index.Index.search_maxscore_query` (and the
+:class:`~impact_index.ScoredIndex` equivalents) accept Terrier-matchop-style
+structured queries, evaluated as "virtual" posting lists on top of the
+same WAND/MaxScore dynamic pruning used for flat queries:
+
+- ``#combine(...)`` — weighted sum of children (the default combinator
+  when a query has multiple terms); ``#combine:0=2:1=1(quick fox)``
+  weights the first child 2x and the second 1x.
+- ``#syn(t1 t2 ...)`` — synonyms/OR: term frequencies are summed and the
+  merged postings scored as a single virtual term.
+- ``#band(n1 n2 ...)`` — boolean AND: only documents containing every
+  child match; score is the sum of the children's scores.
+- ``#1(t1 t2 ...)`` — exact phrase, adjacent positions only. **Requires
+  an index built with** ``positions=True``.
+- ``#uwN(t1 t2 ...)`` — unordered window: all terms within ``N`` tokens
+  of each other, any order. **Requires positions**, same as ``#1``.
+
+.. code-block:: python
+
+    scored = index.with_scoring(impact_index.BM25Scoring())
+
+    results = scored.search_wand_query(
+        "#combine(#1(new york) #syn(city town) #band(guide budget))",
+        top_k=10,
+    )
+
+A matchop string is resolved against the index's own analyzer (the same
+tokenizer/stemmer/stop words used at indexing time), so it requires an
+index built via ``BOWIndexBuilder``. You can also build the query tree
+directly from term ids, with no analyzer involved, as nested dicts:
+``{"term": ix}`` (or ``{"term": [ix, weight]}``), ``{"combine": [[w1,
+node1], ...]}``, ``{"syn": [ix, ...]}``, ``{"band": [node, ...]}``,
+``{"phrase": [ix, ...]}``, or ``{"window": {"terms": [ix, ...], "width":
+N}}``.
 
 
 .. _compression:
@@ -561,3 +716,66 @@ Async retrieval
 
     docs = await store.aio_get_by_number([0, 1, 2])
     docs = await store.aio_get_by_key("docno", ["DOC001", "DOC002"])
+
+Internal DocId vs external identifiers
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The index and the document store each keep their own, independent
+numbering, and impact-index does not maintain a mapping between them:
+
+- The index only ever knows the internal ``DocId`` (``u64``) you pass to
+  ``add``/``add_text`` — a plain sequential counter with no notion of a
+  corpus's own document identifier (e.g. a TREC ``docno``). Postings and
+  search results are all expressed in terms of this id.
+- :class:`~impact_index.DocumentStoreBuilder` assigns its own sequential
+  ``internal_id`` purely from call order: ``builder.add(keys, content)``
+  takes no doc id argument at all — the first call gets internal id 0,
+  the second 1, and so on. Its *only* id-based lookup is
+  :meth:`~impact_index.DocumentStore.get_by_key`, which maps a key field
+  you chose (e.g. ``"docno"``) to that internal sequential number via an
+  FST. There is no lookup from an index ``DocId`` to a store key, or vice
+  versa, anywhere in the library.
+
+In practice, the way to tie the two together is to build both structures
+in lockstep — feeding them the same documents in the same order, with
+contiguous ids starting at 0 — and to keep the corpus's own identifier as
+a key field in the store:
+
+.. code-block:: python
+
+    index_builder = impact_index.BOWIndexBuilder("/path/to/index", stemmer="porter")
+    store_builder = impact_index.DocumentStoreBuilder("/path/to/store")
+
+    for docid, doc in enumerate(documents):        # docid: 0, 1, 2, ...
+        index_builder.add_text(docid, doc.text)
+        store_builder.add({"docno": doc.external_id}, doc.text.encode())
+
+    index = index_builder.build(in_memory=True)
+    store_builder.build()
+
+Because both were fed the same documents in the same order, the store's
+sequential number *is* the index's ``DocId`` — so after search,
+``store.get_by_number(docid)`` retrieves the exact document that was
+scored:
+
+.. code-block:: python
+
+    store = impact_index.DocumentStore.load("/path/to/store")
+    scored = index.with_scoring(impact_index.BM25Scoring())
+    results = scored.search_maxscore(query, top_k=10)
+
+    for hit in results:
+        doc = store.get_by_number([hit.docid])[0]
+        print(doc.keys["docno"], hit.score, doc.content)
+
+    # Going the other way -- external id to content, no search involved:
+    doc = store.get_by_key("docno", ["W1234"])[0]
+
+This convention breaks silently if the two are ever built out of lockstep
+(e.g. documents filtered/skipped on one side but not the other, or
+non-contiguous ``DocId`` values) — nothing validates the correspondence,
+so it is entirely the caller's responsibility. It does survive
+:meth:`~impact_index.Index.reorder`: reordering renumbers ids internally
+for storage locality, but search results are always translated back to
+the *original* ``DocId`` automatically, which is what the store was built
+against.

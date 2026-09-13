@@ -1,0 +1,48 @@
+{
+  "config_name": "PISA (MaxScore)",
+  "fields": {
+    "algorithm": "block_max_maxscore",
+    "b": 0.4,
+    "dataset": "msmarco-passage/dev/small",
+    "index_key": "daf4aeead5c6f034",
+    "k1": 0.9,
+    "max_queries": 0,
+    "top_k": 100
+  },
+  "group": "terrier-aligned",
+  "mrr_at_10": 0.18536606858598273,
+  "n_queries": 6980,
+  "samples": [
+    {
+      "elapsed_s": 48.368081076070666,
+      "host": "xian",
+      "qps": 144.31004589622316,
+      "timestamp": "2026-09-13T18:35:10.170089+00:00"
+    },
+    {
+      "elapsed_s": 48.79844702221453,
+      "host": "xian",
+      "qps": 143.03733880757503,
+      "timestamp": "2026-09-13T18:35:59.031296+00:00"
+    },
+    {
+      "elapsed_s": 48.4470531642437,
+      "host": "xian",
+      "qps": 144.07481041904902,
+      "timestamp": "2026-09-13T18:36:47.535487+00:00"
+    },
+    {
+      "elapsed_s": 48.55636647902429,
+      "host": "xian",
+      "qps": 143.75045964395355,
+      "timestamp": "2026-09-13T18:37:36.149043+00:00"
+    },
+    {
+      "elapsed_s": 48.564189536497,
+      "host": "xian",
+      "qps": 143.7273033199573,
+      "timestamp": "2026-09-13T18:38:24.802009+00:00"
+    }
+  ],
+  "system": "pisa"
+}

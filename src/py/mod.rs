@@ -1781,8 +1781,14 @@ impl PyBOWIndexBuilder {
     ///     dtype: Data type for term frequencies ("int32", "int64", "float32").
     ///     stemmer: Stemmer to use ("snowball" or None).
     ///     language: Language for the stemmer (default: "english").
-    ///     stop_words: Stop words to filter. Either a list of strings, or
-    ///         ``True`` to use the default Lucene stop words for the language.
+    ///     stop_words: Stop words to filter. One of:
+    ///         - a list of strings (used verbatim);
+    ///         - ``True`` (alias for ``"lucene"``, for backward compatibility);
+    ///         - ``"lucene"`` or ``"terrier"`` (case-insensitive) to use the
+    ///           built-in list for that family and ``language``. Terrier only
+    ///           ships a stop word list for English; other languages are
+    ///           Lucene-only.
+    ///         - ``None`` for no stop words.
     ///     positions: Store token positions alongside postings, enabling
     ///         phrase (``#1``) / window (``#uwN``) structured queries later
     ///         (``search_wand_query``/``search_maxscore_query``). Opt-in:
@@ -1809,11 +1815,19 @@ impl PyBOWIndexBuilder {
         let dtype_str = dtype.unwrap_or("int32");
         let lang = language.unwrap_or("english");
 
-        // Resolve stop words: True = use language default, list = explicit, None = no stop words
+        // Resolve stop words: True/"lucene"/"terrier" = built-in family list,
+        // list = explicit, None = no stop words. `resolved_family` is kept
+        // alongside the resolved words purely so it can be persisted in
+        // `AnalyzerConfig` for introspection -- reload always uses the exact
+        // words in `resolved_stop_words`/`stop_words_list`, never the family
+        // alone (see the `AnalyzerConfig::stop_words_family` doc comment).
+        let mut resolved_family: Option<crate::vocab::stopwords::StopWordFamily> = None;
         let resolved_stop_words: Vec<String> = match stop_words {
             Some(obj) => {
                 if let Ok(true) = obj.extract::<bool>() {
-                    // True: use default stop words for the language
+                    // True: alias for "lucene", by design -- this is the
+                    // back-compat path and must always mean Lucene.
+                    resolved_family = Some(crate::vocab::stopwords::StopWordFamily::Lucene);
                     crate::vocab::stopwords::get_stop_words(lang)
                         .ok_or_else(|| {
                             pyo3::exceptions::PyValueError::new_err(format!(
@@ -1824,11 +1838,25 @@ impl PyBOWIndexBuilder {
                         .into_iter()
                         .map(|s| s.to_string())
                         .collect()
+                } else if let Ok(family_str) = obj.extract::<String>() {
+                    let family = crate::vocab::stopwords::StopWordFamily::from_str(&family_str)
+                        .map_err(pyo3::exceptions::PyValueError::new_err)?;
+                    resolved_family = Some(family);
+                    crate::vocab::stopwords::get_stop_words_for_family(lang, family)
+                        .ok_or_else(|| {
+                            pyo3::exceptions::PyValueError::new_err(format!(
+                                "No built-in {} stop words for language '{}'",
+                                family, lang
+                            ))
+                        })?
+                        .into_iter()
+                        .map(|s| s.to_string())
+                        .collect()
                 } else if let Ok(list) = obj.extract::<Vec<String>>() {
                     list
                 } else {
                     return Err(pyo3::exceptions::PyTypeError::new_err(
-                        "stop_words must be True, a list of strings, or None",
+                        "stop_words must be True, 'lucene', 'terrier', a list of strings, or None",
                     ));
                 }
             }
@@ -1836,6 +1864,21 @@ impl PyBOWIndexBuilder {
         };
 
         let stop_word_refs: Vec<&str> = resolved_stop_words.iter().map(|s| s.as_str()).collect();
+
+        // Which pipeline stage(s) stop words are checked at follows directly
+        // from the requested family (see `StopWordFilterMode` docs):
+        // Lucene = pre-stem only, Terrier = post-stem only (against the raw
+        // list), no family (custom list, or no stop words at all) = both,
+        // preserving pre-existing behavior for callers not using a preset.
+        let filter_mode = match resolved_family {
+            Some(crate::vocab::stopwords::StopWordFamily::Lucene) => {
+                crate::vocab::analyzer::StopWordFilterMode::PreStem
+            }
+            Some(crate::vocab::stopwords::StopWordFamily::Terrier) => {
+                crate::vocab::analyzer::StopWordFilterMode::PostStem
+            }
+            None => crate::vocab::analyzer::StopWordFilterMode::Both,
+        };
 
         let make_analyzer = |stemmer_name: &str,
                              stemmer_box: Box<dyn crate::vocab::stemmer::Stemmer>,
@@ -1846,6 +1889,7 @@ impl PyBOWIndexBuilder {
             } else {
                 TextAnalyzer::with_stop_words(stemmer_box, &stop_word_refs)
             };
+            a.set_stop_words_filter_mode(filter_mode);
             // Enable English possessive filter for English stemmers
             if english {
                 a.set_english_possessive_filter(true);
@@ -1865,6 +1909,8 @@ impl PyBOWIndexBuilder {
                 language: lang.to_string(),
                 stop_words: !stop_word_refs.is_empty(),
                 stop_words_list: resolved_stop_words.clone(),
+                stop_words_family: resolved_family.map(|f| f.as_str().to_string()),
+                stop_words_filter_mode: filter_mode,
                 english_possessive_filter: english,
                 tokenizer,
             });
@@ -2158,14 +2204,23 @@ impl PyTextAnalyzer {
         };
 
         // Recreate stop words from config. `stop_words_list` holds the exact
-        // list a custom `stop_words=[...]` build used; fall back to the
-        // language's built-in default only for indices built before that
-        // field existed (where `stop_words_list` is empty but `stop_words`
-        // is true).
+        // list a build used (Lucene, Terrier, or a custom `stop_words=[...]`
+        // list alike -- it's always the resolved words, not a reference to
+        // them) and takes precedence whenever non-empty. Only indices built
+        // before that field existed have it empty while `stop_words` is
+        // true; for those, reconstruct from `stop_words_family` (itself
+        // `#[serde(default)]`, so those same old indices have it `None` too)
+        // falling back to the Lucene list, which is what `stop_words` alone
+        // ever meant before either field existed.
         let stop_words = if !config.stop_words_list.is_empty() {
             config.stop_words_list.clone()
         } else if config.stop_words {
-            crate::vocab::stopwords::get_stop_words(&config.language)
+            let family = config
+                .stop_words_family
+                .as_deref()
+                .and_then(|f| crate::vocab::stopwords::StopWordFamily::from_str(f).ok())
+                .unwrap_or(crate::vocab::stopwords::StopWordFamily::Lucene);
+            crate::vocab::stopwords::get_stop_words_for_family(&config.language, family)
                 .unwrap_or_default()
                 .iter()
                 .map(|s| s.to_string())
@@ -2188,9 +2243,18 @@ impl PyTextAnalyzer {
             ))
         })?;
 
+        // `stop_words_filter_mode` governs which of the pre-stem/post-stem
+        // checks actually run (see `StopWordFilterMode`); it's independent
+        // of which words ended up in `stop_word_refs` above, so it's
+        // applied here explicitly rather than inferred from the loaded
+        // list. `#[serde(default)]` on the field means a pre-existing
+        // index without it deserializes as `Both`, so this correctly keeps
+        // reproducing the old "check both" behavior for those indices.
+        let filter_mode = config.stop_words_filter_mode;
         let tokenizer = config.effective_tokenizer();
         analyzer.set_config(config);
         analyzer.set_tokenizer(tokenizer);
+        analyzer.set_stop_words_filter_mode(filter_mode);
 
         Ok(Self { inner: analyzer })
     }
@@ -2239,15 +2303,28 @@ fn impact_index(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyTextAnalyzer>()?;
 
     // Functions
+    /// Get the built-in stop word list for a language and family.
+    ///
+    /// Args:
+    ///     language: Language name (e.g. "english", "french").
+    ///     family: ``"lucene"`` (default, unchanged from before this
+    ///         parameter existed) or ``"terrier"``. Terrier only has an
+    ///         English list; other languages are Lucene-only.
     #[pyfn(module)]
     #[pyo3(name = "get_stop_words")]
-    fn py_get_stop_words(language: &str) -> PyResult<Vec<String>> {
-        crate::vocab::stopwords::get_stop_words(language)
+    #[pyo3(signature = (language, family=None))]
+    fn py_get_stop_words(language: &str, family: Option<&str>) -> PyResult<Vec<String>> {
+        let family = match family {
+            None => crate::vocab::stopwords::StopWordFamily::Lucene,
+            Some(f) => crate::vocab::stopwords::StopWordFamily::from_str(f)
+                .map_err(pyo3::exceptions::PyValueError::new_err)?,
+        };
+        crate::vocab::stopwords::get_stop_words_for_family(language, family)
             .map(|words| words.into_iter().map(|s| s.to_string()).collect())
             .ok_or_else(|| {
                 pyo3::exceptions::PyValueError::new_err(format!(
-                    "No stop words for language '{}'",
-                    language
+                    "No {} stop words for language '{}'",
+                    family, language
                 ))
             })
     }

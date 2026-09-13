@@ -1,0 +1,12 @@
+{
+  "build_seconds": 425.88008352182806,
+  "built_at": "2026-09-13T18:03:46.593805+00:00",
+  "config_name": "Terrier 5 (PyTerrier)",
+  "fields": {
+    "dataset": "msmarco-passage/dev/small",
+    "system": "terrier"
+  },
+  "host": "xian",
+  "impact_index_version": null,
+  "index_key": "b2d6463f8bc7bc41"
+}

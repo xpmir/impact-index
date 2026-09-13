@@ -1,0 +1,48 @@
+{
+  "config_name": "lucene-stopwords_positions",
+  "fields": {
+    "algorithm": "maxscore",
+    "b": 0.4,
+    "dataset": "msmarco-passage/dev/small",
+    "index_key": "ef448fa223a3ec85",
+    "k1": 0.9,
+    "max_queries": 0,
+    "top_k": 100
+  },
+  "group": "ablation-porter",
+  "mrr_at_10": 0.18579234320280177,
+  "n_queries": 6980,
+  "samples": [
+    {
+      "elapsed_s": 72.15856156125665,
+      "host": "xian",
+      "qps": 96.73141826801186,
+      "timestamp": "2026-09-13T16:48:42.334206+00:00"
+    },
+    {
+      "elapsed_s": 70.64336059056222,
+      "host": "xian",
+      "qps": 98.80617147384847,
+      "timestamp": "2026-09-13T16:49:53.067317+00:00"
+    },
+    {
+      "elapsed_s": 70.58033029921353,
+      "host": "xian",
+      "qps": 98.89440826373942,
+      "timestamp": "2026-09-13T16:51:03.705328+00:00"
+    },
+    {
+      "elapsed_s": 70.5355707667768,
+      "host": "xian",
+      "qps": 98.95716337334402,
+      "timestamp": "2026-09-13T16:52:14.323341+00:00"
+    },
+    {
+      "elapsed_s": 70.46877725608647,
+      "host": "xian",
+      "qps": 99.05095947151729,
+      "timestamp": "2026-09-13T16:53:24.851193+00:00"
+    }
+  ],
+  "system": "impact-index"
+}

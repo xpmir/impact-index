@@ -1,0 +1,48 @@
+{
+  "config_name": "Terrier 5 (PyTerrier)",
+  "fields": {
+    "algorithm": "maxscore",
+    "b": 0.4,
+    "dataset": "msmarco-passage/dev/small",
+    "index_key": "b2d6463f8bc7bc41",
+    "k1": 0.9,
+    "max_queries": 0,
+    "top_k": 100
+  },
+  "group": "terrier-aligned",
+  "mrr_at_10": 0.18810780233774482,
+  "n_queries": 6980,
+  "samples": [
+    {
+      "elapsed_s": 263.04197163693607,
+      "host": "xian",
+      "qps": 26.535689177520887,
+      "timestamp": "2026-09-13T18:08:11.977362+00:00"
+    },
+    {
+      "elapsed_s": 261.4085275698453,
+      "host": "xian",
+      "qps": 26.701500769270144,
+      "timestamp": "2026-09-13T18:12:33.470351+00:00"
+    },
+    {
+      "elapsed_s": 261.32271694019437,
+      "host": "xian",
+      "qps": 26.710268750180738,
+      "timestamp": "2026-09-13T18:16:54.863775+00:00"
+    },
+    {
+      "elapsed_s": 261.6076328381896,
+      "host": "xian",
+      "qps": 26.681178696025633,
+      "timestamp": "2026-09-13T18:21:16.552339+00:00"
+    },
+    {
+      "elapsed_s": 261.4901693519205,
+      "host": "xian",
+      "qps": 26.693164095993716,
+      "timestamp": "2026-09-13T18:25:38.112210+00:00"
+    }
+  ],
+  "system": "terrier"
+}

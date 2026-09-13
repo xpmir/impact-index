@@ -1,0 +1,48 @@
+{
+  "config_name": "impact-index (compressed, WAND/BMW)",
+  "fields": {
+    "algorithm": "wand",
+    "b": 0.4,
+    "dataset": "msmarco-passage/dev/small",
+    "index_key": "6641d09b842b3fef",
+    "k1": 0.9,
+    "max_queries": 0,
+    "top_k": 100
+  },
+  "group": "terrier-aligned",
+  "mrr_at_10": 0.18849780552144446,
+  "n_queries": 6980,
+  "samples": [
+    {
+      "elapsed_s": 37.51890439353883,
+      "host": "xian",
+      "qps": 186.0395476047545,
+      "timestamp": "2026-09-13T17:54:07.424943+00:00"
+    },
+    {
+      "elapsed_s": 37.62657824717462,
+      "host": "xian",
+      "qps": 185.50716873980238,
+      "timestamp": "2026-09-13T17:54:45.128984+00:00"
+    },
+    {
+      "elapsed_s": 37.70696455612779,
+      "host": "xian",
+      "qps": 185.11169175683952,
+      "timestamp": "2026-09-13T17:55:22.910773+00:00"
+    },
+    {
+      "elapsed_s": 37.66858550533652,
+      "host": "xian",
+      "qps": 185.30029483085158,
+      "timestamp": "2026-09-13T17:56:00.658641+00:00"
+    },
+    {
+      "elapsed_s": 37.64511267654598,
+      "host": "xian",
+      "qps": 185.41583498430455,
+      "timestamp": "2026-09-13T17:56:38.383134+00:00"
+    }
+  ],
+  "system": "impact-index"
+}

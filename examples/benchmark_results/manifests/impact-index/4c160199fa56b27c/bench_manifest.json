@@ -1,0 +1,16 @@
+{
+  "build_seconds": 238.77949375845492,
+  "built_at": "2026-09-13T17:07:42.168247+00:00",
+  "config_name": "snowball_terrier-stopwords",
+  "fields": {
+    "compression": null,
+    "dataset": "msmarco-passage/dev/small",
+    "positions": false,
+    "stemmer": "snowball",
+    "stop_words": "terrier",
+    "system": "impact-index"
+  },
+  "host": "xian",
+  "impact_index_version": null,
+  "index_key": "4c160199fa56b27c"
+}

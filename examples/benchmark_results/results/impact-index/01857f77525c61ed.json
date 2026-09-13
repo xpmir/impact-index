@@ -1,0 +1,48 @@
+{
+  "config_name": "snowball_lucene-stopwords",
+  "fields": {
+    "algorithm": "maxscore",
+    "b": 0.4,
+    "dataset": "msmarco-passage/dev/small",
+    "index_key": "fc418bb2d31bbb88",
+    "k1": 0.9,
+    "max_queries": 0,
+    "top_k": 100
+  },
+  "group": "ablation-snowball",
+  "mrr_at_10": 0.18538579615227194,
+  "n_queries": 6980,
+  "samples": [
+    {
+      "elapsed_s": 72.09720424562693,
+      "host": "xian",
+      "qps": 96.81374018637308,
+      "timestamp": "2026-09-13T16:58:58.450380+00:00"
+    },
+    {
+      "elapsed_s": 71.29730004444718,
+      "host": "xian",
+      "qps": 97.8999204128154,
+      "timestamp": "2026-09-13T17:00:09.805414+00:00"
+    },
+    {
+      "elapsed_s": 71.34910092130303,
+      "host": "xian",
+      "qps": 97.82884310902296,
+      "timestamp": "2026-09-13T17:01:21.230213+00:00"
+    },
+    {
+      "elapsed_s": 70.7445213533938,
+      "host": "xian",
+      "qps": 98.66488409939821,
+      "timestamp": "2026-09-13T17:02:32.029514+00:00"
+    },
+    {
+      "elapsed_s": 70.6680184211582,
+      "host": "xian",
+      "qps": 98.77169554127711,
+      "timestamp": "2026-09-13T17:03:42.754984+00:00"
+    }
+  ],
+  "system": "impact-index"
+}

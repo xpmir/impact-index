@@ -1,0 +1,12 @@
+{
+  "build_seconds": 237.80163513496518,
+  "built_at": "2026-09-13T17:47:53.138936+00:00",
+  "config_name": "Pyserini (Lucene)",
+  "fields": {
+    "dataset": "msmarco-passage/dev/small",
+    "system": "pyserini"
+  },
+  "host": "xian",
+  "impact_index_version": null,
+  "index_key": "246ca2f77bb0e0b6"
+}

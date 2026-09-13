@@ -1,0 +1,16 @@
+{
+  "build_seconds": 251.75956119596958,
+  "built_at": "2026-09-13T16:57:37.276328+00:00",
+  "config_name": "snowball_lucene-stopwords",
+  "fields": {
+    "compression": null,
+    "dataset": "msmarco-passage/dev/small",
+    "positions": false,
+    "stemmer": "snowball",
+    "stop_words": "lucene",
+    "system": "impact-index"
+  },
+  "host": "xian",
+  "impact_index_version": null,
+  "index_key": "7d433c6bfdcbd5ff"
+}

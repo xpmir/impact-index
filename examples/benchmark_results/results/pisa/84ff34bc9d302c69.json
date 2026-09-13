@@ -1,0 +1,48 @@
+{
+  "config_name": "PISA (Block-Max WAND)",
+  "fields": {
+    "algorithm": "block_max_wand",
+    "b": 0.4,
+    "dataset": "msmarco-passage/dev/small",
+    "index_key": "daf4aeead5c6f034",
+    "k1": 0.9,
+    "max_queries": 0,
+    "top_k": 100
+  },
+  "group": "terrier-aligned",
+  "mrr_at_10": 0.18537681357165608,
+  "n_queries": 6980,
+  "samples": [
+    {
+      "elapsed_s": 40.05769678391516,
+      "host": "xian",
+      "qps": 174.24866031745393,
+      "timestamp": "2026-09-13T18:31:44.539299+00:00"
+    },
+    {
+      "elapsed_s": 39.1651449482888,
+      "host": "xian",
+      "qps": 178.21969021730814,
+      "timestamp": "2026-09-13T18:32:23.760895+00:00"
+    },
+    {
+      "elapsed_s": 39.160413291305304,
+      "host": "xian",
+      "qps": 178.2412240666968,
+      "timestamp": "2026-09-13T18:33:02.979088+00:00"
+    },
+    {
+      "elapsed_s": 39.213006211444736,
+      "host": "xian",
+      "qps": 178.0021649542088,
+      "timestamp": "2026-09-13T18:33:42.248625+00:00"
+    },
+    {
+      "elapsed_s": 39.18103046901524,
+      "host": "xian",
+      "qps": 178.1474329910709,
+      "timestamp": "2026-09-13T18:34:21.511627+00:00"
+    }
+  ],
+  "system": "pisa"
+}

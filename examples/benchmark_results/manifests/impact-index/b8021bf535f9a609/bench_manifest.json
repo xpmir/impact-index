@@ -1,0 +1,16 @@
+{
+  "build_seconds": 262.4509740881622,
+  "built_at": "2026-09-13T16:23:17.107199+00:00",
+  "config_name": "no-stopwords",
+  "fields": {
+    "compression": null,
+    "dataset": "msmarco-passage/dev/small",
+    "positions": false,
+    "stemmer": "porter",
+    "stop_words": null,
+    "system": "impact-index"
+  },
+  "host": "xian",
+  "impact_index_version": null,
+  "index_key": "b8021bf535f9a609"
+}

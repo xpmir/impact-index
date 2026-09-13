@@ -1,0 +1,48 @@
+{
+  "config_name": "Pyserini (Lucene)",
+  "fields": {
+    "algorithm": "maxscore",
+    "b": 0.4,
+    "dataset": "msmarco-passage/dev/small",
+    "index_key": "246ca2f77bb0e0b6",
+    "k1": 0.9,
+    "max_queries": 0,
+    "top_k": 100
+  },
+  "group": "lucene-aligned",
+  "mrr_at_10": 0.18545219902669766,
+  "n_queries": 6980,
+  "samples": [
+    {
+      "elapsed_s": 64.09063502587378,
+      "host": "xian",
+      "qps": 108.90826713110475,
+      "timestamp": "2026-09-13T17:49:19.815516+00:00"
+    },
+    {
+      "elapsed_s": 61.77992128953338,
+      "host": "xian",
+      "qps": 112.98169137004933,
+      "timestamp": "2026-09-13T17:50:21.673928+00:00"
+    },
+    {
+      "elapsed_s": 61.77728099375963,
+      "host": "xian",
+      "qps": 112.98652008826801,
+      "timestamp": "2026-09-13T17:51:23.538471+00:00"
+    },
+    {
+      "elapsed_s": 62.1330036893487,
+      "host": "xian",
+      "qps": 112.3396518040309,
+      "timestamp": "2026-09-13T17:52:25.754360+00:00"
+    },
+    {
+      "elapsed_s": 61.86570009589195,
+      "host": "xian",
+      "qps": 112.82503857842046,
+      "timestamp": "2026-09-13T17:53:27.704734+00:00"
+    }
+  ],
+  "system": "pyserini"
+}

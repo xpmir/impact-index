@@ -1,0 +1,48 @@
+{
+  "config_name": "impact-index (compressed, MaxScore)",
+  "fields": {
+    "algorithm": "maxscore",
+    "b": 0.4,
+    "dataset": "msmarco-passage/dev/small",
+    "index_key": "32f234d9255eba9a",
+    "k1": 0.9,
+    "max_queries": 0,
+    "top_k": 100
+  },
+  "group": "lucene-aligned",
+  "mrr_at_10": 0.18579234320280177,
+  "n_queries": 6980,
+  "samples": [
+    {
+      "elapsed_s": 72.69730561040342,
+      "host": "xian",
+      "qps": 96.01456259475344,
+      "timestamp": "2026-09-13T16:36:37.180134+00:00"
+    },
+    {
+      "elapsed_s": 71.0340630877763,
+      "host": "xian",
+      "qps": 98.26271645724195,
+      "timestamp": "2026-09-13T16:37:48.312425+00:00"
+    },
+    {
+      "elapsed_s": 70.80582055076957,
+      "host": "xian",
+      "qps": 98.57946628829988,
+      "timestamp": "2026-09-13T16:38:59.178100+00:00"
+    },
+    {
+      "elapsed_s": 70.39943496696651,
+      "host": "xian",
+      "qps": 99.14852304248211,
+      "timestamp": "2026-09-13T16:40:09.634162+00:00"
+    },
+    {
+      "elapsed_s": 70.44544125720859,
+      "host": "xian",
+      "qps": 99.08377143262973,
+      "timestamp": "2026-09-13T16:41:20.136353+00:00"
+    }
+  ],
+  "system": "impact-index"
+}

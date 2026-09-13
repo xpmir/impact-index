@@ -445,9 +445,15 @@ fn test_compressed_index_standalone() {
             language: "english".to_string(),
             stop_words: true,
             stop_words_list: stop_words.iter().map(|s| s.to_string()).collect(),
+            stop_words_family: Some("lucene".to_string()),
+            stop_words_filter_mode: impact_index::vocab::analyzer::StopWordFilterMode::PreStem,
             english_possessive_filter: true,
             tokenizer: impact_index::vocab::analyzer::Tokenizer::LuceneEnglish,
         });
+    builder
+        .analyzer_mut()
+        .unwrap()
+        .set_stop_words_filter_mode(impact_index::vocab::analyzer::StopWordFilterMode::PreStem);
 
     let docs = vec![
         (0u64, "the quick brown fox jumps over the lazy dog"),

@@ -1,0 +1,21 @@
+{
+  "build_seconds": 8.978028198704123,
+  "built_at": "2026-09-13T16:47:28.452664+00:00",
+  "config_name": "lucene-stopwords_positions",
+  "fields": {
+    "compression": {
+      "block_size": 128,
+      "nbits": 0,
+      "reorder": false,
+      "split_quantiles": null
+    },
+    "dataset": "msmarco-passage/dev/small",
+    "positions": true,
+    "stemmer": "porter",
+    "stop_words": "lucene",
+    "system": "impact-index"
+  },
+  "host": "xian",
+  "impact_index_version": null,
+  "index_key": "ef448fa223a3ec85"
+}
