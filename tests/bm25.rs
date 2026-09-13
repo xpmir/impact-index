@@ -444,6 +444,7 @@ fn test_compressed_index_standalone() {
             stemmer: "porter".to_string(),
             language: "english".to_string(),
             stop_words: true,
+            stop_words_list: stop_words.iter().map(|s| s.to_string()).collect(),
             english_possessive_filter: true,
         });
 

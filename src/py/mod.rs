@@ -1850,11 +1850,16 @@ impl PyBOWIndexBuilder {
             if english {
                 a.set_english_possessive_filter(true);
             }
-            // Store config for later retrieval
+            // Store config for later retrieval. `stop_words_list` preserves
+            // the *exact* list used here (not just whether one was given) so
+            // `PyTextAnalyzer::from_index` can reconstruct the real custom
+            // list at query time instead of substituting the language's
+            // built-in default.
             a.set_config(crate::vocab::analyzer::AnalyzerConfig {
                 stemmer: stemmer_name.to_string(),
                 language: lang.to_string(),
                 stop_words: !stop_word_refs.is_empty(),
+                stop_words_list: resolved_stop_words.clone(),
                 english_possessive_filter: english,
             });
             a
@@ -2146,8 +2151,14 @@ impl PyTextAnalyzer {
             _ => Box::new(crate::vocab::stemmer::NoStemmer),
         };
 
-        // Recreate stop words from config
-        let stop_words = if config.stop_words {
+        // Recreate stop words from config. `stop_words_list` holds the exact
+        // list a custom `stop_words=[...]` build used; fall back to the
+        // language's built-in default only for indices built before that
+        // field existed (where `stop_words_list` is empty but `stop_words`
+        // is true).
+        let stop_words = if !config.stop_words_list.is_empty() {
+            config.stop_words_list.clone()
+        } else if config.stop_words {
             crate::vocab::stopwords::get_stop_words(&config.language)
                 .unwrap_or_default()
                 .iter()

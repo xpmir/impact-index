@@ -342,3 +342,33 @@ fn convert_f32_to_v<V: PostingValue>(v: f32) -> V {
         }
     }
 }
+
+#[cfg(test)]
+mod bow_stop_word_tests {
+    use super::*;
+    use crate::vocab::analyzer::TextAnalyzer;
+    use crate::vocab::stemmer::SnowballStemmer;
+    use temp_dir::TempDir;
+
+    /// Regression test for the parallel batch path
+    /// ([`BOWIndexBuilder::add_texts_batch`], used by
+    /// `impact_index.BOWIndexBuilder.add_texts` from Python): an inflected
+    /// stop word ("whats") must not stem back into the stop word itself
+    /// ("what") and re-enter the vocabulary.
+    #[test]
+    fn add_texts_batch_rejects_inflected_stop_word() {
+        let dir = TempDir::new().unwrap();
+        let stemmer = SnowballStemmer::new("english").unwrap();
+        let analyzer = TextAnalyzer::with_stop_words(Box::new(stemmer), &["what", "is", "the"]);
+        let mut b =
+            BOWIndexBuilder::<i32>::with_analyzer(dir.path(), &BuilderOptions::default(), analyzer);
+        b.add_texts_batch(&[(1, "whats next for the show"), (2, "is this the one")])
+            .unwrap();
+        let vocab = b.analyzer_mut().unwrap().vocab();
+        assert!(
+            vocab.get("what").is_none(),
+            "'whats' must not leak 'what' into the vocabulary"
+        );
+        assert!(vocab.get("next").is_some());
+    }
+}

@@ -15,6 +15,15 @@ use crate::base::TermIndex;
 use super::stemmer::Stemmer;
 use super::Vocabulary;
 
+/// Stem each stop word so it can be matched against already-stemmed tokens.
+/// See [`TextAnalyzer::stemmed_stop_words`] for why this exists.
+fn stem_stop_words(stemmer: &dyn Stemmer, stop_words: &[&str]) -> HashSet<String> {
+    stop_words
+        .iter()
+        .map(|w| stemmer.stem(&w.to_lowercase()))
+        .collect()
+}
+
 /// Analyzer configuration, serialized with the index for reproducibility.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AnalyzerConfig {
@@ -22,8 +31,19 @@ pub struct AnalyzerConfig {
     pub stemmer: String,
     /// Language (for snowball stemmer and stop words)
     pub language: String,
-    /// Whether stop words are enabled
+    /// Whether stop words are enabled. Kept for backward compatibility with
+    /// indices built before `stop_words_list` existed; `stop_words_list`
+    /// takes precedence whenever it's non-empty.
     pub stop_words: bool,
+    /// The actual stop word list that was used, so query-time analysis
+    /// (`PyTextAnalyzer::from_index`) can reconstruct the *exact* list a
+    /// custom (non-default) `stop_words=[...]` build used, instead of
+    /// silently substituting the language's built-in default list.
+    /// `#[serde(default)]` so indices built before this field existed still
+    /// deserialize (as an empty list, falling back to the old `stop_words`
+    /// bool + built-in-list behavior).
+    #[serde(default)]
+    pub stop_words_list: Vec<String>,
     /// Whether English possessive filter is enabled (strip 's)
     pub english_possessive_filter: bool,
 }
@@ -34,17 +54,31 @@ impl Default for AnalyzerConfig {
             stemmer: "none".to_string(),
             language: "english".to_string(),
             stop_words: false,
+            stop_words_list: Vec::new(),
             english_possessive_filter: false,
         }
     }
 }
 
 /// Full text analysis pipeline matching Lucene's EnglishAnalyzer:
-/// tokenize -> possessive filter -> lowercase -> stop words -> stem -> vocabulary lookup.
+/// tokenize -> possessive filter -> lowercase -> stop words -> stem -> stop
+/// words (stemmed) -> vocabulary lookup. See [`TextAnalyzer::stemmed_stop_words`]
+/// for why stop words are checked twice.
 pub struct TextAnalyzer {
     vocab: Vocabulary,
     stemmer: Box<dyn Stemmer>,
     stop_words: HashSet<String>,
+    /// Stemmed form of each entry in `stop_words`, checked *after* stemming
+    /// a surviving token. Stop word removal itself always happens before
+    /// stemming (on the raw token) -- that's the correct order, since
+    /// stemming a word first and then comparing against raw stop words risks
+    /// coincidentally dropping legitimate content words. But an inflected or
+    /// misspelled variant of a stop word (e.g. "whats" instead of "what's")
+    /// won't exact-match the raw stop word list, survives that first filter,
+    /// and can then stem right back down to the stop word itself, quietly
+    /// re-admitting it into the vocabulary. This second, stem-aware check
+    /// catches exactly (and only) that case.
+    stemmed_stop_words: HashSet<String>,
     /// Strip English possessives ('s) before tokenizing
     english_possessive_filter: bool,
     /// Analyzer config for serialization
@@ -58,6 +92,7 @@ impl TextAnalyzer {
             vocab: Vocabulary::new(),
             stemmer,
             stop_words: HashSet::new(),
+            stemmed_stop_words: HashSet::new(),
             english_possessive_filter: false,
             config: AnalyzerConfig::default(),
         }
@@ -65,10 +100,12 @@ impl TextAnalyzer {
 
     /// Create a new analyzer with the given stemmer and stop words.
     pub fn with_stop_words(stemmer: Box<dyn Stemmer>, stop_words: &[&str]) -> Self {
+        let stemmed_stop_words = stem_stop_words(stemmer.as_ref(), stop_words);
         Self {
             vocab: Vocabulary::new(),
             stemmer,
             stop_words: stop_words.iter().map(|s| s.to_string()).collect(),
+            stemmed_stop_words,
             english_possessive_filter: false,
             config: AnalyzerConfig::default(),
         }
@@ -80,6 +117,7 @@ impl TextAnalyzer {
             vocab,
             stemmer,
             stop_words: HashSet::new(),
+            stemmed_stop_words: HashSet::new(),
             english_possessive_filter: false,
             config: AnalyzerConfig::default(),
         }
@@ -91,10 +129,12 @@ impl TextAnalyzer {
         stemmer: Box<dyn Stemmer>,
         stop_words: &[&str],
     ) -> Self {
+        let stemmed_stop_words = stem_stop_words(stemmer.as_ref(), stop_words);
         Self {
             vocab,
             stemmer,
             stop_words: stop_words.iter().map(|s| s.to_string()).collect(),
+            stemmed_stop_words,
             english_possessive_filter: false,
             config: AnalyzerConfig::default(),
         }
@@ -174,6 +214,9 @@ impl TextAnalyzer {
         let mut tf_map: HashMap<String, f32> = HashMap::new();
         for token in &tokens {
             let stemmed = self.stemmer.stem(token);
+            if self.stemmed_stop_words.contains(&stemmed) {
+                continue;
+            }
             *tf_map.entry(stemmed).or_insert(0.0) += 1.0;
         }
 
@@ -202,6 +245,9 @@ impl TextAnalyzer {
         let mut positions_map: HashMap<String, Vec<u32>> = HashMap::new();
         for (token, pos) in tokens {
             let stemmed = self.stemmer.stem(&token);
+            if self.stemmed_stop_words.contains(&stemmed) {
+                continue;
+            }
             positions_map.entry(stemmed).or_default().push(pos);
         }
 
@@ -221,6 +267,9 @@ impl TextAnalyzer {
 
         for token in &tokens {
             let stemmed = self.stemmer.stem(token);
+            if self.stemmed_stop_words.contains(&stemmed) {
+                continue;
+            }
             if let Some(idx) = self.vocab.get(&stemmed) {
                 *query.entry(idx).or_insert(0.0) += 1.0;
             }
@@ -238,6 +287,9 @@ impl TextAnalyzer {
         let mut tf_map: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
         for token in &tokens {
             let stemmed = self.stemmer.stem(token);
+            if self.stemmed_stop_words.contains(&stemmed) {
+                continue;
+            }
             *tf_map.entry(stemmed).or_insert(0.0) += 1.0;
         }
         tf_map.into_iter().collect()
@@ -254,6 +306,9 @@ impl TextAnalyzer {
         let mut positions_map: HashMap<String, Vec<u32>> = HashMap::new();
         for (token, pos) in tokens {
             let stemmed = self.stemmer.stem(&token);
+            if self.stemmed_stop_words.contains(&stemmed) {
+                continue;
+            }
             positions_map.entry(stemmed).or_default().push(pos);
         }
         positions_map.into_iter().collect()
@@ -313,6 +368,7 @@ impl TextAnalyzer {
             vocab,
             stemmer,
             stop_words: HashSet::new(),
+            stemmed_stop_words: HashSet::new(),
             english_possessive_filter: config.english_possessive_filter,
             config,
         })
@@ -326,10 +382,12 @@ impl TextAnalyzer {
     ) -> std::io::Result<Self> {
         let vocab = Vocabulary::load(&dir.join("vocab"))?;
         let config = Self::load_config(dir);
+        let stemmed_stop_words = stem_stop_words(stemmer.as_ref(), stop_words);
         Ok(Self {
             vocab,
             stemmer,
             stop_words: stop_words.iter().map(|s| s.to_string()).collect(),
+            stemmed_stop_words,
             english_possessive_filter: config.english_possessive_filter,
             config,
         })
@@ -414,6 +472,33 @@ mod tests {
         let tokens = analyzer.tokenize("price is 3.14 dollars U.S.A.");
         assert!(tokens.contains(&"3.14".to_string()));
         assert!(tokens.contains(&"u.s.a".to_string()));
+    }
+
+    #[test]
+    fn test_stop_word_survives_inflection_then_stem() {
+        // "whats" (no apostrophe -- common informal spelling) isn't an exact
+        // match for the raw stop word "what", so it survives the pre-stem
+        // filter -- but Snowball/Porter2 stems it right back down to "what",
+        // which must then be caught by the post-stem check, not silently
+        // re-admitted into the vocabulary.
+        use crate::vocab::stemmer::SnowballStemmer;
+        let stemmer = SnowballStemmer::new("english").unwrap();
+        let mut analyzer = TextAnalyzer::with_stop_words(Box::new(stemmer), &["what", "is", "the"]);
+
+        let (terms, _) = analyzer.analyze_doc("whats next for the show");
+        assert!(
+            analyzer.vocab().get("what").is_none(),
+            "'whats' must not stem back into the stop word 'what': vocab = {:?}",
+            terms
+        );
+
+        // Query-side must reject it too, even against an index that (before
+        // this fix) already has "what" polluted into its vocabulary.
+        let query = analyzer.analyze_query("what");
+        assert!(
+            query.is_empty(),
+            "querying a stop word must return no terms"
+        );
     }
 
     #[test]
