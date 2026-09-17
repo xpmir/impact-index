@@ -23,7 +23,8 @@ Supports both neural IR models with floating-point impact scores and traditional
 
 BM25 on MS MARCO passage (8.8M docs, 6,980 queries, top-100, single-threaded).
 impact-index is built twice below, each time matching one reference system's
-own tokenizer/stemmer/stopwords (see [BENCHMARKS.md](BENCHMARKS.md) for why).
+own tokenizer/stemmer/stopwords (see [BENCHMARKS.md](BENCHMARKS.md) for why,
+and for a third build aligned with real Terrier 5 instead of PISA).
 MaxScore is its headline algorithm.
 
 **Lucene-aligned** (`pipeline="pyserini"`) — vs Pyserini:
@@ -33,19 +34,15 @@ MaxScore is its headline algorithm.
 | **impact-index** (compressed + reordered, MaxScore) | **295** | **102 ± 0** | 0.65 GB | 0.1859 |
 | Pyserini (Lucene) | 213 | 99 ± 1 | 0.59 GB | 0.1855 |
 
-**Terrier-aligned** (`pipeline="terrier"`) — vs Terrier 5 and PISA:
+**PISA-aligned** (`pipeline="terrier-pisa"`) — vs PISA:
 
 | System | x86 q/s | Index size | MRR@10 |
 |--------|---------|-----------|--------|
-| **impact-index** (compressed, MaxScore) | **230 ± 1** | 0.50 GB | 0.1882 |
-| Terrier 5 (PyTerrier) | 26 ± 0 | 1.31 GB | 0.1877 |
+| **impact-index** (compressed, MaxScore) | **235 ± 2** | 0.64 GB | 0.1866 |
 | PISA (Block-Max WAND) | 215 ± 1 | 0.60 GB | 0.1854 |
 
-- Result overlap: @10=0.985/@100=0.989 vs Pyserini, @10=0.963/@100=0.966 vs
-  Terrier 5. Overlap vs PISA is lower (@10=0.819/@100=0.852) because PISA's
-  own index, via the `pyterrier_pisa` wrapper used here, doesn't filter
-  stop words at all — see [BENCHMARKS.md](BENCHMARKS.md) for why that's not
-  a fidelity problem on impact-index's side.
+- Result overlap: @10=0.985/@100=0.989 vs Pyserini, @10=0.976/@100=0.979 vs
+  PISA.
 - Compressed index is lossless (same results as raw) in both configurations.
 - q/s is mean ± std over 5 search-only repeats, warm resident index. ARM numbers are from an earlier session (no ARM host this run).
 

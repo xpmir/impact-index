@@ -124,6 +124,75 @@ class TestPipeline:
         with pytest.raises(ValueError):
             impact_index.BOWIndexBuilder(d, dtype="int32", pipeline="nope")
 
+    def test_terrier_pisa_pipeline_indexes_stop_words_but_query_filters_them(
+        self, tmp_path
+    ):
+        # PISA's own index (as built by the pyterrier_pisa wrapper commonly
+        # compared against) never filters stop words from what it stores,
+        # at index time -- unlike real Terrier 5, which does (see
+        # "terrier"). But PISA's own query processing DOES exclude them
+        # (verified: querying it with only stop words returns no results).
+        # "terrier-pisa" reproduces that asymmetry: same tokenizer/stemmer
+        # as "terrier", nothing filtered at index time, but Terrier's list
+        # still filtered at query time.
+        text = "the cat and the dog are however running, don't stop"
+        import os
+
+        d_tp = str(tmp_path / "terrier_pisa")
+        os.makedirs(d_tp)
+        b_tp = impact_index.BOWIndexBuilder(
+            d_tp, dtype="int32", pipeline="terrier-pisa"
+        )
+        b_tp.add_text(0, text)
+        index_tp = b_tp.build(True)
+
+        d_t = str(tmp_path / "terrier")
+        os.makedirs(d_t)
+        b_t = impact_index.BOWIndexBuilder(d_t, dtype="int32", pipeline="terrier")
+        b_t.add_text(0, text)
+        index_t = b_t.build(True)
+
+        # terrier-pisa's index keeps stop words ("the", "and", "however",
+        # ...); terrier's index drops them -- so terrier-pisa's vocab is
+        # strictly larger for the same text.
+        assert index_tp.num_postings() > index_t.num_postings()
+
+        # But querying terrier-pisa still filters stop words out of the
+        # query, same as terrier does.
+        analyzer = impact_index.TextAnalyzer.from_index(d_tp)
+        assert analyzer.analyze_query("the") == {}
+        assert analyzer.analyze_query("and") == {}
+        assert analyzer.analyze_query("however") == {}
+        assert analyzer.analyze_query("cat") != {}
+        # PISA's tokenizer still applies: "don't" -> "don".
+        assert len(analyzer.analyze_query("don")) == 1
+
+    def test_terrier_pisa_pipeline_stop_words_override_is_index_time_only(
+        self, tmp_path
+    ):
+        # An explicit stop_words= overrides the pipeline's own (empty)
+        # INDEX-time default, same as any other pipeline. Query-time
+        # filtering is a fixed characteristic of matching PISA's own query
+        # behavior, not affected by this override -- see the `pipeline=`
+        # docstring.
+        d = str(tmp_path / "terrier_pisa_custom")
+        import os
+
+        os.makedirs(d)
+        b = impact_index.BOWIndexBuilder(
+            d, dtype="int32", pipeline="terrier-pisa", stop_words=["cat"]
+        )
+        b.add_text(0, "the cat and the dog are running")
+        index = b.build(True)
+        # "cat" was excluded from indexing by the custom list; "the"/"and"
+        # weren't (terrier-pisa's own index-time default is empty).
+        analyzer = index.analyzer()
+        assert analyzer.analyze_query("cat") == {}
+        # Query-time Terrier filtering still applies regardless.
+        assert analyzer.analyze_query("the") == {}
+        assert analyzer.analyze_query("and") == {}
+        assert analyzer.analyze_query("dog") != {}
+
 
 class TestBOWIndexBuilder:
     def test_build_with_manual_terms(self, rng, tmp_path):

@@ -225,6 +225,13 @@ all three axes to match that system's own defaults in one go:
         "/path/to/index", pipeline="terrier", stop_words=True,
     )
 
+    # Matches PISA's own index instead (as built by the pyterrier_pisa
+    # wrapper commonly compared against) -- see the table below for why
+    # this differs from "terrier"
+    builder = impact_index.BOWIndexBuilder(
+        "/path/to/index", pipeline="terrier-pisa",
+    )
+
 ``stemmer=``, ``stop_words=``, and ``language=`` still compose freely on
 top of a ``pipeline=`` choice — an explicit value overrides just that one
 axis, keeping the pipeline's tokenizer and stop-word timing:
@@ -264,18 +271,27 @@ PISA (native CLI)        truncates at the   Snowball/Porter2       *after* stemm
                                                                      below)
 ======================== ================= ===================== ==================================
 
-``pipeline="terrier"`` matches the middle row (real Terrier 5, verified),
-not PISA's native CLI row: it uses pre-stem filtering, and PISA's own
+``pipeline="terrier"`` matches the middle row (real Terrier 5, verified):
+pre-stem filtering, both at index time and query time, plus PISA's own
 tokenizer (the closest available approximation to Terrier 5's, whose Java
-tokenizer hasn't been independently verified). Note that the
-``pyterrier_pisa`` Python wrapper used for this project's PISA benchmark
-comparisons doesn't remove stop words from its index at all, at index time
-or query time -- its ``stops=`` argument only affects PISA's own native CLI
-tool. So there is no PISA index to match on stop-word handling; only
-Terrier 5's is reproducible here. See `BENCHMARKS.md
+tokenizer hasn't been independently verified).
+
+``pipeline="terrier-pisa"`` instead matches the bottom row's index -- but
+not by using post-stem filtering (that's PISA's *native CLI tool*, not
+what its commonly-used Python wrapper actually does). The
+``pyterrier_pisa`` wrapper this project's PISA benchmark numbers are built
+with doesn't remove stop words from its *index* at all, at any setting --
+"the" alone ends up indexed in 87% of MS MARCO passages -- but its own
+*query* processing does exclude them (querying it with only stop words
+returns no results). ``"terrier-pisa"`` reproduces exactly that asymmetry:
+nothing filtered when building the index, Terrier's list still filtered
+when analyzing a query. Filtering neither side, or both, measurably hurts
+agreement with a real PISA index built this way. See `BENCHMARKS.md
 <https://github.com/experimaestro/experimaestro-ir-rust/blob/main/BENCHMARKS.md>`_
-for the measured consequence (result overlap is much higher against
-Terrier 5 than against PISA).
+for the measured numbers (full-query-set result overlap: 0.98 against PISA
+with ``"terrier-pisa"``, 0.96 against Terrier 5 with ``"terrier"`` -- each
+pipeline is a close match for the system it targets, not for the other
+one).
 
 The tokenizer difference is easy to miss but changes a large fraction of
 the vocabulary: PISA's ``EnglishTokenStream`` (``tools/tokenizer.cpp`` in

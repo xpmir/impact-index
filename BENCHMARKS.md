@@ -9,9 +9,9 @@ for the headline numbers.
 
 ## Comparison against reference systems
 
-`examples/benchmark.py --suite comparison` builds impact-index twice, each
-time matching one reference family's own tokenizer/stemmer/stopwords, and
-reports two groups below.
+`examples/benchmark.py --suite comparison` builds impact-index three times,
+each time matching one reference family's own tokenizer/stemmer/stopwords,
+and reports three groups below.
 
 ### Lucene-aligned — `pipeline="pyserini"`
 
@@ -46,23 +46,54 @@ stemmer instead of Snowball, use `pipeline="terrier", stemmer="porter"`.
 | PISA (MaxScore) | 181 ± 1 | 0.60 GB | 0.1854 |
 
 - Result overlap vs **Terrier 5**, full 6,980-query set: @10=0.963, @100=0.966.
-- Result overlap vs **PISA** (Block-Max WAND): @10=0.819, @100=0.852.
-- Why PISA's overlap is lower: `pyterrier_pisa` (the wrapper used here)
-  never removes stop words from PISA's index or query scoring, at any
-  setting — "the" alone is indexed in 87% of docs (df=7,714,561/8,841,823).
-  Architectural, not a bug: PISA's `stops=` only feeds its native CLI tool,
-  not this wrapper's `index()`/`bm25()`. Terrier 5 itself only reaches
-  @10=0.878 vs PISA, for the same reason.
+- Result overlap vs **PISA** (Block-Max WAND): @10=0.819, @100=0.852 — see
+  the PISA-aligned section below for why, and for a pipeline that instead
+  gets high agreement with PISA specifically.
 - No ARM measurement (PISA/Terrier 5 are x86-only); no reordered variant.
 
-MaxScore is impact-index's headline algorithm in both tables; WAND/BMW is
+### PISA-aligned — `pipeline="terrier-pisa"`
+
+Same tokenizer/stemmer as `"terrier"` above, but no stop words filtered at
+index time. `pyterrier_pisa` (the wrapper this project's PISA numbers are
+built with) never removes stop words from PISA's index, at any setting —
+"the" alone is indexed in 87% of docs (df=7,714,561/8,841,823 passages).
+Architectural, not a bug: PISA's `stops=` only feeds its own native CLI
+tool, not this wrapper's `index()` call. `"terrier"` (above) matches real
+Terrier 5 instead, which *does* filter at index time — the two pipelines
+trade off fidelity to one reference system against the other; no single
+build matches both.
+
+Query time still filters Terrier's list, though: PISA's own query
+processing *does* exclude stop words (confirmed -- querying it with only
+stop words returns no results), just not at index time. Matching that
+asymmetry (unfiltered index, filtered query) is what gets high agreement
+below — filtering neither side measurably hurt real-query overlap with
+PISA (MS MARCO queries are stopword-heavy, so leaving them in let their
+small-but-nonzero idf-weighted contributions perturb rankings PISA never
+considers), and it slowed search down for no benefit (unfiltered queries
+have to traverse "the"'s multi-million-posting list for nothing).
+
+| System | x86 q/s | Index size | MRR@10 |
+|--------|---------|-----------|--------|
+| **impact-index** (compressed, MaxScore) | **235 ± 2** | 0.64 GB | 0.1866 |
+| impact-index (compressed, WAND/BMW) | 194 ± 0 | 0.64 GB | 0.1866 |
+| PISA (Block-Max WAND) | 215 ± 1 | 0.60 GB | 0.1854 |
+| PISA (MaxScore) | 181 ± 1 | 0.60 GB | 0.1854 |
+
+- Result overlap vs **PISA** (Block-Max WAND), full 6,980-query set:
+  @10=0.976, @100=0.979.
+- No ARM measurement (PISA is x86-only); no reordered variant.
+
+MaxScore is impact-index's headline algorithm throughout; WAND/BMW is
 included for transparency but is slower at top_k=100 (θ rises slowly, most
 of the loop is unpruned catch-up — algorithmic, not a bug). Compressed
-index is lossless in both configurations.
+index is lossless in every configuration.
 
 Reproduce with `examples/benchmark.py --suite comparison --systems
 impact-index,pyserini,terrier,pisa` (add `--with pyserini --with
-python-terrier` to the `uv run` invocation, plus a JVM).
+python-terrier` to the `uv run` invocation, plus a JVM), or narrow to one
+group with `--only lucene-aligned` / `--only terrier-aligned` / `--only
+pisa-aligned`.
 
 Notes:
 - **Terrier 5** via PyTerrier, one query at a time, exhaustive DAAT (no WAND/block-max pruning in stock Terrier 5.11).

@@ -376,6 +376,45 @@ COMPARISON_CONFIGS: List[Config] = [
         group="terrier-aligned",
         algorithm="block_max_maxscore",
     ),
+    # --- PISA-aligned: impact-index[terrier-pisa] vs PISA ---
+    # Separate from terrier-aligned above: pyterrier_pisa's PISA index never
+    # filters stop words at all (index or query time), unlike real Terrier
+    # 5, so no single impact-index build can have high fidelity to both --
+    # see BOWIndexBuilder's pipeline= docstring and BENCHMARKS.md. This
+    # group trades Terrier-5 fidelity for PISA fidelity: same tokenizer and
+    # stemmer as pipeline="terrier", but no stop words at all.
+    Config(
+        "impact-index (compressed, MaxScore)",
+        "impact-index",
+        group="pisa-aligned",
+        pipeline="terrier-pisa",
+        stemmer="snowball",
+        stop_words=[],
+        compression=Compression(nbits=0, block_size=128),
+        algorithm="maxscore",
+    ),
+    Config(
+        "impact-index (compressed, WAND/BMW)",
+        "impact-index",
+        group="pisa-aligned",
+        pipeline="terrier-pisa",
+        stemmer="snowball",
+        stop_words=[],
+        compression=Compression(nbits=0, block_size=128),
+        algorithm="wand",
+    ),
+    Config(
+        "PISA (Block-Max WAND)",
+        "pisa",
+        group="pisa-aligned",
+        algorithm="block_max_wand",
+    ),
+    Config(
+        "PISA (MaxScore)",
+        "pisa",
+        group="pisa-aligned",
+        algorithm="block_max_maxscore",
+    ),
 ]
 
 SUITES = {"ablation": ABLATION_CONFIGS, "comparison": COMPARISON_CONFIGS}
@@ -1304,6 +1343,22 @@ def render_comparison(output_dir: Path) -> None:
         print(
             f"| {name} | {qps(name, 'terrier-aligned', algo)} | {size(name, 'terrier-aligned')} | "
             f"{mrr(name, 'terrier-aligned', algo)} |"
+        )
+
+    print(
+        "\n### PISA-aligned (Snowball/Porter2 stemmer, no stop words -- matches PISA's own index)\n"
+    )
+    print("| System | x86 q/s | Index size | MRR@10 |")
+    print("|--------|---------|-----------|--------|")
+    for name, algo in [
+        ("impact-index (compressed, MaxScore)", "maxscore"),
+        ("impact-index (compressed, WAND/BMW)", "wand"),
+        ("PISA (Block-Max WAND)", "block_max_wand"),
+        ("PISA (MaxScore)", "block_max_maxscore"),
+    ]:
+        print(
+            f"| {name} | {qps(name, 'pisa-aligned', algo)} | {size(name, 'pisa-aligned')} | "
+            f"{mrr(name, 'pisa-aligned', algo)} |"
         )
 
 

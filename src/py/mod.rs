@@ -1804,16 +1804,38 @@ impl PyBOWIndexBuilder {
     ///     pipeline: The only place a reference system's own tokenizer,
     ///         stop-word-filter timing, and default stemmer/stop-word-list
     ///         are all selected together, as that system actually implements
-    ///         them: ``"pyserini"`` (default) matches Lucene/Pyserini
-    ///         (`LuceneEnglish` tokenizer, Lucene's ~33-word list, checked
-    ///         pre-stem, Porter stemmer); ``"terrier"`` matches PISA's own
-    ///         tokenizer (see ``Tokenizer.pisa_english``) and Terrier's
-    ///         ~730-word list, checked post-stem against the raw list, with
-    ///         Snowball/Porter2 (PISA's stemmer -- real Terrier 5 itself
-    ///         uses classic Porter; pass ``stemmer="porter"`` to match that
-    ///         instead). Everything else (``stemmer``, ``stop_words``,
-    ///         ``language``) composes freely on top: an explicit value
-    ///         overrides just that piece of the pipeline's defaults, e.g.
+    ///         them:
+    ///         - ``"pyserini"`` (default) matches Lucene/Pyserini
+    ///           (``LuceneEnglish`` tokenizer, Lucene's ~33-word list,
+    ///           checked pre-stem, Porter stemmer).
+    ///         - ``"terrier"`` matches real Terrier 5's own behavior:
+    ///           PISA's tokenizer (see ``Tokenizer.pisa_english`` -- the
+    ///           closest available approximation to Terrier 5's own Java
+    ///           tokenizer, not independently verified), Terrier's
+    ///           ~730-word list checked pre-stem against the raw list
+    ///           (Terrier 5's default ``termpipelines=Stopwords,``
+    ///           ``PorterStemmer``, verified against a real Terrier 5
+    ///           index), and Snowball/Porter2 (PISA's stemmer -- real
+    ///           Terrier 5 itself uses classic Porter; pass
+    ///           ``stemmer="porter"`` to match that instead).
+    ///         - ``"terrier-pisa"`` instead matches PISA's own index, as
+    ///           built by the ``pyterrier_pisa`` wrapper commonly used to
+    ///           compare against it: same tokenizer and stemmer as
+    ///           ``"terrier"``, but nothing is filtered at index time --
+    ///           that wrapper never removes stop words from what it
+    ///           stores, regardless of its own settings. Its own query
+    ///           processing does exclude them, though, so this pipeline's
+    ///           queries still drop Terrier's ~730-word list (fixed by
+    ///           this pipeline choice alone, not affected by an explicit
+    ///           ``stop_words=`` override -- that only changes what gets
+    ///           indexed). Use this pipeline (not ``"terrier"``) when
+    ///           comparing directly against a PISA index built that way;
+    ///           the two trade off fidelity to one reference system
+    ///           against the other and can't both be matched by the same
+    ///           build.
+    ///         Everything else (``stemmer``, ``stop_words``, ``language``)
+    ///         composes freely on top: an explicit value overrides just
+    ///         that piece of the pipeline's defaults, e.g.
     ///         ``pipeline="terrier", stemmer="porter"`` keeps Terrier's
     ///         tokenizer/stop-word timing/list but swaps in the Porter
     ///         stemmer.
@@ -1870,21 +1892,28 @@ impl PyBOWIndexBuilder {
         struct PipelineDefaults {
             stemmer: &'static str,
             tokenizer: crate::vocab::analyzer::Tokenizer,
-            stop_words_family: crate::vocab::stopwords::StopWordFamily,
+            // `None` means "no stop words at all" -- used by `"terrier-pisa"`,
+            // see its arm below.
+            stop_words_family: Option<crate::vocab::stopwords::StopWordFamily>,
             filter_mode: crate::vocab::analyzer::StopWordFilterMode,
+            // Extra stop words checked only at query time, never at index
+            // time -- see `TextAnalyzer::query_stop_words`. `None` for every
+            // pipeline except `"terrier-pisa"`.
+            query_only_stop_words_family: Option<crate::vocab::stopwords::StopWordFamily>,
         }
         let pipeline_defaults = pipeline
             .map(|name| match name.to_lowercase().as_str() {
                 "pyserini" => Ok(PipelineDefaults {
                     stemmer: "porter",
                     tokenizer: crate::vocab::analyzer::Tokenizer::LuceneEnglish,
-                    stop_words_family: crate::vocab::stopwords::StopWordFamily::Lucene,
+                    stop_words_family: Some(crate::vocab::stopwords::StopWordFamily::Lucene),
                     filter_mode: crate::vocab::analyzer::StopWordFilterMode::PreStem,
+                    query_only_stop_words_family: None,
                 }),
                 "terrier" => Ok(PipelineDefaults {
                     stemmer: "snowball",
                     tokenizer: crate::vocab::analyzer::Tokenizer::PisaEnglish,
-                    stop_words_family: crate::vocab::stopwords::StopWordFamily::Terrier,
+                    stop_words_family: Some(crate::vocab::stopwords::StopWordFamily::Terrier),
                     // Real Terrier's default termpipeline is
                     // `Stopwords,PorterStemmer` -- stopwords are filtered
                     // BEFORE stemming, against the unstemmed word list (e.g.
@@ -1892,9 +1921,44 @@ impl PyBOWIndexBuilder {
                     // first). Verified by dumping an isolated Terrier 5
                     // lexicon directly. PostStem was the wrong timing.
                     filter_mode: crate::vocab::analyzer::StopWordFilterMode::PreStem,
+                    query_only_stop_words_family: None,
+                }),
+                "terrier-pisa" => Ok(PipelineDefaults {
+                    stemmer: "snowball",
+                    tokenizer: crate::vocab::analyzer::Tokenizer::PisaEnglish,
+                    // No stop words at INDEX time: PISA's own index, as
+                    // built by the `pyterrier_pisa` wrapper commonly used
+                    // to compare against it, never filters stop words from
+                    // what it stores, regardless of its own `stops=`
+                    // setting ("the" ends up indexed in ~87% of MS MARCO
+                    // passages). But its own query processing *does*
+                    // exclude them (verified: querying it with only stop
+                    // words returns no results) -- hence
+                    // `query_only_stop_words_family` below, checked only in
+                    // `analyze_query`, never in `analyze_doc`. An earlier
+                    // version of this pipeline filtered nothing at either
+                    // stage, matching the index but not the query side;
+                    // that measurably hurt real-query overlap with PISA
+                    // (full MS MARCO dev/small query set) versus filtering
+                    // the query side too -- those queries are
+                    // stopword-heavy, so leaving them in the query let
+                    // their small-but-nonzero idf-weighted contributions
+                    // perturb rankings PISA never considers (it drops them
+                    // from the query outright). `"terrier"` (above) matches
+                    // real Terrier 5's actual behavior instead, which filters
+                    // both stages -- the two pipelines trade off fidelity
+                    // to one reference system against the other; pick the
+                    // one whose reference index you're actually comparing
+                    // against. filter_mode is moot with an empty index-time
+                    // list.
+                    stop_words_family: None,
+                    filter_mode: crate::vocab::analyzer::StopWordFilterMode::PreStem,
+                    query_only_stop_words_family: Some(
+                        crate::vocab::stopwords::StopWordFamily::Terrier,
+                    ),
                 }),
                 other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Unknown pipeline '{}', expected 'pyserini' or 'terrier'",
+                    "Unknown pipeline '{}', expected 'pyserini', 'terrier', or 'terrier-pisa'",
                     other
                 ))),
             })
@@ -1912,18 +1976,23 @@ impl PyBOWIndexBuilder {
         let mut resolved_family: Option<crate::vocab::stopwords::StopWordFamily> = None;
         let resolved_stop_words: Vec<String> = match stop_words {
             None if pipeline_defaults.is_some() => {
-                let family = pipeline_defaults.as_ref().unwrap().stop_words_family;
-                resolved_family = Some(family);
-                crate::vocab::stopwords::get_stop_words_for_family(lang, family)
-                    .ok_or_else(|| {
-                        pyo3::exceptions::PyValueError::new_err(format!(
-                            "No built-in {} stop words for language '{}'",
-                            family, lang
-                        ))
-                    })?
-                    .into_iter()
-                    .map(|s| s.to_string())
-                    .collect()
+                match pipeline_defaults.as_ref().unwrap().stop_words_family {
+                    Some(family) => {
+                        resolved_family = Some(family);
+                        crate::vocab::stopwords::get_stop_words_for_family(lang, family)
+                            .ok_or_else(|| {
+                                pyo3::exceptions::PyValueError::new_err(format!(
+                                    "No built-in {} stop words for language '{}'",
+                                    family, lang
+                                ))
+                            })?
+                            .into_iter()
+                            .map(|s| s.to_string())
+                            .collect()
+                    }
+                    // `"terrier-pisa"`: no stop words at all by design.
+                    None => Vec::new(),
+                }
             }
             Some(obj) => {
                 if let Ok(true) = obj.extract::<bool>() {
@@ -1988,6 +2057,30 @@ impl PyBOWIndexBuilder {
             (None, None) => crate::vocab::analyzer::StopWordFilterMode::Both,
         };
 
+        // Query-only stop words (never applied at index time): fixed by
+        // `pipeline` alone, not by `stop_words=` -- it approximates a
+        // specific reference system's own query-time behavior (currently
+        // only `"terrier-pisa"`), not a general user-tunable list.
+        let resolved_query_stop_words: Vec<String> = pipeline_defaults
+            .as_ref()
+            .and_then(|pd| pd.query_only_stop_words_family)
+            .map(|family| {
+                crate::vocab::stopwords::get_stop_words_for_family(lang, family)
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "No built-in {} stop words for language '{}'",
+                            family, lang
+                        ))
+                    })
+                    .map(|words| words.into_iter().map(|s| s.to_string()).collect())
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let query_stop_word_refs: Vec<&str> = resolved_query_stop_words
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+
         let make_analyzer = |stemmer_name: &str,
                              stemmer_box: Box<dyn crate::vocab::stemmer::Stemmer>,
                              tokenizer: crate::vocab::analyzer::Tokenizer|
@@ -1998,6 +2091,7 @@ impl PyBOWIndexBuilder {
                 TextAnalyzer::with_stop_words(stemmer_box, &stop_word_refs)
             };
             a.set_stop_words_filter_mode(filter_mode);
+            a.set_query_stop_words(&query_stop_word_refs);
             a.set_tokenizer(tokenizer);
             // Store config for later retrieval. `stop_words_list` preserves
             // the *exact* list used here (not just whether one was given) so
@@ -2011,6 +2105,7 @@ impl PyBOWIndexBuilder {
                 stop_words_list: resolved_stop_words.clone(),
                 stop_words_family: resolved_family.map(|f| f.as_str().to_string()),
                 stop_words_filter_mode: filter_mode,
+                query_stop_words_list: resolved_query_stop_words.clone(),
                 english_possessive_filter: tokenizer
                     == crate::vocab::analyzer::Tokenizer::LuceneEnglish,
                 tokenizer,
@@ -2368,9 +2463,12 @@ impl PyTextAnalyzer {
         // reproducing the old "check both" behavior for those indices.
         let filter_mode = config.stop_words_filter_mode;
         let tokenizer = config.effective_tokenizer();
+        let query_stop_words = config.query_stop_words_list.clone();
         analyzer.set_config(config);
         analyzer.set_tokenizer(tokenizer);
         analyzer.set_stop_words_filter_mode(filter_mode);
+        let query_stop_word_refs: Vec<&str> = query_stop_words.iter().map(|s| s.as_str()).collect();
+        analyzer.set_query_stop_words(&query_stop_word_refs);
 
         Ok(Self { inner: analyzer })
     }

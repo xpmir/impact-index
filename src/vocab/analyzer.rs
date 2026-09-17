@@ -281,6 +281,19 @@ pub struct AnalyzerConfig {
     /// indices built with them must not silently change query results.
     #[serde(default)]
     pub stop_words_filter_mode: StopWordFilterMode,
+    /// Extra stop words checked only at query time, never at index time --
+    /// unlike `stop_words_list`, which applies to both. Used by
+    /// `pipeline="terrier-pisa"`: PISA's own index, as built by the
+    /// `pyterrier_pisa` wrapper commonly compared against, never filters
+    /// stop words from what it stores, but its own query processing does
+    /// exclude them (verified: querying it with only stop words returns no
+    /// results). Indexing with none but querying as if Terrier's list
+    /// applied reproduces that asymmetry. Checked pre-stem, against the raw
+    /// token, same as `PreStem` mode's index-time check. `#[serde(default)]`
+    /// so older indices deserialize with none (no query-time-only
+    /// filtering, the previous behavior).
+    #[serde(default)]
+    pub query_stop_words_list: Vec<String>,
     /// Deprecated, superseded by `tokenizer`. Still written (kept in sync
     /// with `tokenizer`) so indices built before `tokenizer` existed still
     /// deserialize correctly; read via [`Self::effective_tokenizer`], never
@@ -303,6 +316,7 @@ impl Default for AnalyzerConfig {
             stop_words_list: Vec::new(),
             stop_words_family: None,
             stop_words_filter_mode: StopWordFilterMode::Both,
+            query_stop_words_list: Vec::new(),
             english_possessive_filter: false,
             tokenizer: Tokenizer::Standard,
         }
@@ -352,6 +366,12 @@ pub struct TextAnalyzer {
     /// `"lucene"`/`"terrier"` presets) narrow it via
     /// [`Self::set_stop_words_filter_mode`].
     filter_mode: StopWordFilterMode,
+    /// Extra stop words checked only in [`Self::analyze_query`], never in
+    /// [`Self::analyze_doc`]/[`Self::analyze_doc_positional`] -- see
+    /// [`AnalyzerConfig::query_stop_words_list`]. Checked pre-stem, against
+    /// the raw token. Empty (no-op) unless explicitly set via
+    /// [`Self::set_query_stop_words`].
+    query_stop_words: HashSet<String>,
     /// Which tokenizer variant is active (word-splitting/apostrophe rules).
     active_tokenizer: Tokenizer,
     /// Analyzer config for serialization
@@ -367,6 +387,7 @@ impl TextAnalyzer {
             stop_words: HashSet::new(),
             stemmed_stop_words: HashSet::new(),
             filter_mode: StopWordFilterMode::Both,
+            query_stop_words: HashSet::new(),
             active_tokenizer: Tokenizer::Standard,
             config: AnalyzerConfig::default(),
         }
@@ -381,6 +402,7 @@ impl TextAnalyzer {
             stop_words: stop_words.iter().map(|s| s.to_string()).collect(),
             stemmed_stop_words,
             filter_mode: StopWordFilterMode::Both,
+            query_stop_words: HashSet::new(),
             active_tokenizer: Tokenizer::Standard,
             config: AnalyzerConfig::default(),
         }
@@ -394,6 +416,7 @@ impl TextAnalyzer {
             stop_words: HashSet::new(),
             stemmed_stop_words: HashSet::new(),
             filter_mode: StopWordFilterMode::Both,
+            query_stop_words: HashSet::new(),
             active_tokenizer: Tokenizer::Standard,
             config: AnalyzerConfig::default(),
         }
@@ -412,6 +435,7 @@ impl TextAnalyzer {
             stop_words: stop_words.iter().map(|s| s.to_string()).collect(),
             stemmed_stop_words,
             filter_mode: StopWordFilterMode::Both,
+            query_stop_words: HashSet::new(),
             active_tokenizer: Tokenizer::Standard,
             config: AnalyzerConfig::default(),
         }
@@ -450,6 +474,14 @@ impl TextAnalyzer {
     pub fn set_stop_words_filter_mode(&mut self, mode: StopWordFilterMode) {
         self.filter_mode = mode;
         self.config.stop_words_filter_mode = mode;
+    }
+
+    /// Set extra stop words checked only at query time (the `query_stop_words`
+    /// field; see [`AnalyzerConfig::query_stop_words_list`]). Also mirrored
+    /// into `self.config` so it's persisted with the index.
+    pub fn set_query_stop_words(&mut self, words: &[&str]) {
+        self.query_stop_words = words.iter().map(|s| s.to_string()).collect();
+        self.config.query_stop_words_list = words.iter().map(|s| s.to_string()).collect();
     }
 
     /// Whether the raw (pre-stem) `token` should be dropped as a stop word.
@@ -604,13 +636,19 @@ impl TextAnalyzer {
 
     /// Analyze query text: tokenize, stem, lookup in vocabulary.
     ///
-    /// Does NOT grow vocabulary — unknown terms are skipped.
+    /// Does NOT grow vocabulary — unknown terms are skipped. Also applies
+    /// `query_stop_words` (pre-stem, raw token) on top of the usual
+    /// pre/post-stem checks -- query-only filtering that never affects
+    /// indexing, see `query_stop_words`'s doc comment.
     /// Returns a map from TermIndex to TF (for boosting).
     pub fn analyze_query(&self, text: &str) -> HashMap<TermIndex, f32> {
         let tokens = self.tokenize(text);
         let mut query: HashMap<TermIndex, f32> = HashMap::new();
 
         for token in &tokens {
+            if self.query_stop_words.contains(token) {
+                continue;
+            }
             let stemmed = self.stemmer.stem(token);
             if self.is_post_stem_stop_word(&stemmed) {
                 continue;
@@ -718,6 +756,10 @@ impl TextAnalyzer {
             // takes no stop words at all, so the mode is moot here; kept
             // consistent with `with_stop_words`'s default below.
             filter_mode: StopWordFilterMode::Both,
+            // Empty here too -- set from `config.query_stop_words_list` by
+            // the caller afterward (`PyTextAnalyzer::from_index`), same as
+            // `filter_mode` above.
+            query_stop_words: HashSet::new(),
             active_tokenizer: config.effective_tokenizer(),
             config,
         })
@@ -745,6 +787,7 @@ impl TextAnalyzer {
             // config-derived mode to apply (`PyTextAnalyzer::from_index`)
             // set it explicitly afterward via `set_stop_words_filter_mode`.
             filter_mode: StopWordFilterMode::Both,
+            query_stop_words: HashSet::new(),
             active_tokenizer: config.effective_tokenizer(),
             config,
         })
