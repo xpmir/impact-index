@@ -5,7 +5,22 @@ on:
     types: [created]
 
 jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          if [ "$tag" != "$version" ]; then
+            echo "::error file=Cargo.toml::Release tag $GITHUB_REF_NAME does not match Cargo.toml version $version. Bump Cargo.toml (and Cargo.lock), then recreate the release."
+            exit 1
+          fi
+          echo "Version $version matches tag $GITHUB_REF_NAME"
+
   linux:
+    needs: check-version
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -44,6 +59,7 @@ jobs:
 
 
   windows:
+    needs: check-version
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -92,6 +108,7 @@ jobs:
           path: dist
 
   macos:
+    needs: check-version
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -137,6 +154,7 @@ jobs:
           path: dist
 
   sdist:
+    needs: check-version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
