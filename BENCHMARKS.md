@@ -29,22 +29,30 @@ Porter stemmer, Lucene ~33-word stopword list, pre-stem filtering.
 
 ### Terrier-aligned — `pipeline="terrier"`
 
-Snowball/Porter2 stemmer, Terrier ~730-word stopword list, post-stem
-filtering, PISA's own tokenizer. Matches PISA's defaults; close to but not
-verified identical to real Terrier 5's (unverified: its own Java
-tokenizer). For real Terrier 5's stemmer instead, use
-`pipeline="terrier", stemmer="porter"`.
+Snowball/Porter2 stemmer, Terrier ~730-word stopword list, pre-stem
+filtering (checked against the raw word list, before stemming), PISA's own
+tokenizer. Pre-stem filtering matches real Terrier 5's default
+`termpipelines=Stopwords,PorterStemmer` order — verified by dumping an
+isolated Terrier 5 index's lexicon directly (e.g. "because" is absent
+outright, never surviving as stemmed "becaus"). For real Terrier 5's
+stemmer instead of Snowball, use `pipeline="terrier", stemmer="porter"`.
 
 | System | x86 q/s | Index size | MRR@10 |
 |--------|---------|-----------|--------|
-| **impact-index** (compressed, MaxScore) | **220 ± 1** | 0.51 GB | 0.1883 |
-| impact-index (compressed, WAND/BMW) | 183 ± 0 | 0.51 GB | 0.1883 |
+| **impact-index** (compressed, MaxScore) | **230 ± 1** | 0.50 GB | 0.1882 |
+| impact-index (compressed, WAND/BMW) | 198 ± 1 | 0.50 GB | 0.1882 |
 | Terrier 5 (PyTerrier) | 26 ± 0 | 1.31 GB | 0.1877 |
-| PISA (Block-Max WAND) | 177 ± 1 | 0.60 GB | 0.1854 |
-| PISA (MaxScore) | 150 ± 1 | 0.60 GB | 0.1854 |
+| PISA (Block-Max WAND) | 215 ± 1 | 0.60 GB | 0.1854 |
+| PISA (MaxScore) | 181 ± 1 | 0.60 GB | 0.1854 |
 
-- Result overlap vs PISA (Block-Max WAND), full 6,980-query set: @10=0.901, @100=0.924.
-- Terrier 5 itself: @10=0.878 vs PISA (different stemmer/stopword-filter order).
+- Result overlap vs **Terrier 5**, full 6,980-query set: @10=0.963, @100=0.966.
+- Result overlap vs **PISA** (Block-Max WAND): @10=0.819, @100=0.852.
+- Why PISA's overlap is lower: `pyterrier_pisa` (the wrapper used here)
+  never removes stop words from PISA's index or query scoring, at any
+  setting — "the" alone is indexed in 87% of docs (df=7,714,561/8,841,823).
+  Architectural, not a bug: PISA's `stops=` only feeds its native CLI tool,
+  not this wrapper's `index()`/`bm25()`. Terrier 5 itself only reaches
+  @10=0.878 vs PISA, for the same reason.
 - No ARM measurement (PISA/Terrier 5 are x86-only); no reordered variant.
 
 MaxScore is impact-index's headline algorithm in both tables; WAND/BMW is
@@ -80,7 +88,7 @@ ablation`.
 | Config | Build (s) | Size (MB) | q/s | MRR@10 |
 |--------|-----------|-----------|-----|--------|
 | Lucene stopwords (~33 words) | 266 | 639.2 | 97 ± 0 | 0.1851 |
-| Terrier stopwords (~730 words) | 250 | 517.2 | 220 ± 1 | 0.1883 |
+| Terrier stopwords (~730 words) | 234 | 509.1 | 230 ± 1 | 0.1882 |
 
 - Stopwords are the dominant lever: Terrier's ~730-word list more than doubles throughput vs. Lucene's ~33-word one.
 - Porter vs. Snowball stemming: negligible difference at fixed stopwords.

@@ -37,11 +37,15 @@ MaxScore is its headline algorithm.
 
 | System | x86 q/s | Index size | MRR@10 |
 |--------|---------|-----------|--------|
-| **impact-index** (compressed, MaxScore) | **220 ± 1** | 0.51 GB | 0.1883 |
+| **impact-index** (compressed, MaxScore) | **230 ± 1** | 0.50 GB | 0.1882 |
 | Terrier 5 (PyTerrier) | 26 ± 0 | 1.31 GB | 0.1877 |
-| PISA (Block-Max WAND) | 177 ± 1 | 0.60 GB | 0.1854 |
+| PISA (Block-Max WAND) | 215 ± 1 | 0.60 GB | 0.1854 |
 
-- Result overlap: @10=0.985/@100=0.989 vs Pyserini, @10=0.901/@100=0.924 vs PISA.
+- Result overlap: @10=0.985/@100=0.989 vs Pyserini, @10=0.963/@100=0.966 vs
+  Terrier 5. Overlap vs PISA is lower (@10=0.819/@100=0.852) because PISA's
+  own index, via the `pyterrier_pisa` wrapper used here, doesn't filter
+  stop words at all — see [BENCHMARKS.md](BENCHMARKS.md) for why that's not
+  a fidelity problem on impact-index's side.
 - Compressed index is lossless (same results as raw) in both configurations.
 - q/s is mean ± std over 5 search-only repeats, warm resident index. ARM numbers are from an earlier session (no ARM host this run).
 

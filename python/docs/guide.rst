@@ -219,8 +219,8 @@ all three axes to match that system's own defaults in one go:
         "/path/to/index", pipeline="pyserini", stop_words=True,
     )
 
-    # Matches PISA's own defaults (also close to, but not identical to,
-    # real Terrier 5 -- see the table below)
+    # Matches real Terrier 5's own defaults (and closely approximates
+    # PISA's tokenizer -- see the table below)
     builder = impact_index.BOWIndexBuilder(
         "/path/to/index", pipeline="terrier", stop_words=True,
     )
@@ -231,10 +231,10 @@ axis, keeping the pipeline's tokenizer and stop-word timing:
 
 .. code-block:: python
 
-    # Terrier's tokenizer + stop-word timing, but real Terrier 5's own
-    # stemmer (classic Porter) instead of PISA's Snowball/Porter2
+    # Terrier's tokenizer + stop-word timing, but PISA's own stemmer
+    # (Snowball/Porter2) instead of real Terrier 5's classic Porter
     builder = impact_index.BOWIndexBuilder(
-        "/path/to/index", pipeline="terrier", stemmer="porter",
+        "/path/to/index", pipeline="terrier", stemmer="snowball",
     )
 
 Omitting ``pipeline`` entirely falls back to today's defaults (equivalent
@@ -248,13 +248,34 @@ System                   Tokenizer         Stemmer               Stop words chec
 ======================== ================= ===================== ==================================
 Lucene/Anserini/Pyserini strips trailing    classic Porter         *before* stemming, against the raw
                          ``'s`` only        (``PorterStemFilter``) token (Lucene's ~33-word list)
-PISA                     truncates at the   Snowball/Porter2       *after* stemming, against the raw
-                         *first* apostrophe                        (never-stemmed) list (Terrier's
-                         anywhere                                  ~730-word list)
-Terrier 5 (real)         (Java tokenizer,   classic Porter         *before* stemming (Terrier's own
-                         not independently                         ~730-word list)
-                         verified here)
+Terrier 5 (real)         (Java tokenizer,   classic Porter         *before* stemming, against the raw
+                         not independently                         token (Terrier's own ~730-word
+                         verified here)                             list) -- default
+                                                                     ``termpipelines=Stopwords,``
+                                                                     ``PorterStemmer``, verified by
+                                                                     dumping an isolated Terrier 5
+                                                                     index's lexicon directly
+PISA (native CLI)        truncates at the   Snowball/Porter2       *after* stemming, against the raw
+                         *first* apostrophe                        (never-stemmed) list -- PISA's
+                         anywhere                                  own ``tools/app.cpp``, not
+                                                                     exercised by the
+                                                                     ``pyterrier_pisa`` wrapper this
+                                                                     project benchmarks against (see
+                                                                     below)
 ======================== ================= ===================== ==================================
+
+``pipeline="terrier"`` matches the middle row (real Terrier 5, verified),
+not PISA's native CLI row: it uses pre-stem filtering, and PISA's own
+tokenizer (the closest available approximation to Terrier 5's, whose Java
+tokenizer hasn't been independently verified). Note that the
+``pyterrier_pisa`` Python wrapper used for this project's PISA benchmark
+comparisons doesn't remove stop words from its index at all, at index time
+or query time -- its ``stops=`` argument only affects PISA's own native CLI
+tool. So there is no PISA index to match on stop-word handling; only
+Terrier 5's is reproducible here. See `BENCHMARKS.md
+<https://github.com/experimaestro/experimaestro-ir-rust/blob/main/BENCHMARKS.md>`_
+for the measured consequence (result overlap is much higher against
+Terrier 5 than against PISA).
 
 The tokenizer difference is easy to miss but changes a large fraction of
 the vocabulary: PISA's ``EnglishTokenStream`` (``tools/tokenizer.cpp`` in
@@ -272,11 +293,6 @@ MARCO passages contain at least one apostrophe token, so getting this
 wrong silently mismatches a real IR system on a large slice of the
 collection's vocabulary — not just on the possessives the name suggests.
 
-Real Terrier 5's own tokenizer hasn't been independently verified against
-this table (only PISA's C++ source has been read directly); ``terrier``
-stop words + PISA's tokenizer is the closest available approximation, and
-what the "Terrier-aligned" benchmark numbers use.
-
 Choosing a stemmer
 ~~~~~~~~~~~~~~~~~~
 
@@ -286,9 +302,9 @@ Two stemmers are available via ``stemmer=`` (or picked automatically by
 - ``"porter"`` — a direct port of Lucene's ``PorterStemFilter``. Pyserini's
   own default, and real Terrier 5's.
 - ``"snowball"`` — the classic Porter2/Snowball algorithm. PISA's own
-  default (and what ``pipeline="terrier"`` picks, to match PISA rather
-  than real Terrier 5 — pass ``stemmer="porter"`` explicitly for the
-  latter).
+  default (and what ``pipeline="terrier"`` picks by default — pass
+  ``stemmer="porter"`` explicitly to match real Terrier 5's stemmer
+  instead).
 - ``None`` (default without a stemmer) — no stemming.
 
 The two disagree on some common words (e.g. "community", "day", "use"
@@ -379,19 +395,18 @@ restored automatically on reload.
 
 .. note::
 
-    Stop-word filtering is applied at a different pipeline stage per
-    family, matching each family's reference system exactly: the
-    ``"lucene"`` family filters the raw token *before* stemming (as
-    Lucene's ``EnglishAnalyzer`` does), while the ``"terrier"`` family
-    stems first and then filters the *stemmed* token against the raw
-    (never-stemmed) stop-word list (as PISA's analyzer does) — so an
-    inflected form like "however" (stemming to "howev") is *not* caught
-    even under the Terrier family, matching PISA's own behavior rather
-    than being over-aggressively filtered. A custom ``stop_words=[...]``
-    list checks both stages, since there's no single reference pipeline
-    to match. With an explicit ``pipeline=`` (see above), that pipeline's
-    own timing always wins, even if ``stop_words=`` is also overridden
-    with a custom list or the other family's built-in one.
+    Both built-in families filter the raw token *before* stemming,
+    matching their reference system exactly: the ``"lucene"`` family as
+    Lucene's ``EnglishAnalyzer`` does, and the ``"terrier"`` family as
+    real Terrier 5's default ``termpipelines=Stopwords,PorterStemmer``
+    does (verified by dumping an isolated Terrier 5 index's lexicon
+    directly). So an inflected form like "however" is caught directly
+    against the raw list, before it would otherwise stem to "howev". A
+    custom ``stop_words=[...]`` list checks both pre- and post-stem
+    stages, since there's no single reference pipeline to match. With an
+    explicit ``pipeline=`` (see above), that pipeline's own timing always
+    wins, even if ``stop_words=`` is also overridden with a custom list or
+    the other family's built-in one.
 
 Loading a saved index
 ~~~~~~~~~~~~~~~~~~~~~

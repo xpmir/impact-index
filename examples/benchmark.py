@@ -716,7 +716,10 @@ def build_or_load_pisa_index(
 
     if not force_rebuild and manifest_path.exists():
         index = PisaIndex(
-            str(index_dir), stemmer="porter2", threads=os.cpu_count() or 4
+            str(index_dir),
+            stemmer="porter2",
+            stops="terrier",
+            threads=os.cpu_count() or 4,
         )
         return index, index_key, index_dir, False
 
@@ -725,6 +728,18 @@ def build_or_load_pisa_index(
     index = PisaIndex(
         str(index_dir),
         stemmer="porter2",  # Snowball Porter2 -- PISA's own analysis, not Lucene-matched
+        # Explicit for self-documentation only -- PisaIndex already defaults
+        # to PisaStopwords.terrier. Either way, this setting never removes
+        # anything from the persisted index or its BM25-quantized files:
+        # `stops=` only feeds PISA's native CLI stop-word exclusion path,
+        # which this wrapper's index()/bm25() calls don't exercise
+        # ("Dropping 0 terms" is logged during index construction
+        # regardless of this setting). So PISA's index always contains
+        # every stemmed token, including stop words ("the" alone hit ~87%
+        # of MS MARCO passages, df=7,714,561/8,841,823) -- unlike
+        # impact-index and real Terrier 5, which both drop them. This is
+        # architectural, not fixable here; see BENCHMARKS.md.
+        stops="terrier",
         threads=os.cpu_count() or 4,
         index_encoding="block_simdbp",
     )

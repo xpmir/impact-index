@@ -159,32 +159,47 @@ fn pisa_tokenize(text: &str) -> Vec<String> {
 
 /// Which pipeline stage(s) stop words are checked at.
 ///
-/// impact-index is meant to match two different reference pipelines
-/// depending on the requested stop-word family, and they disagree about
+/// impact-index is meant to match reference pipelines that disagree about
 /// *when* stop words are removed relative to stemming:
 ///
 /// - Real Lucene (`EnglishAnalyzer`, wrapped by Anserini/Pyserini):
 ///   `StopFilter` runs before `PorterStemFilter` -- stop words are checked
 ///   exactly once, pre-stem.
-/// - Real PISA (`pisa-engine/pisa`, compared against for the
-///   Terrier-aligned pipeline): `tools/app.cpp`'s `Analyzer::text_analyzer`
-///   appends `StopWordRemover` *after* the stemmer, and compares the
-///   already-stemmed token against the literal, never-separately-stemmed
-///   word list -- stop words are checked exactly once, post-stem, against
-///   the raw list.
+/// - Real Terrier 5 (compared against for the Terrier-aligned pipeline):
+///   default `termpipelines=Stopwords,PorterStemmer` -- `Stopwords` also
+///   runs before the stemmer, checked once, pre-stem, against the raw
+///   list. Verified by dumping an isolated Terrier 5 index's lexicon
+///   directly (e.g. "because" is absent outright, never appearing as a
+///   stemmed "becaus").
+/// - PISA's own native CLI (`pisa-engine/pisa`, `tools/app.cpp`'s
+///   `Analyzer::text_analyzer`) does the opposite: it appends
+///   `StopWordRemover` *after* the stemmer, comparing the already-stemmed
+///   token against the literal, never-separately-stemmed word list --
+///   checked once, post-stem. Note this is PISA's native indexing tool,
+///   not `pyterrier_pisa` (the Python wrapper used for this project's PISA
+///   benchmark comparisons): that wrapper's `PisaIndex.index()` never
+///   removes stop words from the persisted index at all -- its `stops=`
+///   parameter only prunes stop words from the *query* at retrieval time
+///   (verified: "Dropping 0 terms" logged regardless of the setting). So
+///   there is no real index to "match" on the PISA side of that
+///   comparison; only Terrier 5's is reproducible here, hence `PreStem`.
 ///
-/// Neither real system checks both stages. impact-index historically did
-/// (see `dcc4b20`), which is only correct for an arbitrary custom list with
-/// no declared family -- see [`Self::Both`].
+/// No real system checks both stages. impact-index historically did (see
+/// `dcc4b20`), which is only correct for an arbitrary custom list with no
+/// declared family -- see [`Self::Both`].
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum StopWordFilterMode {
-    /// Check the raw (pre-stem) token only. Matches real Lucene: exactly
-    /// one `StopFilter` pass, before stemming.
+    /// Check the raw (pre-stem) token only. Matches real Lucene and real
+    /// Terrier 5: exactly one `StopFilter`/`Stopwords` pass, before
+    /// stemming. Used by both the `"lucene"` and `"terrier"` presets.
     PreStem,
     /// Check the stemmed token, against the *raw* (unstemmed) stop word
-    /// set. Matches real PISA: exactly one pass, after stemming, against
-    /// the literal word list (not a separately pre-stemmed copy of it).
+    /// set. Matches PISA's own native CLI indexing tool (not the
+    /// `pyterrier_pisa` wrapper this project benchmarks against, which
+    /// never removes stop words from its index at all -- see the module
+    /// doc above). Not used by any built-in preset; available for direct
+    /// use via [`Self::set_stop_words_filter_mode`] if ever needed.
     PostStem,
     /// Check both: the raw token pre-stem, then the stemmed token against
     /// a pre-stemmed copy of the list post-stem. This is the historical
@@ -313,9 +328,9 @@ impl AnalyzerConfig {
 /// [pre-stem stop words] -> stem -> [post-stem stop words] -> vocabulary
 /// lookup. Which of the two stop-word checks actually run is governed by
 /// [`StopWordFilterMode`] (see [`Self::is_pre_stem_stop_word`] and
-/// [`Self::is_post_stem_stop_word`]) -- matching Lucene requires only the
-/// pre-stem check, matching PISA/Terrier only the post-stem one, and an
-/// arbitrary custom list runs both, for backward compatibility.
+/// [`Self::is_post_stem_stop_word`]) -- matching Lucene or Terrier requires
+/// only the pre-stem check, and an arbitrary custom list runs both, for
+/// backward compatibility.
 pub struct TextAnalyzer {
     vocab: Vocabulary,
     stemmer: Box<dyn Stemmer>,
@@ -451,12 +466,12 @@ impl TextAnalyzer {
 
     /// Whether an already-stemmed token should be dropped as a stop word.
     /// Mode-dependent (see [`StopWordFilterMode`]):
-    /// - `PreStem` (Lucene): never -- Lucene checks stop words exactly once,
-    ///   pre-stem, in [`Self::is_pre_stem_stop_word`].
-    /// - `PostStem` (Terrier/PISA): the stemmed token against the *raw*
-    ///   `stop_words` set -- PISA's `StopWordRemover` runs after its
-    ///   stemmer and compares against the literal, never-separately-stemmed
-    ///   word list.
+    /// - `PreStem` (Lucene and Terrier presets): never -- both check stop
+    ///   words exactly once, pre-stem, in [`Self::is_pre_stem_stop_word`].
+    /// - `PostStem` (PISA's native CLI, not a preset default): the stemmed
+    ///   token against the *raw* `stop_words` set -- PISA's
+    ///   `StopWordRemover` runs after its stemmer and compares against the
+    ///   literal, never-separately-stemmed word list.
     /// - `Both` (custom list, or a config predating this enum): the stemmed
     ///   token against `stemmed_stop_words`, a pre-stemmed copy of the list
     ///   -- the historical impact-index behavior, unchanged for callers
@@ -1036,9 +1051,9 @@ mod stop_word_filter_mode_tests {
         );
     }
 
-    /// Terrier family (`PostStem` mode): the identical case IS removed --
-    /// the post-stem check (against the raw list) catches it, matching
-    /// PISA.
+    /// `PostStem` mode (PISA's native CLI behavior, not a preset default):
+    /// the identical case IS removed -- the post-stem check (against the
+    /// raw list) catches it.
     #[test]
     fn terrier_mode_removes_stem_collision() {
         let stemmer = SnowballStemmer::new("english").unwrap();
@@ -1061,9 +1076,9 @@ mod stop_word_filter_mode_tests {
         );
     }
 
-    /// Terrier family's post-stem check must compare against the RAW stop
-    /// word set, not a separately pre-stemmed copy (the old
-    /// `stemmed_stop_words` behavior) -- this is what distinguishes the fix.
+    /// `PostStem` mode's check must compare against the RAW stop word set,
+    /// not a separately pre-stemmed copy (the old `stemmed_stop_words`
+    /// behavior) -- this is what distinguishes the fix.
     /// Uses [`ToyStemmer`] so the stop word's own stem deliberately differs
     /// from itself: "wolf" (raw stop word) stems to "wolv", while the
     /// document token "wolves" stems to "wolf" (the literal raw stop word

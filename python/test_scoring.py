@@ -269,16 +269,11 @@ class TestBOWIndexBuilder:
         # Lucene's 33-word list -- verified against
         # src/vocab/stopwords/{terrier,lucene}/english*.txt.
         #
-        # Terrier's family filters post-stem only, against the RAW word
-        # list (matching real PISA -- see `StopWordFilterMode::PostStem`),
-        # so a word is only actually caught if its own stem happens to
-        # equal its raw form. "particular" stems to itself ("particular"),
-        # so it's still caught. "however" and "several" stem to "howev"
-        # and "sever" respectively -- neither matches the raw list entry,
-        # so PISA's real algorithm (faithfully reproduced here) does NOT
-        # remove them, even though they're nominally "in the list". This
-        # is an intentional, documented quirk of matching PISA exactly, not
-        # a bug.
+        # Terrier's family filters pre-stem only, against the RAW word list
+        # (matching real Terrier 5's default `Stopwords,PorterStemmer`
+        # termpipeline -- stop words are checked once, before stemming --
+        # see `StopWordFilterMode::PreStem`), so all three are caught
+        # regardless of how they stem.
         text = (
             "the cat and the dog are however running in a particular "
             "and several wide open field"
@@ -317,14 +312,16 @@ class TestBOWIndexBuilder:
         # Reload each from its saved config and confirm the family that was
         # actually used survives a reload (not silently falling back).
         analyzer_terrier = impact_index.TextAnalyzer.from_index(d_terrier)
-        # "particular" stems to itself, so Terrier's post-stem-against-raw
-        # check catches it.
+        # All three are checked pre-stem, against the raw list, so all are
+        # caught regardless of how they'd otherwise stem.
         assert analyzer_terrier.analyze_query("particular") == {}
-        # "however" stems to "howev", which isn't in the raw list -- PISA's
-        # literal algorithm does not catch this, and neither do we.
-        assert len(analyzer_terrier.analyze_query("however")) > 0
+        assert analyzer_terrier.analyze_query("however") == {}
+        assert analyzer_terrier.analyze_query("several") == {}
+        # Lucene's shorter list doesn't contain any of them.
         analyzer_lucene = impact_index.TextAnalyzer.from_index(d_lucene)
         assert len(analyzer_lucene.analyze_query("however")) > 0
+        assert len(analyzer_lucene.analyze_query("particular")) > 0
+        assert len(analyzer_lucene.analyze_query("several")) > 0
 
     def test_doc_metadata_copy_files(self, rng, tmp_path):
         src = str(tmp_path / "src")

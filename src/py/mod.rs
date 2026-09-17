@@ -1885,7 +1885,13 @@ impl PyBOWIndexBuilder {
                     stemmer: "snowball",
                     tokenizer: crate::vocab::analyzer::Tokenizer::PisaEnglish,
                     stop_words_family: crate::vocab::stopwords::StopWordFamily::Terrier,
-                    filter_mode: crate::vocab::analyzer::StopWordFilterMode::PostStem,
+                    // Real Terrier's default termpipeline is
+                    // `Stopwords,PorterStemmer` -- stopwords are filtered
+                    // BEFORE stemming, against the unstemmed word list (e.g.
+                    // "because" is dropped outright, not stemmed to "becaus"
+                    // first). Verified by dumping an isolated Terrier 5
+                    // lexicon directly. PostStem was the wrong timing.
+                    filter_mode: crate::vocab::analyzer::StopWordFilterMode::PreStem,
                 }),
                 other => Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "Unknown pipeline '{}', expected 'pyserini' or 'terrier'",
@@ -1966,16 +1972,18 @@ impl PyBOWIndexBuilder {
         // checks it at, regardless of which stop-word list ends up being
         // used); otherwise it follows the requested stop-word family (see
         // `StopWordFilterMode` docs): Lucene = pre-stem only, Terrier =
-        // post-stem only (against the raw list), no family (custom list, or
-        // no stop words at all) = both, preserving pre-existing behavior for
-        // callers not using a preset.
+        // pre-stem only too (real Terrier's default termpipeline is
+        // `Stopwords,PorterStemmer` -- stopwords before stemming, verified
+        // by dumping an isolated Terrier 5 lexicon directly), no family
+        // (custom list, or no stop words at all) = both, preserving
+        // pre-existing behavior for callers not using a preset.
         let filter_mode = match (&pipeline_defaults, resolved_family) {
             (Some(pd), _) => pd.filter_mode,
             (None, Some(crate::vocab::stopwords::StopWordFamily::Lucene)) => {
                 crate::vocab::analyzer::StopWordFilterMode::PreStem
             }
             (None, Some(crate::vocab::stopwords::StopWordFamily::Terrier)) => {
-                crate::vocab::analyzer::StopWordFilterMode::PostStem
+                crate::vocab::analyzer::StopWordFilterMode::PreStem
             }
             (None, None) => crate::vocab::analyzer::StopWordFilterMode::Both,
         };
