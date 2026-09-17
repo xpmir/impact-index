@@ -26,22 +26,22 @@ impact-index is built twice below, each time matching one reference system's
 own tokenizer/stemmer/stopwords (see [BENCHMARKS.md](BENCHMARKS.md) for why).
 MaxScore is its headline algorithm.
 
-**Lucene-aligned** (Porter stemmer, Lucene stopwords) — vs Pyserini:
+**Lucene-aligned** (`pipeline="pyserini"`) — vs Pyserini:
 
 | System | ARM q/s | x86 q/s | Index size | MRR@10 |
 |--------|---------|---------|-----------|--------|
-| **impact-index** (compressed + reordered, MaxScore) | **295** | **104.5 ± 0.4** | 0.65 GB | 0.1858 |
-| Pyserini (Lucene) | 213 | 112.0 ± 1.6 | 0.58 GB | 0.1855 |
+| **impact-index** (compressed + reordered, MaxScore) | **295** | **102 ± 0** | 0.65 GB | 0.1859 |
+| Pyserini (Lucene) | 213 | 99 ± 1 | 0.59 GB | 0.1855 |
 
-**Terrier-aligned** (Snowball stemmer, Terrier stopwords) — vs Terrier 5 and PISA:
+**Terrier-aligned** (`pipeline="terrier"`) — vs Terrier 5 and PISA:
 
 | System | x86 q/s | Index size | MRR@10 |
 |--------|---------|-----------|--------|
-| **impact-index** (compressed, MaxScore) | **223.1 ± 1.1** | 0.57 GB | 0.1885 |
-| Terrier 5 (PyTerrier) | 26.7 ± 0.1 | 1.31 GB | 0.1881 |
-| PISA (Block-Max WAND) | 177.4 ± 1.6 | 0.60 GB | 0.1854 |
+| **impact-index** (compressed, MaxScore) | **220 ± 1** | 0.51 GB | 0.1883 |
+| Terrier 5 (PyTerrier) | 26 ± 0 | 1.31 GB | 0.1877 |
+| PISA (Block-Max WAND) | 177 ± 1 | 0.60 GB | 0.1854 |
 
-- Result overlap: @10=0.985/@100=0.989 vs Pyserini, @10=0.865/@100=0.894 vs PISA.
+- Result overlap: @10=0.985/@100=0.989 vs Pyserini, @10=0.901/@100=0.924 vs PISA.
 - Compressed index is lossless (same results as raw) in both configurations.
 - q/s is mean ± std over 5 search-only repeats, warm resident index. ARM numbers are from an earlier session (no ARM host this run).
 

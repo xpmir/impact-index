@@ -208,6 +208,13 @@ class Config:
     )
     dataset: str = "msmarco-passage/dev/small"
     # impact-index-only build knobs (ignored by other systems, which use their own defaults):
+    # `pipeline` is the only place another system's tokenizer/stop-word-filter
+    # timing is selected -- "pyserini" (Lucene's tokenizer, pre-stem stop
+    # words) or "terrier" (PISA's own tokenizer -- which truncates every
+    # contraction/possessive at its first apostrophe, not just a trailing
+    # 's -- post-stem stop words). `stemmer`/`stop_words` below compose on
+    # top of it, overriding just that piece of the pipeline's defaults.
+    pipeline: Optional[str] = None  # "pyserini" | "terrier" | None
     stemmer: str = "porter"  # "porter" | "snowball"
     stop_words: Any = "lucene"  # "lucene" | "terrier" | True | None
     positions: bool = False
@@ -217,6 +224,11 @@ class Config:
     top_k: int = 100
     k1: float = 0.9
     b: float = 0.4
+    # impact-index-only: BM25 idf variant -- "bm25" (Robertson/Sparck-Jones,
+    # no +1 -- matches PISA and Terrier) or "lucene" (Lucene's
+    # BM25Similarity.idf, +1 -- matches Pyserini). Ignored by other systems,
+    # which use their own (fixed) idf formula.
+    bm25_variant: str = "bm25"
     max_queries: int = 0
 
     def display(self) -> str:
@@ -237,25 +249,39 @@ ABLATION_CONFIGS: List[Config] = [
         "no-stopwords",
         "impact-index",
         group="ablation-porter",
+        pipeline="pyserini",
         stemmer="porter",
-        stop_words=None,
+        # [] not None: with `pipeline` set, `stop_words=None` means "use
+        # the pipeline's own default list" (Python can't distinguish an
+        # omitted argument from an explicit None) -- see BOWIndexBuilder's
+        # docstring. [] is the explicit "no stop words at all" signal.
+        stop_words=[],
+        bm25_variant="lucene",
     ),
     Config(
         "lucene-stopwords",
         "impact-index",
         group="ablation-porter",
+        pipeline="pyserini",
         stemmer="porter",
         stop_words="lucene",
+        bm25_variant="lucene",
     ),
     Config(
         "lucene-stopwords_positions",
         "impact-index",
         group="ablation-porter",
+        pipeline="pyserini",
         stemmer="porter",
         stop_words="lucene",
         positions=True,
+        bm25_variant="lucene",
     ),
     Config(
+        # Deliberately NOT pipeline="terrier": this isolates the stemmer
+        # variable (snowball vs porter) at fixed Lucene stopwords/tokenizer,
+        # so it must keep the Lucene tokenizer/filter timing, not switch to
+        # PISA's -- see the "Porter vs. Snowball stemming" ablation note.
         "snowball_lucene-stopwords",
         "impact-index",
         group="ablation-snowball",
@@ -266,6 +292,7 @@ ABLATION_CONFIGS: List[Config] = [
         "snowball_terrier-stopwords",
         "impact-index",
         group="ablation-snowball",
+        pipeline="terrier",
         stemmer="snowball",
         stop_words="terrier",
     ),
@@ -285,28 +312,34 @@ COMPARISON_CONFIGS: List[Config] = [
         "impact-index (compressed, MaxScore)",
         "impact-index",
         group="lucene-aligned",
+        pipeline="pyserini",
         stemmer="porter",
         stop_words="lucene",
         compression=Compression(nbits=0, block_size=128),
         algorithm="maxscore",
+        bm25_variant="lucene",
     ),
     Config(
         "impact-index (compressed + reordered, MaxScore)",
         "impact-index",
         group="lucene-aligned",
+        pipeline="pyserini",
         stemmer="porter",
         stop_words="lucene",
         compression=Compression(nbits=0, block_size=128, reorder=True),
         algorithm="maxscore",
+        bm25_variant="lucene",
     ),
     Config(
         "impact-index (compressed, WAND/BMW)",
         "impact-index",
         group="lucene-aligned",
+        pipeline="pyserini",
         stemmer="porter",
         stop_words="lucene",
         compression=Compression(nbits=0, block_size=128),
         algorithm="wand",
+        bm25_variant="lucene",
     ),
     Config("Pyserini (Lucene)", "pyserini", group="lucene-aligned"),
     # --- Terrier-aligned: impact-index[Terrier] vs Terrier 5 and PISA ---
@@ -314,6 +347,7 @@ COMPARISON_CONFIGS: List[Config] = [
         "impact-index (compressed, MaxScore)",
         "impact-index",
         group="terrier-aligned",
+        pipeline="terrier",
         stemmer="snowball",
         stop_words="terrier",
         compression=Compression(nbits=0, block_size=128),
@@ -323,6 +357,7 @@ COMPARISON_CONFIGS: List[Config] = [
         "impact-index (compressed, WAND/BMW)",
         "impact-index",
         group="terrier-aligned",
+        pipeline="terrier",
         stemmer="snowball",
         stop_words="terrier",
         compression=Compression(nbits=0, block_size=128),
@@ -362,6 +397,7 @@ def index_cache_fields(cfg: Config) -> dict:
         return {
             "system": cfg.system,
             "dataset": cfg.dataset,
+            "pipeline": cfg.pipeline,
             "stemmer": cfg.stemmer,
             "stop_words": cfg.stop_words,
             "positions": cfg.positions,
@@ -383,6 +419,7 @@ def search_cache_fields(cfg: Config, index_key: str) -> dict:
         "top_k": cfg.top_k,
         "k1": cfg.k1,
         "b": cfg.b,
+        "bm25_variant": cfg.bm25_variant,
         "max_queries": cfg.max_queries,
         "dataset": cfg.dataset,
     }
@@ -493,6 +530,7 @@ def build_or_load_impact_index(
         builder = impact_index.BOWIndexBuilder(
             str(index_dir),
             dtype="int32",
+            pipeline=cfg.pipeline,
             stemmer=cfg.stemmer,
             stop_words=cfg.stop_words,
             positions=cfg.positions,
@@ -558,17 +596,17 @@ class ImpactIndexHandle:
     def __init__(self, raw_index):
         self.raw_index = raw_index
         self._analyzer = raw_index.analyzer()
-        self._scored_cache: Dict[Tuple[float, float], Any] = {}
+        self._scored_cache: Dict[Tuple[float, float, str], Any] = {}
 
-    def _scored(self, k1: float, b: float):
-        key = (k1, b)
+    def _scored(self, k1: float, b: float, variant: str):
+        key = (k1, b, variant)
         if key not in self._scored_cache:
-            scoring = impact_index.BM25Scoring(k1=k1, b=b)
+            scoring = impact_index.BM25Scoring(k1=k1, b=b, variant=variant)
             self._scored_cache[key] = self.raw_index.with_scoring(scoring)
         return self._scored_cache[key]
 
     def search_once(self, queries, cfg: Config):
-        scored = self._scored(cfg.k1, cfg.b)
+        scored = self._scored(cfg.k1, cfg.b, cfg.bm25_variant)
         search_fn = (
             scored.search_wand if cfg.algorithm == "wand" else scored.search_maxscore
         )
