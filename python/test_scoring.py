@@ -21,6 +21,109 @@ class TestBM25Scoring:
         scoring = impact_index.BM25Scoring(k1=0.9, b=0.4)
         assert scoring is not None
 
+    def test_variant_bm25_and_lucene(self):
+        # "bm25" (the true/Robertson formula) is the default; "lucene" is
+        # Lucene's BM25Similarity.idf variant. Both must construct fine.
+        assert impact_index.BM25Scoring(variant="bm25") is not None
+        assert impact_index.BM25Scoring(variant="lucene") is not None
+
+    def test_variant_rejects_unknown_value(self):
+        with pytest.raises(ValueError):
+            impact_index.BM25Scoring(variant="not-a-real-variant")
+
+
+class TestPipeline:
+    def test_terrier_pipeline_truncates_at_first_apostrophe(self, tmp_path):
+        # PISA's own tokenizer (unlike Lucene's) truncates ANY contraction
+        # or possessive at the first apostrophe, not just a trailing 's --
+        # see Tokenizer::PisaEnglish. "don't" -> "don", "king's" -> "king".
+        d = str(tmp_path / "terrier")
+        import os
+
+        os.makedirs(d)
+        b = impact_index.BOWIndexBuilder(d, dtype="int32", pipeline="terrier")
+        b.add_text(0, "don't worry king's castle it's fine")
+        b.build(False)
+        analyzer = impact_index.TextAnalyzer.from_index(d)
+        assert len(analyzer.analyze_query("don king")) == 2
+
+    def test_pyserini_pipeline_keeps_only_trailing_possessive(self, tmp_path):
+        # Lucene's EnglishPossessiveFilter only strips a trailing 's --
+        # "don't" is left whole (not stemmed down to "don"), "king's" -> "king".
+        d = str(tmp_path / "pyserini")
+        import os
+
+        os.makedirs(d)
+        b = impact_index.BOWIndexBuilder(d, dtype="int32", pipeline="pyserini")
+        b.add_text(0, "don't worry king's castle it's fine")
+        b.build(False)
+        analyzer = impact_index.TextAnalyzer.from_index(d)
+        assert len(analyzer.analyze_query("don king")) == 1
+
+    def test_pipeline_composes_with_explicit_stemmer(self, tmp_path):
+        # pipeline="terrier" + stemmer="porter": terrier's tokenizer/stop
+        # words, but the Porter stemmer instead of terrier's own Snowball
+        # default -- matches real Terrier 5's own (classic Porter) stemmer.
+        d = str(tmp_path / "terrier_porter")
+        import os
+
+        os.makedirs(d)
+        b = impact_index.BOWIndexBuilder(
+            d, dtype="int32", pipeline="terrier", stemmer="porter"
+        )
+        b.add_text(0, "the cat and the dog are running, don't stop")
+        b.build(False)
+        analyzer = impact_index.TextAnalyzer.from_index(d)
+        # Terrier's list (unlike Lucene's short one) covers "and".
+        assert analyzer.analyze_query("and") == {}
+        # Terrier's tokenizer (not Lucene's) still applies: "don't" -> "don".
+        assert len(analyzer.analyze_query("don")) == 1
+
+    def test_pipeline_with_none_stop_words_uses_pipeline_default(self, tmp_path):
+        # Python can't distinguish "stop_words omitted" from
+        # "stop_words=None explicitly passed" -- with `pipeline` set, both
+        # mean "use that pipeline's own default stop-word list". Pass [] to
+        # opt out of stop words entirely while still using the pipeline's
+        # tokenizer/stemmer -- regression test for a real bug where the
+        # "no stop words" ablation config silently got Lucene's stopwords
+        # applied anyway because it passed `stop_words=None` alongside
+        # `pipeline="pyserini"`.
+        d_none = str(tmp_path / "none")
+        import os
+
+        os.makedirs(d_none)
+        b_none = impact_index.BOWIndexBuilder(
+            d_none, dtype="int32", pipeline="pyserini", stop_words=None
+        )
+        b_none.add_text(0, "the cat and the dog are running")
+        b_none.build(False)
+        analyzer_none = impact_index.TextAnalyzer.from_index(d_none)
+        assert analyzer_none.analyze_query("the") == {}, (
+            "stop_words=None with a pipeline set must use that pipeline's "
+            "default list (Lucene's, here), not skip stop-word filtering"
+        )
+
+        d_empty = str(tmp_path / "empty")
+        os.makedirs(d_empty)
+        b_empty = impact_index.BOWIndexBuilder(
+            d_empty, dtype="int32", pipeline="pyserini", stop_words=[]
+        )
+        b_empty.add_text(0, "the cat and the dog are running")
+        b_empty.build(False)
+        analyzer_empty = impact_index.TextAnalyzer.from_index(d_empty)
+        assert analyzer_empty.analyze_query("the") != {}, (
+            "stop_words=[] must explicitly disable stop-word filtering "
+            "even with a pipeline set"
+        )
+
+    def test_unknown_pipeline_rejected(self, tmp_path):
+        d = str(tmp_path / "bad_pipeline")
+        import os
+
+        os.makedirs(d)
+        with pytest.raises(ValueError):
+            impact_index.BOWIndexBuilder(d, dtype="int32", pipeline="nope")
+
 
 class TestBOWIndexBuilder:
     def test_build_with_manual_terms(self, rng, tmp_path):

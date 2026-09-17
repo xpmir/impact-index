@@ -200,17 +200,96 @@ vocabulary management:
     query = index.analyzer().analyze_query("quick fox")
     results = scored.search_maxscore(query, top_k=10)
 
+Matching a reference pipeline
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A "pipeline" is the *combination* of tokenizer, stemmer, and stop-word
+list/timing a reference IR system uses — and the three don't vary
+independently: Lucene/Pyserini, Terrier, and PISA each disagree on more
+than one axis at once (see the table below). ``pipeline=`` is the *only*
+``BOWIndexBuilder`` argument that names another system; picking one sets
+all three axes to match that system's own defaults in one go:
+
+.. code-block:: python
+
+    import impact_index
+
+    # Matches Lucene/Anserini/Pyserini's own defaults
+    builder = impact_index.BOWIndexBuilder(
+        "/path/to/index", pipeline="pyserini", stop_words=True,
+    )
+
+    # Matches PISA's own defaults (also close to, but not identical to,
+    # real Terrier 5 -- see the table below)
+    builder = impact_index.BOWIndexBuilder(
+        "/path/to/index", pipeline="terrier", stop_words=True,
+    )
+
+``stemmer=``, ``stop_words=``, and ``language=`` still compose freely on
+top of a ``pipeline=`` choice — an explicit value overrides just that one
+axis, keeping the pipeline's tokenizer and stop-word timing:
+
+.. code-block:: python
+
+    # Terrier's tokenizer + stop-word timing, but real Terrier 5's own
+    # stemmer (classic Porter) instead of PISA's Snowball/Porter2
+    builder = impact_index.BOWIndexBuilder(
+        "/path/to/index", pipeline="terrier", stemmer="porter",
+    )
+
+Omitting ``pipeline`` entirely falls back to today's defaults (equivalent
+to ``pipeline="pyserini"`` for English text), so existing code that sets
+``stemmer=``/``stop_words=`` directly keeps working unchanged.
+
+**Why all three axes at once matters:**
+
+======================== ================= ===================== ==================================
+System                   Tokenizer         Stemmer               Stop words checked
+======================== ================= ===================== ==================================
+Lucene/Anserini/Pyserini strips trailing    classic Porter         *before* stemming, against the raw
+                         ``'s`` only        (``PorterStemFilter``) token (Lucene's ~33-word list)
+PISA                     truncates at the   Snowball/Porter2       *after* stemming, against the raw
+                         *first* apostrophe                        (never-stemmed) list (Terrier's
+                         anywhere                                  ~730-word list)
+Terrier 5 (real)         (Java tokenizer,   classic Porter         *before* stemming (Terrier's own
+                         not independently                         ~730-word list)
+                         verified here)
+======================== ================= ===================== ==================================
+
+The tokenizer difference is easy to miss but changes a large fraction of
+the vocabulary: PISA's ``EnglishTokenStream`` (``tools/tokenizer.cpp`` in
+the PISA source) doesn't have a separate "possessive filter" step the way
+Lucene does — its *only* rule for an apostrophe is "keep the substring
+before the first one", applied to *any* token matching
+``[a-zA-Z0-9]+('[a-zA-Z]+)``. So ``"don't"`` -> ``"don"`` and
+``"it's"`` -> ``"it"``, not just ``"king's"`` -> ``"king"``. Lucene's
+``EnglishPossessiveFilter`` only ever strips a *trailing* ``'s``, leaving
+``"don't"`` untouched. impact-index's ``pipeline="terrier"`` replicates
+PISA's rule exactly (``Tokenizer::PisaEnglish`` in
+``src/vocab/analyzer.rs``); ``pipeline="pyserini"`` (or no ``pipeline`` at
+all) replicates Lucene's (``Tokenizer::LuceneEnglish``). Roughly 18% of MS
+MARCO passages contain at least one apostrophe token, so getting this
+wrong silently mismatches a real IR system on a large slice of the
+collection's vocabulary — not just on the possessives the name suggests.
+
+Real Terrier 5's own tokenizer hasn't been independently verified against
+this table (only PISA's C++ source has been read directly); ``terrier``
+stop words + PISA's tokenizer is the closest available approximation, and
+what the "Terrier-aligned" benchmark numbers use.
+
 Choosing a stemmer
 ~~~~~~~~~~~~~~~~~~
 
-Two stemmers are available via ``stemmer=``:
+Two stemmers are available via ``stemmer=`` (or picked automatically by
+``pipeline=``, see above):
 
-- ``"porter"`` — a direct port of Lucene's ``PorterStemFilter``. Pick this
-  to match Lucene/Anserini/Pyserini defaults as closely as possible
-  (useful when comparing results against, or reproducing, Pyserini runs).
-- ``"snowball"`` — the classic Porter2/Snowball algorithm. Pick this to
-  match PISA/Terrier defaults instead — both use Snowball-family stemmers.
-- ``None`` (default) — no stemming.
+- ``"porter"`` — a direct port of Lucene's ``PorterStemFilter``. Pyserini's
+  own default, and real Terrier 5's.
+- ``"snowball"`` — the classic Porter2/Snowball algorithm. PISA's own
+  default (and what ``pipeline="terrier"`` picks, to match PISA rather
+  than real Terrier 5 — pass ``stemmer="porter"`` explicitly for the
+  latter).
+- ``None`` (default without a stemmer) — no stemming.
 
 The two disagree on some common words (e.g. "community", "day", "use"
 stem differently), so pick based on which system you're comparing against
@@ -222,21 +301,21 @@ Tokenizer variant
 ~~~~~~~~~~~~~~~~~~
 
 Besides stemming, the analyzer also picks a tokenizer variant at the Rust
-level (``Tokenizer::Standard`` vs ``Tokenizer::LuceneEnglish``,
-``src/vocab/analyzer.rs``). ``LuceneEnglish`` additionally strips a
-trailing English possessive (``'s``) before lowercasing, matching
-Lucene's ``EnglishAnalyzer`` tokenizer chain (``StandardTokenizer`` ->
-``EnglishPossessiveFilter``); this is a tokenization concern, not a
-stemming one, so it composes with any stemmer choice (or none).
+level: ``Tokenizer::Standard``, ``Tokenizer::LuceneEnglish``, or
+``Tokenizer::PisaEnglish`` (``src/vocab/analyzer.rs`` — see the pipeline
+table above for what each one does with an apostrophe). This is a
+tokenization concern, not a stemming one, so it composes with any stemmer
+choice (or none).
 
 .. note::
 
-    This isn't a separate ``BOWIndexBuilder`` argument: the possessive
-    filter is enabled automatically whenever ``language="english"`` (the
-    default), for *any* stemmer choice, and left off for every other
-    language. There is currently no way to analyze English text without
-    possessive-stripping through ``BOWIndexBuilder`` — use the lower-level
-    Rust ``TextAnalyzer`` API directly if you need that.
+    There is no separate ``BOWIndexBuilder`` argument for the tokenizer
+    variant directly — it's selected via ``pipeline=`` (recommended) or
+    implied by ``language="english"`` (the default) for backward
+    compatibility when no ``pipeline`` is given, which always means
+    ``LuceneEnglish``. Every other language gets plain ``Standard``
+    splitting. Use the lower-level Rust ``TextAnalyzer`` API directly
+    (``set_tokenizer``) for anything not covered by these two paths.
 
 Stop words
 ~~~~~~~~~~
@@ -310,7 +389,9 @@ restored automatically on reload.
     even under the Terrier family, matching PISA's own behavior rather
     than being over-aggressively filtered. A custom ``stop_words=[...]``
     list checks both stages, since there's no single reference pipeline
-    to match.
+    to match. With an explicit ``pipeline=`` (see above), that pipeline's
+    own timing always wins, even if ``stop_words=`` is also overridden
+    with a custom list or the other family's built-in one.
 
 Loading a saved index
 ~~~~~~~~~~~~~~~~~~~~~

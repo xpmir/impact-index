@@ -24,6 +24,139 @@ fn stem_stop_words(stemmer: &dyn Stemmer, stop_words: &[&str]) -> HashSet<String
         .collect()
 }
 
+/// Which of PISA's three token types matched at a lexer position, used only
+/// to break a length tie between candidates in [`pisa_tokenize`] (PISA's
+/// lexer combinator picks the longest match, and among equal-length matches
+/// the one declared first -- see the `Lexer::Lexer()` constructor in PISA's
+/// `src/tokenizer.cpp`). Declaration order there is Abbreviature,
+/// Possessive, Term, so that's the tiebreak order here too.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PisaTokenKind {
+    Abbreviature,
+    Possessive,
+    Term,
+}
+
+/// Faithful reimplementation of PISA's `EnglishTokenStream` tokenizer
+/// (`pisa`'s `src/tokenizer.cpp`) -- a from-scratch ASCII lexer over the raw
+/// text, not a filter layered on UAX#29 word-splitting. UAX#29 and PISA's
+/// lexer disagree on where a "word" even starts and ends (not just on
+/// apostrophes), so composing the two the way [`Tokenizer::LuceneEnglish`]
+/// composes with UAX#29 would silently diverge from real PISA output. Three
+/// token types, tried at every position and resolved by longest match (see
+/// [`PisaTokenKind`] for the tie-break order):
+///
+/// - **Abbreviature** `([a-zA-Z]+\.){2,}`: two or more letter-runs each
+///   followed by a period (`"U.S.A."`, `"e.g."`) -- periods are stripped:
+///   `"U.S.A."` -> `"usa"`.
+/// - **Possessive** `[a-zA-Z0-9]+('[a-zA-Z]+)`: an alphanumeric run,
+///   *any* apostrophe, then one or more letters -- kept only up to (not
+///   including) the apostrophe: `"don't"` -> `"don"`, `"it's"` -> `"it"`,
+///   `"o'brien"` -> `"o"` (not just a trailing `'s`, unlike Lucene).
+/// - **Term** `[a-zA-Z0-9]+`: a plain alphanumeric run. Digits and letters
+///   are one character class here, and a period is *not* part of a number
+///   (unlike UAX#29): `"3.14"` -> two tokens, `"3"` and `"14"`.
+///
+/// Anything matching none of these (including any non-ASCII character --
+/// PISA's classes are plain `[a-zA-Z0-9]`, no Unicode support) is a single
+/// skipped "NotValid" character, same as whitespace/punctuation. Output is
+/// lowercased here (empirically confirmed to happen somewhere in a real
+/// PISA build's indexing pipeline, even though `EnglishTokenStream` itself
+/// doesn't call out a lowercasing step -- see the analyzer module's
+/// pipeline-comparison notes) since [`TextAnalyzer`] always indexes
+/// lowercased text regardless of tokenizer.
+fn pisa_tokenize(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+
+    let alpha_run = |from: usize| -> usize {
+        let mut j = from;
+        while j < n && chars[j].is_ascii_alphabetic() {
+            j += 1;
+        }
+        j
+    };
+    let alnum_run = |from: usize| -> usize {
+        let mut j = from;
+        while j < n && chars[j].is_ascii_alphanumeric() {
+            j += 1;
+        }
+        j
+    };
+
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n {
+        // Abbreviature: ([a-zA-Z]+\.){2,}, greedy.
+        let abbrev_end = {
+            let mut j = i;
+            let mut groups = 0u32;
+            loop {
+                let after_alpha = alpha_run(j);
+                if after_alpha == j || after_alpha >= n || chars[after_alpha] != '.' {
+                    break;
+                }
+                j = after_alpha + 1;
+                groups += 1;
+            }
+            if groups >= 2 {
+                j
+            } else {
+                i
+            }
+        };
+
+        // Possessive: [a-zA-Z0-9]+('[a-zA-Z]+).
+        let possessive_end = {
+            let after_alnum = alnum_run(i);
+            if after_alnum > i && after_alnum < n && chars[after_alnum] == '\'' {
+                let after_letters = alpha_run(after_alnum + 1);
+                if after_letters > after_alnum + 1 {
+                    after_letters
+                } else {
+                    i
+                }
+            } else {
+                i
+            }
+        };
+
+        // Term: [a-zA-Z0-9]+.
+        let term_end = alnum_run(i);
+
+        let candidates = [
+            (abbrev_end, PisaTokenKind::Abbreviature),
+            (possessive_end, PisaTokenKind::Possessive),
+            (term_end, PisaTokenKind::Term),
+        ];
+        match candidates
+            .into_iter()
+            .filter(|&(end, _)| end > i)
+            .max_by_key(|&(end, kind)| (end, std::cmp::Reverse(kind)))
+        {
+            None => i += 1, // NotValid: skip one character.
+            Some((end, kind)) => {
+                let span: String = chars[i..end].iter().collect();
+                let token = match kind {
+                    PisaTokenKind::Abbreviature => {
+                        span.chars().filter(|&c| c != '.').collect::<String>()
+                    }
+                    PisaTokenKind::Possessive => {
+                        let cut = span.find('\'').expect("possessive match has an apostrophe");
+                        span[..cut].to_string()
+                    }
+                    PisaTokenKind::Term => span,
+                };
+                if !token.is_empty() {
+                    out.push(token.to_lowercase());
+                }
+                i = end;
+            }
+        }
+    }
+    out
+}
+
 /// Which pipeline stage(s) stop words are checked at.
 ///
 /// impact-index is meant to match two different reference pipelines
@@ -73,12 +206,26 @@ pub enum StopWordFilterMode {
 /// is a tokenizer-stage concern, not a stemming one: Porter/Snowball are
 /// defined on already-clean word forms and never see the apostrophe, so
 /// `LuceneEnglish` can be paired with any stemmer (or none).
+///
+/// `PisaEnglish` matches PISA's own `EnglishTokenStream`
+/// (`src/tokenizer.cpp`), which is *not* Lucene's rule: PISA's lexer has a
+/// single `[a-zA-Z0-9]+('[a-zA-Z]+)` "Possessive" token type and, on a
+/// match, keeps only the substring before the *first* apostrophe -- for any
+/// apostrophe, not just a trailing `'s`. So `"don't"` -> `"don"`,
+/// `"it's"` -> `"it"`, `"o'brien"` -> `"o"`, not just `"king's"` ->
+/// `"king"`. This is what both PISA and (per Kamphuis et al.'s
+/// reproducibility survey) Terrier's own tokenizer do, and it matters: ~18%
+/// of MS MARCO passages contain at least one such token, so pairing
+/// Snowball/Terrier-stopwords with `LuceneEnglish` (as impact-index did
+/// before this variant existed) silently mismatches PISA/Terrier on a large
+/// fraction of the collection's vocabulary, not just on possessives.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum Tokenizer {
     #[default]
     Standard,
     LuceneEnglish,
+    PisaEnglish,
 }
 
 /// Analyzer configuration, serialized with the index for reproducibility.
@@ -150,12 +297,14 @@ impl Default for AnalyzerConfig {
 impl AnalyzerConfig {
     /// The tokenizer variant actually in effect, falling back to the
     /// legacy `english_possessive_filter` bool for indices built before
-    /// `tokenizer` existed.
+    /// `tokenizer` existed (that bool predates [`Tokenizer::PisaEnglish`],
+    /// so it can only ever mean [`Tokenizer::LuceneEnglish`]).
     pub fn effective_tokenizer(&self) -> Tokenizer {
-        if self.tokenizer == Tokenizer::LuceneEnglish || self.english_possessive_filter {
-            Tokenizer::LuceneEnglish
-        } else {
-            Tokenizer::Standard
+        match self.tokenizer {
+            Tokenizer::PisaEnglish => Tokenizer::PisaEnglish,
+            Tokenizer::LuceneEnglish => Tokenizer::LuceneEnglish,
+            Tokenizer::Standard if self.english_possessive_filter => Tokenizer::LuceneEnglish,
+            Tokenizer::Standard => Tokenizer::Standard,
         }
     }
 }
@@ -188,8 +337,8 @@ pub struct TextAnalyzer {
     /// `"lucene"`/`"terrier"` presets) narrow it via
     /// [`Self::set_stop_words_filter_mode`].
     filter_mode: StopWordFilterMode,
-    /// Strip English possessives ('s) before tokenizing
-    english_possessive_filter: bool,
+    /// Which tokenizer variant is active (word-splitting/apostrophe rules).
+    active_tokenizer: Tokenizer,
     /// Analyzer config for serialization
     config: AnalyzerConfig,
 }
@@ -203,7 +352,7 @@ impl TextAnalyzer {
             stop_words: HashSet::new(),
             stemmed_stop_words: HashSet::new(),
             filter_mode: StopWordFilterMode::Both,
-            english_possessive_filter: false,
+            active_tokenizer: Tokenizer::Standard,
             config: AnalyzerConfig::default(),
         }
     }
@@ -217,7 +366,7 @@ impl TextAnalyzer {
             stop_words: stop_words.iter().map(|s| s.to_string()).collect(),
             stemmed_stop_words,
             filter_mode: StopWordFilterMode::Both,
-            english_possessive_filter: false,
+            active_tokenizer: Tokenizer::Standard,
             config: AnalyzerConfig::default(),
         }
     }
@@ -230,7 +379,7 @@ impl TextAnalyzer {
             stop_words: HashSet::new(),
             stemmed_stop_words: HashSet::new(),
             filter_mode: StopWordFilterMode::Both,
-            english_possessive_filter: false,
+            active_tokenizer: Tokenizer::Standard,
             config: AnalyzerConfig::default(),
         }
     }
@@ -248,7 +397,7 @@ impl TextAnalyzer {
             stop_words: stop_words.iter().map(|s| s.to_string()).collect(),
             stemmed_stop_words,
             filter_mode: StopWordFilterMode::Both,
-            english_possessive_filter: false,
+            active_tokenizer: Tokenizer::Standard,
             config: AnalyzerConfig::default(),
         }
     }
@@ -265,9 +414,9 @@ impl TextAnalyzer {
 
     /// Set the tokenizer variant (word-splitting rules). See [`Tokenizer`].
     pub fn set_tokenizer(&mut self, tokenizer: Tokenizer) {
-        self.english_possessive_filter = tokenizer == Tokenizer::LuceneEnglish;
+        self.active_tokenizer = tokenizer;
         self.config.tokenizer = tokenizer;
-        self.config.english_possessive_filter = self.english_possessive_filter;
+        self.config.english_possessive_filter = tokenizer == Tokenizer::LuceneEnglish;
     }
 
     /// Set the analyzer config (for serialization).
@@ -320,40 +469,58 @@ impl TextAnalyzer {
         }
     }
 
-    /// Lowercase a token and, if enabled, strip a trailing English
-    /// possessive ('s with straight or curly apostrophe). Matches Lucene's
-    /// EnglishPossessiveFilter, which handles U+0027 ('), U+2019 ('), and
-    /// U+FF07 (').
+    /// Lowercase a token and, if [`Tokenizer::LuceneEnglish`] is active,
+    /// strip a *trailing* possessive `'s` suffix (straight U+0027, curly
+    /// U+2019, or fullwidth U+FF07), matching Lucene's
+    /// `EnglishPossessiveFilter`. Not used for [`Tokenizer::PisaEnglish`]
+    /// -- see [`pisa_tokenize`], which replaces UAX#29 splitting entirely
+    /// rather than post-processing its output.
     fn normalize_token(&self, t: &str) -> String {
         let lowered = t.to_lowercase();
-        if self.english_possessive_filter {
-            if lowered.ends_with("'s")
+        if self.active_tokenizer == Tokenizer::LuceneEnglish
+            && (lowered.ends_with("'s")
                 || lowered.ends_with("\u{2019}s")
-                || lowered.ends_with("\u{ff07}s")
-            {
-                // Remove last 2 chars (apostrophe + s)
-                let end = lowered.len() - "'s".len();
-                // Curly apostrophes are multi-byte, find the right cut point
-                let cut = lowered
-                    .rfind(|c: char| c == '\'' || c == '\u{2019}' || c == '\u{ff07}')
-                    .unwrap_or(end);
-                return lowered[..cut].to_string();
-            }
+                || lowered.ends_with("\u{ff07}s"))
+        {
+            // Remove last 2 chars (apostrophe + s)
+            let end = lowered.len() - "'s".len();
+            // Curly apostrophes are multi-byte, find the right cut point
+            let cut = lowered
+                .rfind(|c: char| c == '\'' || c == '\u{2019}' || c == '\u{ff07}')
+                .unwrap_or(end);
+            lowered[..cut].to_string()
+        } else {
+            lowered
         }
-        lowered
     }
 
-    /// Tokenize text using UAX#29 word boundaries (matching Lucene's
-    /// StandardTokenizer), then apply possessive filter, lowercase, and the
-    /// pre-stem stop word check (see [`Self::is_pre_stem_stop_word`]) --
-    /// keeping each surviving token's pre-filtering index as its position.
-    /// This creates position gaps across removed stopwords (Lucene's
+    /// Split `text` into raw (not yet stop-word-filtered) tokens, in
+    /// document order. [`Tokenizer::PisaEnglish`] uses [`pisa_tokenize`]
+    /// directly on the raw text (its period/apostrophe rules don't compose
+    /// with UAX#29 splitting -- see that function); every other variant
+    /// splits on UAX#29 word boundaries first, then applies
+    /// [`Self::normalize_token`] per word.
+    fn raw_tokens(&self, text: &str) -> Vec<String> {
+        match self.active_tokenizer {
+            Tokenizer::PisaEnglish => pisa_tokenize(text),
+            Tokenizer::Standard | Tokenizer::LuceneEnglish => text
+                .unicode_words()
+                .map(|t| self.normalize_token(t))
+                .collect(),
+        }
+    }
+
+    /// Tokenize text (see [`Self::raw_tokens`]), then apply the pre-stem
+    /// stop word check (see [`Self::is_pre_stem_stop_word`]) -- keeping
+    /// each surviving token's pre-filtering index as its position. This
+    /// creates position gaps across removed stopwords (Lucene's
     /// position-increment behavior), which is required for correct phrase
     /// semantics: `#1(new york)` must not match "new the york".
     fn tokenize_indexed(&self, text: &str) -> Vec<(String, u32)> {
-        text.unicode_words()
+        self.raw_tokens(text)
+            .into_iter()
             .enumerate()
-            .map(|(i, t)| (self.normalize_token(t), i as u32))
+            .map(|(i, s)| (s, i as u32))
             .filter(|(s, _)| !s.is_empty() && !self.is_pre_stem_stop_word(s))
             .collect()
     }
@@ -536,7 +703,7 @@ impl TextAnalyzer {
             // takes no stop words at all, so the mode is moot here; kept
             // consistent with `with_stop_words`'s default below.
             filter_mode: StopWordFilterMode::Both,
-            english_possessive_filter: config.effective_tokenizer() == Tokenizer::LuceneEnglish,
+            active_tokenizer: config.effective_tokenizer(),
             config,
         })
     }
@@ -563,7 +730,7 @@ impl TextAnalyzer {
             // config-derived mode to apply (`PyTextAnalyzer::from_index`)
             // set it explicitly afterward via `set_stop_words_filter_mode`.
             filter_mode: StopWordFilterMode::Both,
-            english_possessive_filter: config.effective_tokenizer() == Tokenizer::LuceneEnglish,
+            active_tokenizer: config.effective_tokenizer(),
             config,
         })
     }
@@ -615,6 +782,131 @@ mod tests {
         assert!(tokens.contains(&"children".to_string()));
         assert!(tokens.contains(&"it".to_string()));
         assert!(!tokens.iter().any(|t| t.contains("'s")));
+    }
+
+    #[test]
+    fn test_pisa_tokenizer_truncates_any_apostrophe() {
+        let mut analyzer = TextAnalyzer::new(Box::new(NoStemmer));
+        analyzer.set_tokenizer(Tokenizer::PisaEnglish);
+        let tokens =
+            analyzer.tokenize("don't worry king's castle it's fine O'Brien's book y'all wasn't");
+        // Truncated at the FIRST apostrophe, unlike Lucene's trailing-'s-only rule.
+        assert!(tokens.contains(&"don".to_string()), "{:?}", tokens);
+        assert!(tokens.contains(&"king".to_string()), "{:?}", tokens);
+        assert!(tokens.contains(&"it".to_string()), "{:?}", tokens);
+        assert!(tokens.contains(&"o".to_string()), "{:?}", tokens);
+        assert!(tokens.contains(&"y".to_string()), "{:?}", tokens);
+        assert!(tokens.contains(&"wasn".to_string()), "{:?}", tokens);
+        assert!(!tokens.iter().any(|t| t.contains('\'')));
+    }
+
+    #[test]
+    fn test_pisa_tokenizer_leaves_bare_apostrophe_alone() {
+        // No letters after the apostrophe (or no apostrophe at all): nothing
+        // to truncate, unlike a real `'s`/contraction suffix.
+        let mut analyzer = TextAnalyzer::new(Box::new(NoStemmer));
+        analyzer.set_tokenizer(Tokenizer::PisaEnglish);
+        let tokens = analyzer.tokenize("plain word");
+        assert_eq!(
+            tokens,
+            vec!["plain".to_string(), "word".to_string()],
+            "no apostrophes: PisaEnglish must behave like Standard"
+        );
+    }
+
+    #[test]
+    fn test_pisa_tokenizer_splits_numbers_at_periods() {
+        // PISA's Term type is [a-zA-Z0-9]+ -- a period is never part of a
+        // number, unlike UAX#29 (which keeps "3.14" as one token).
+        let mut analyzer = TextAnalyzer::new(Box::new(NoStemmer));
+        analyzer.set_tokenizer(Tokenizer::PisaEnglish);
+        let tokens = analyzer.tokenize("price is 3.14 dollars");
+        assert_eq!(
+            tokens,
+            vec![
+                "price".to_string(),
+                "is".to_string(),
+                "3".to_string(),
+                "14".to_string(),
+                "dollars".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_pisa_tokenizer_collapses_abbreviations() {
+        // Abbreviature: ([a-zA-Z]+\.){2,} -- periods stripped, one token.
+        let mut analyzer = TextAnalyzer::new(Box::new(NoStemmer));
+        analyzer.set_tokenizer(Tokenizer::PisaEnglish);
+        let tokens = analyzer.tokenize("U.S.A. is a country");
+        assert!(tokens.contains(&"usa".to_string()), "{:?}", tokens);
+        assert!(!tokens.iter().any(|t| t.contains('.')));
+    }
+
+    /// Regression fixture verified against a real PISA build: each input
+    /// line was run through PISA's actual `EnglishTokenStream`
+    /// (`tools/pisa_tok_dump.cpp`, a 15-line driver linked directly against
+    /// PISA's `tokenizer.hpp` -- no indexing involved) on x86_64 Linux, and
+    /// the (lowercased -- `EnglishTokenStream` itself doesn't lowercase;
+    /// see [`pisa_tokenize`]) output transcribed below. Covers apostrophes
+    /// (including doubled/leading/trailing/mid-word), numbers-with-periods,
+    /// abbreviations (including a single group, which must NOT collapse),
+    /// hyphens, and non-ASCII text (PISA's lexer is ASCII-only).
+    #[test]
+    fn test_pisa_tokenizer_matches_real_pisa_fixtures() {
+        let cases: &[(&str, &[&str])] = &[
+            ("don't worry", &["don", "worry"]),
+            ("it's a it's", &["it", "a", "it"]),
+            ("king's castle", &["king", "castle"]),
+            ("O'Brien's book", &["o", "s", "book"]),
+            ("y'all come back", &["y", "come", "back"]),
+            ("wasn't ready", &["wasn", "ready"]),
+            ("dogs' bones", &["dogs", "bones"]),
+            (
+                "price is 3.14 dollars",
+                &["price", "is", "3", "14", "dollars"],
+            ),
+            ("U.S.A. is here", &["usa", "is", "here"]),
+            ("e.g. this i.e. that", &["eg", "this", "ie", "that"]),
+            (
+                "IP is 192.168.1.1 today",
+                &["ip", "is", "192", "168", "1", "1", "today"],
+            ),
+            ("Mr. Smith", &["mr", "smith"]),
+            (
+                "co-operation and e-mail",
+                &["co", "operation", "and", "e", "mail"],
+            ),
+            ("cafe and naive", &["cafe", "and", "naive"]),
+            ("NASA and iPhone", &["nasa", "and", "iphone"]),
+            (
+                "caf\u{e9} and na\u{ef}ve M\u{fc}ller",
+                &["caf", "and", "na", "ve", "m", "ller"],
+            ),
+            ("U.N.C.L.E. agent", &["uncle", "agent"]),
+            ("3.14.15 pie", &["3", "14", "15", "pie"]),
+            ("test'", &["test"]),
+            ("'tis the season", &["tis", "the", "season"]),
+            ("hello---world", &["hello", "world"]),
+            ("test123 456test", &["test123", "456test"]),
+            ("don''t", &["don", "t"]),
+            ("a.b.c.d", &["abc", "d"]),
+            ("U.S versus U.S.A", &["u", "s", "versus", "us", "a"]),
+            ("single", &["single"]),
+            ("a. b. c", &["a", "b", "c"]),
+            ("X.Y", &["x", "y"]),
+        ];
+
+        let mut analyzer = TextAnalyzer::new(Box::new(NoStemmer));
+        analyzer.set_tokenizer(Tokenizer::PisaEnglish);
+        for &(input, expected) in cases {
+            let tokens = analyzer.tokenize(input);
+            assert_eq!(
+                tokens, expected,
+                "input {:?}: got {:?}, expected {:?}",
+                input, tokens, expected
+            );
+        }
     }
 
     #[test]

@@ -40,9 +40,19 @@ __all__ = [
 class BM25Scoring:
     r"""
     BM25 scoring model.
+
+    `variant` selects the IDF formula:
+    - `"bm25"` (default): the original Robertson/Sparck-Jones formula
+      `ln((N - df + 0.5) / (df + 0.5))`, floored so very common terms don't
+      get a negative weight. Matches PISA and Terrier.
+    - `"lucene"`: Lucene's `BM25Similarity.idf`,
+      `ln(1 + (N - df + 0.5) / (df + 0.5))`. Matches Pyserini/Anserini.
     """
     def __new__(
-        cls, k1: builtins.float = 1.2000000476837158, b: builtins.float = 0.75
+        cls,
+        k1: builtins.float = 1.2000000476837158,
+        b: builtins.float = 0.75,
+        variant: builtins.str = "bm25",
     ) -> BM25Scoring: ...
 
 @typing.final

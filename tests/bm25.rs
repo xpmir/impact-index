@@ -54,10 +54,10 @@ fn brute_force_bm25(
                 let tf = values[i];
                 let term_df = *df.get(&term_ix).unwrap_or(&0);
 
-                // IDF
+                // IDF (true/Robertson BM25 -- BM25Scoring's default variant)
                 let n = num_docs as f64;
                 let df_f64 = term_df as f64;
-                let idf = ((n - df_f64 + 0.5) / (df_f64 + 0.5) + 1.0).ln() as f32;
+                let idf = (((n - df_f64 + 0.5) / (df_f64 + 0.5)).ln() as f32).max(1e-6);
 
                 // TF normalization (Lucene-style: no (k1+1) multiplier)
                 let tf_norm = tf / (k1 * (1.0 - b + b * dl / avg_dl) + tf);

@@ -21,7 +21,7 @@ use crate::compress::docid::{BitPackingCompressor, EliasFanoCompressor, PForComp
 use crate::compress::CompressionTransform;
 use crate::docmeta::DocMetadata;
 use crate::docstore;
-use crate::scoring::bm25::BM25Scoring;
+use crate::scoring::bm25::{BM25Scoring, Bm25IdfVariant};
 use crate::scoring::ScoredIndex;
 use crate::transforms::split::SplitIndexTransform;
 use crate::vocab::analyzer::TextAnalyzer;
@@ -515,7 +515,11 @@ impl PySparseIndex {
             doc_meta.doc_lengths.clone(),
         ));
 
-        let model = Box::new(BM25Scoring::with_params(scoring.k1, scoring.b));
+        let model = Box::new(BM25Scoring::with_variant(
+            scoring.k1,
+            scoring.b,
+            scoring.variant,
+        ));
         let scored = ScoredIndex::new(self.index.clone(), doc_meta, model);
         let scored_box: Arc<Box<dyn SparseIndex>> = Arc::new(Box::new(scored));
 
@@ -1630,20 +1634,38 @@ impl PyDocMetadata {
 }
 
 /// BM25 scoring model.
+///
+/// `variant` selects the IDF formula:
+/// - `"bm25"` (default): the original Robertson/Sparck-Jones formula
+///   `ln((N - df + 0.5) / (df + 0.5))`, floored so very common terms don't
+///   get a negative weight. Matches PISA and Terrier.
+/// - `"lucene"`: Lucene's `BM25Similarity.idf`,
+///   `ln(1 + (N - df + 0.5) / (df + 0.5))`. Matches Pyserini/Anserini.
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
 #[pyclass(name = "BM25Scoring")]
 pub struct PyBM25Scoring {
     k1: f32,
     b: f32,
+    variant: Bm25IdfVariant,
 }
 
 #[cfg_attr(feature = "stub-gen", gen_stub_pymethods)]
 #[pymethods]
 impl PyBM25Scoring {
     #[new]
-    #[pyo3(signature = (k1=1.2, b=0.75))]
-    fn new(k1: f32, b: f32) -> Self {
-        Self { k1, b }
+    #[pyo3(signature = (k1=1.2, b=0.75, variant="bm25"))]
+    fn new(k1: f32, b: f32, variant: &str) -> PyResult<Self> {
+        let variant = match variant {
+            "bm25" => Bm25IdfVariant::Bm25,
+            "lucene" => Bm25IdfVariant::Lucene,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unknown BM25 idf variant {:?}: must be \"bm25\" or \"lucene\"",
+                    other
+                )))
+            }
+        };
+        Ok(Self { k1, b, variant })
     }
 }
 
@@ -1779,7 +1801,24 @@ impl PyBOWIndexBuilder {
     ///     folder: Directory to store the index.
     ///     options: Builder options (block size, checkpoint frequency).
     ///     dtype: Data type for term frequencies ("int32", "int64", "float32").
-    ///     stemmer: Stemmer to use ("snowball" or None).
+    ///     pipeline: The only place a reference system's own tokenizer,
+    ///         stop-word-filter timing, and default stemmer/stop-word-list
+    ///         are all selected together, as that system actually implements
+    ///         them: ``"pyserini"`` (default) matches Lucene/Pyserini
+    ///         (`LuceneEnglish` tokenizer, Lucene's ~33-word list, checked
+    ///         pre-stem, Porter stemmer); ``"terrier"`` matches PISA's own
+    ///         tokenizer (see ``Tokenizer.pisa_english``) and Terrier's
+    ///         ~730-word list, checked post-stem against the raw list, with
+    ///         Snowball/Porter2 (PISA's stemmer -- real Terrier 5 itself
+    ///         uses classic Porter; pass ``stemmer="porter"`` to match that
+    ///         instead). Everything else (``stemmer``, ``stop_words``,
+    ///         ``language``) composes freely on top: an explicit value
+    ///         overrides just that piece of the pipeline's defaults, e.g.
+    ///         ``pipeline="terrier", stemmer="porter"`` keeps Terrier's
+    ///         tokenizer/stop-word timing/list but swaps in the Porter
+    ///         stemmer.
+    ///     stemmer: Stemmer to use ("snowball", "porter", or None).
+    ///         Defaults to the pipeline's own stemmer.
     ///     language: Language for the stemmer (default: "english").
     ///     stop_words: Stop words to filter. One of:
     ///         - a list of strings (used verbatim);
@@ -1788,7 +1827,14 @@ impl PyBOWIndexBuilder {
     ///           built-in list for that family and ``language``. Terrier only
     ///           ships a stop word list for English; other languages are
     ///           Lucene-only.
-    ///         - ``None`` for no stop words.
+    ///         - ``None`` for no stop words -- *unless* ``pipeline`` is
+    ///           also set, in which case ``None`` means "use that
+    ///           pipeline's own default list" (Python can't tell an
+    ///           omitted argument from an explicit ``None`` here, and
+    ///           ``pipeline``'s whole point is to supply defaults for
+    ///           omitted arguments). Pass ``stop_words=[]`` instead of
+    ///           ``None`` to explicitly get no stop words while still
+    ///           using a pipeline's tokenizer/stemmer/timing.
     ///     positions: Store token positions alongside postings, enabling
     ///         phrase (``#1``) / window (``#uwN``) structured queries later
     ///         (``search_wand_query``/``search_maxscore_query``). Opt-in:
@@ -1796,11 +1842,12 @@ impl PyBOWIndexBuilder {
     ///         without positional operators pay nothing. Overrides
     ///         ``options.positions`` when both are given.
     #[new]
-    #[pyo3(signature = (folder, options=None, dtype=None, stemmer=None, language=None, stop_words=None, positions=false))]
+    #[pyo3(signature = (folder, options=None, dtype=None, pipeline=None, stemmer=None, language=None, stop_words=None, positions=false))]
     fn new(
         folder: &str,
         options: Option<&PyBuilderOptions>,
         dtype: Option<&str>,
+        pipeline: Option<&str>,
         stemmer: Option<&str>,
         language: Option<&str>,
         stop_words: Option<&Bound<'_, PyAny>>,
@@ -1815,14 +1862,63 @@ impl PyBOWIndexBuilder {
         let dtype_str = dtype.unwrap_or("int32");
         let lang = language.unwrap_or("english");
 
+        // `pipeline` is the *only* knob that names another IR system: it
+        // bundles that system's own tokenizer, stop-word-filter timing, and
+        // default stemmer/stop-word family in one place. `stemmer` and
+        // `stop_words`, if given explicitly, override just their own piece
+        // of the bundle -- see the constructor doc comment.
+        struct PipelineDefaults {
+            stemmer: &'static str,
+            tokenizer: crate::vocab::analyzer::Tokenizer,
+            stop_words_family: crate::vocab::stopwords::StopWordFamily,
+            filter_mode: crate::vocab::analyzer::StopWordFilterMode,
+        }
+        let pipeline_defaults = pipeline
+            .map(|name| match name.to_lowercase().as_str() {
+                "pyserini" => Ok(PipelineDefaults {
+                    stemmer: "porter",
+                    tokenizer: crate::vocab::analyzer::Tokenizer::LuceneEnglish,
+                    stop_words_family: crate::vocab::stopwords::StopWordFamily::Lucene,
+                    filter_mode: crate::vocab::analyzer::StopWordFilterMode::PreStem,
+                }),
+                "terrier" => Ok(PipelineDefaults {
+                    stemmer: "snowball",
+                    tokenizer: crate::vocab::analyzer::Tokenizer::PisaEnglish,
+                    stop_words_family: crate::vocab::stopwords::StopWordFamily::Terrier,
+                    filter_mode: crate::vocab::analyzer::StopWordFilterMode::PostStem,
+                }),
+                other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unknown pipeline '{}', expected 'pyserini' or 'terrier'",
+                    other
+                ))),
+            })
+            .transpose()?;
+
+        let stemmer = stemmer.or_else(|| pipeline_defaults.as_ref().map(|pd| pd.stemmer));
+
         // Resolve stop words: True/"lucene"/"terrier" = built-in family list,
-        // list = explicit, None = no stop words. `resolved_family` is kept
-        // alongside the resolved words purely so it can be persisted in
+        // list = explicit, None = no stop words (or, with a `pipeline`, that
+        // pipeline's own default list). `resolved_family` is kept alongside
+        // the resolved words purely so it can be persisted in
         // `AnalyzerConfig` for introspection -- reload always uses the exact
         // words in `resolved_stop_words`/`stop_words_list`, never the family
         // alone (see the `AnalyzerConfig::stop_words_family` doc comment).
         let mut resolved_family: Option<crate::vocab::stopwords::StopWordFamily> = None;
         let resolved_stop_words: Vec<String> = match stop_words {
+            None if pipeline_defaults.is_some() => {
+                let family = pipeline_defaults.as_ref().unwrap().stop_words_family;
+                resolved_family = Some(family);
+                crate::vocab::stopwords::get_stop_words_for_family(lang, family)
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "No built-in {} stop words for language '{}'",
+                            family, lang
+                        ))
+                    })?
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            }
             Some(obj) => {
                 if let Ok(true) = obj.extract::<bool>() {
                     // True: alias for "lucene", by design -- this is the
@@ -1865,24 +1961,28 @@ impl PyBOWIndexBuilder {
 
         let stop_word_refs: Vec<&str> = resolved_stop_words.iter().map(|s| s.as_str()).collect();
 
-        // Which pipeline stage(s) stop words are checked at follows directly
-        // from the requested family (see `StopWordFilterMode` docs):
-        // Lucene = pre-stem only, Terrier = post-stem only (against the raw
-        // list), no family (custom list, or no stop words at all) = both,
-        // preserving pre-existing behavior for callers not using a preset.
-        let filter_mode = match resolved_family {
-            Some(crate::vocab::stopwords::StopWordFamily::Lucene) => {
+        // Which pipeline stage(s) stop words are checked at: an explicit
+        // `pipeline` always wins (it's checked at the stage *that system*
+        // checks it at, regardless of which stop-word list ends up being
+        // used); otherwise it follows the requested stop-word family (see
+        // `StopWordFilterMode` docs): Lucene = pre-stem only, Terrier =
+        // post-stem only (against the raw list), no family (custom list, or
+        // no stop words at all) = both, preserving pre-existing behavior for
+        // callers not using a preset.
+        let filter_mode = match (&pipeline_defaults, resolved_family) {
+            (Some(pd), _) => pd.filter_mode,
+            (None, Some(crate::vocab::stopwords::StopWordFamily::Lucene)) => {
                 crate::vocab::analyzer::StopWordFilterMode::PreStem
             }
-            Some(crate::vocab::stopwords::StopWordFamily::Terrier) => {
+            (None, Some(crate::vocab::stopwords::StopWordFamily::Terrier)) => {
                 crate::vocab::analyzer::StopWordFilterMode::PostStem
             }
-            None => crate::vocab::analyzer::StopWordFilterMode::Both,
+            (None, None) => crate::vocab::analyzer::StopWordFilterMode::Both,
         };
 
         let make_analyzer = |stemmer_name: &str,
                              stemmer_box: Box<dyn crate::vocab::stemmer::Stemmer>,
-                             english: bool|
+                             tokenizer: crate::vocab::analyzer::Tokenizer|
          -> TextAnalyzer {
             let mut a = if stop_word_refs.is_empty() {
                 TextAnalyzer::new(stemmer_box)
@@ -1890,20 +1990,12 @@ impl PyBOWIndexBuilder {
                 TextAnalyzer::with_stop_words(stemmer_box, &stop_word_refs)
             };
             a.set_stop_words_filter_mode(filter_mode);
-            // Enable English possessive filter for English stemmers
-            if english {
-                a.set_english_possessive_filter(true);
-            }
+            a.set_tokenizer(tokenizer);
             // Store config for later retrieval. `stop_words_list` preserves
             // the *exact* list used here (not just whether one was given) so
             // `PyTextAnalyzer::from_index` can reconstruct the real custom
             // list at query time instead of substituting the language's
             // built-in default.
-            let tokenizer = if english {
-                crate::vocab::analyzer::Tokenizer::LuceneEnglish
-            } else {
-                crate::vocab::analyzer::Tokenizer::Standard
-            };
             a.set_config(crate::vocab::analyzer::AnalyzerConfig {
                 stemmer: stemmer_name.to_string(),
                 language: lang.to_string(),
@@ -1911,25 +2003,41 @@ impl PyBOWIndexBuilder {
                 stop_words_list: resolved_stop_words.clone(),
                 stop_words_family: resolved_family.map(|f| f.as_str().to_string()),
                 stop_words_filter_mode: filter_mode,
-                english_possessive_filter: english,
+                english_possessive_filter: tokenizer
+                    == crate::vocab::analyzer::Tokenizer::LuceneEnglish,
                 tokenizer,
             });
             a
         };
 
         let is_english = lang == "english";
+        // A pipeline's tokenizer is meant for English text (like
+        // `LuceneEnglish` already was); other languages fall back to plain
+        // `Standard` splitting, same as before `pipeline` existed.
+        let pipeline_tokenizer = |english_capable: bool| -> crate::vocab::analyzer::Tokenizer {
+            match &pipeline_defaults {
+                Some(pd) if english_capable => pd.tokenizer,
+                Some(_) => crate::vocab::analyzer::Tokenizer::Standard,
+                None if english_capable => crate::vocab::analyzer::Tokenizer::LuceneEnglish,
+                None => crate::vocab::analyzer::Tokenizer::Standard,
+            }
+        };
 
         let analyzer = match stemmer {
             Some("snowball") => {
                 let s = SnowballStemmer::new(lang).map_err(|e| {
                     pyo3::exceptions::PyValueError::new_err(format!("Invalid stemmer: {}", e))
                 })?;
-                Some(make_analyzer("snowball", Box::new(s), is_english))
+                Some(make_analyzer(
+                    "snowball",
+                    Box::new(s),
+                    pipeline_tokenizer(is_english),
+                ))
             }
             Some("porter") => Some(make_analyzer(
                 "porter",
                 Box::new(PorterStemmer::new()),
-                true,
+                pipeline_tokenizer(true),
             )),
             Some("none") | None => None,
             Some(other) => {

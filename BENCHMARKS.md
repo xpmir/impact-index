@@ -62,7 +62,7 @@ python-terrier` to the `uv run` invocation, plus a JVM).
 
 Notes:
 - **Terrier 5** runs through PyTerrier (single-pass index, one query at a time via `pt.terrier.Retriever`, adding some Python overhead per query), using its default exhaustive DAAT matching — stock Terrier 5.11 has no WAND/block-max pruning, unlike impact-index and Lucene.
-- **Java**: measured with whatever JDK was already on the host, OpenJDK 25 — both Terrier 5 (min Java 11+) and Pyserini (min Java 21+) ran fine under it.
+- **Java**: measured with OpenJDK 25
 - **PISA** runs through [`pyterrier-pisa`](https://github.com/terrierteam/pyterrier_pisa) — no JVM needed, but Linux x86_64 wheels only, so no ARM number. Its 0.60 GB excludes PISA's raw forward/inverted-index files, matching impact-index's own raw-vs-compressed split.
 - **impact-index's WAND/BMW trailing MaxScore** is a known effect of top_k=100: WAND pruning needs the top-k threshold θ to rise fast, but at top_k=100 it stays low for a long time — 92% of loop iterations are single-document catch-ups with no pruning benefit (only ~18,500 of ~234,600 per query actually score/reject/skip). Real algorithmic property, not a bug — though PISA's WAND still beating its own MaxScore suggests some implementation headroom beyond that.
 

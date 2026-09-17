@@ -2,7 +2,7 @@
 //!
 //! Implements the Okapi BM25 formula:
 //! - TF component: `(k1 + 1) * tf / (k1 * (1 - b + b * dl / avgdl) + tf)`
-//! - IDF component: `ln(1 + (N - df + 0.5) / (df + 0.5))`
+//! - IDF component: variant-dependent, see [`Bm25IdfVariant`].
 //!
 //! Upper bounds use `min_dl` for tightest bound (BM25's TF component is
 //! monotonically decreasing in document length).
@@ -10,10 +10,44 @@
 use std::sync::Arc;
 
 use half::f16;
+use serde::{Deserialize, Serialize};
 
 use crate::base::DocId;
 
 use super::{ScoringFunction, ScoringModel};
+
+/// Which IDF formula a [`BM25Scoring`] uses. The two disagree on how to
+/// treat terms that are common enough to make `N - df` small -- which
+/// formula is "right" is a real, decades-old disagreement between IR
+/// systems (see Kamphuis et al., "Which BM25 Do You Mean? A Large-Scale
+/// Reproducibility Study of Scoring Variants", ECIR 2020), so both are
+/// first-class here rather than one being a hidden default.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum Bm25IdfVariant {
+    /// The original Robertson/Sparck-Jones BM25 idf: `ln((N - df + 0.5) /
+    /// (df + 0.5))`, floored at [`ROBERTSON_EPSILON`] so a term occurring
+    /// in more than half the collection (where the raw formula goes to
+    /// zero or negative) doesn't get a negative weight. This is what both
+    /// PISA (`scorer/bm25.hpp`) and Terrier (`BM25.java`) implement, and
+    /// what "BM25" refers to in the original Robertson & Walker papers --
+    /// hence the default and the plain `Bm25` name.
+    #[default]
+    Bm25,
+    /// Lucene's `BM25Similarity.idf`: `ln(1 + (N - df + 0.5) / (df +
+    /// 0.5))` -- always positive without needing an epsilon floor, at the
+    /// cost of assigning much more weight than [`Self::Bm25`] to terms
+    /// that occur in a large fraction of the collection. Matches
+    /// Pyserini/Anserini, which use Lucene's `BM25Similarity` directly.
+    Lucene,
+}
+
+/// Floor applied to [`Bm25IdfVariant::Bm25`]'s idf so a term with `df >=
+/// N/2` (where the raw Robertson/Sparck-Jones formula is zero or negative)
+/// still gets a small positive weight instead of being silently dropped
+/// from (or, if left negative, actively subtracted from) the score. Matches
+/// PISA's own `epsilon_score` in `scorer/bm25.hpp`.
+const ROBERTSON_EPSILON: f32 = 1e-6;
 
 /// BM25 scoring model.
 ///
@@ -23,6 +57,9 @@ pub struct BM25Scoring {
     pub k1: f32,
     /// Length normalization parameter (default: 0.75).
     pub b: f32,
+    /// Which IDF formula to use (default: [`Bm25IdfVariant::Bm25`], the
+    /// original Robertson/Sparck-Jones formula).
+    pub variant: Bm25IdfVariant,
 
     // Computed on initialize():
     min_dl_norm: f32,
@@ -41,11 +78,13 @@ pub struct BM25Scoring {
 }
 
 impl BM25Scoring {
-    /// Create a new BM25 scoring model with default parameters (k1=1.2, b=0.75).
+    /// Create a new BM25 scoring model with default parameters (k1=1.2,
+    /// b=0.75, [`Bm25IdfVariant::Bm25`]).
     pub fn new() -> Self {
         Self {
             k1: 1.2,
             b: 0.75,
+            variant: Bm25IdfVariant::default(),
             min_dl_norm: 0.0,
             k1_one_minus_b: 0.0,
             k1_b_over_avgdl: 0.0,
@@ -54,11 +93,26 @@ impl BM25Scoring {
         }
     }
 
-    /// Create with custom k1 and b parameters.
+    /// Create with custom k1 and b parameters ([`Bm25IdfVariant::Bm25`]).
     pub fn with_params(k1: f32, b: f32) -> Self {
         Self {
             k1,
             b,
+            variant: Bm25IdfVariant::default(),
+            min_dl_norm: 0.0,
+            k1_one_minus_b: 0.0,
+            k1_b_over_avgdl: 0.0,
+            num_docs: 0,
+            doc_norms: None,
+        }
+    }
+
+    /// Create with custom k1, b, and IDF variant.
+    pub fn with_variant(k1: f32, b: f32, variant: Bm25IdfVariant) -> Self {
+        Self {
+            k1,
+            b,
+            variant,
             min_dl_norm: 0.0,
             k1_one_minus_b: 0.0,
             k1_b_over_avgdl: 0.0,
@@ -105,23 +159,31 @@ impl ScoringModel for BM25Scoring {
     /// summing idfs is the standard proxy for that without computing a
     /// real joint document frequency).
     fn compound_scorer(&self, dfs: &[u64], _max_value: f32) -> Box<dyn ScoringFunction> {
-        let idf: f32 = dfs.iter().map(|&df| Self::idf(self.num_docs, df)).sum();
+        let idf: f32 = dfs
+            .iter()
+            .map(|&df| Self::idf(self.num_docs, df, self.variant))
+            .sum();
         Box::new(self.build_term_scorer_with_idf(idf))
     }
 }
 
 impl BM25Scoring {
-    /// BM25 idf: `ln(1 + (N - df + 0.5) / (df + 0.5))`.
-    fn idf(num_docs: u64, df: u64) -> f32 {
+    /// IDF for the given variant -- see [`Bm25IdfVariant`].
+    fn idf(num_docs: u64, df: u64, variant: Bm25IdfVariant) -> f32 {
         let n = num_docs as f64;
         let df_f64 = df as f64;
-        ((n - df_f64 + 0.5) / (df_f64 + 0.5) + 1.0).ln() as f32
+        match variant {
+            Bm25IdfVariant::Bm25 => {
+                (((n - df_f64 + 0.5) / (df_f64 + 0.5)).ln() as f32).max(ROBERTSON_EPSILON)
+            }
+            Bm25IdfVariant::Lucene => ((n - df_f64 + 0.5) / (df_f64 + 0.5) + 1.0).ln() as f32,
+        }
     }
 
     /// Builds the concrete per-term scorer (shared by `term_scorer` and
     /// `term_scorer_typed`).
     fn build_term_scorer(&self, df: u64) -> BM25TermScorer {
-        self.build_term_scorer_with_idf(Self::idf(self.num_docs, df))
+        self.build_term_scorer_with_idf(Self::idf(self.num_docs, df, self.variant))
     }
 
     /// Builds a scorer from an already-computed idf -- shared by
@@ -265,14 +327,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_bm25_idf() {
+    fn test_bm25_idf_default_is_robertson() {
+        // Default variant (Bm25IdfVariant::Bm25, "true" BM25): idf = ln((N -
+        // df + 0.5) / (df + 0.5)), no +1 -- matches PISA and Terrier.
         let mut scoring = BM25Scoring::new();
+        assert_eq!(scoring.variant, Bm25IdfVariant::Bm25, "test assumption");
         let doc_lengths = Arc::new(vec![10u32; 100]);
         scoring.initialize(doc_lengths, 100);
 
-        // df=10, N=100: idf = ln(1 + (100 - 10 + 0.5) / (10 + 0.5))
         let scorer = scoring.term_scorer(10, 5.0);
-        let expected_idf = ((100.0 - 10.0 + 0.5) / (10.0 + 0.5) + 1.0f64).ln() as f32;
+        let expected_idf = ((100.0 - 10.0 + 0.5) / (10.0 + 0.5) as f64).ln() as f32;
         // Score with tf=1, dl=avgdl => tf / (k1 + tf) = 1 / (1.2 + 1) = 1/2.2
         let score = scorer.score(1.0, 0);
         let expected = expected_idf * 1.0 / (1.2 * 1.0 + 1.0);
@@ -281,6 +345,44 @@ mod tests {
             "score={}, expected={}",
             score,
             expected
+        );
+    }
+
+    #[test]
+    fn test_bm25_idf_lucene_variant() {
+        // Bm25IdfVariant::Lucene: idf = ln(1 + (N - df + 0.5) / (df + 0.5))
+        // -- matches Lucene's BM25Similarity / Pyserini.
+        let mut scoring = BM25Scoring::with_variant(1.2, 0.75, Bm25IdfVariant::Lucene);
+        let doc_lengths = Arc::new(vec![10u32; 100]);
+        scoring.initialize(doc_lengths, 100);
+
+        let scorer = scoring.term_scorer(10, 5.0);
+        let expected_idf = ((100.0 - 10.0 + 0.5) / (10.0 + 0.5) + 1.0f64).ln() as f32;
+        let score = scorer.score(1.0, 0);
+        let expected = expected_idf * 1.0 / (1.2 * 1.0 + 1.0);
+        assert!(
+            (score - expected).abs() < 1e-3,
+            "score={}, expected={}",
+            score,
+            expected
+        );
+    }
+
+    #[test]
+    fn test_bm25_idf_robertson_floors_common_terms() {
+        // A term in more than half the collection makes the raw
+        // Robertson/Sparck-Jones ratio < 1 (negative ln); must floor at
+        // ROBERTSON_EPSILON instead of going negative or zero.
+        let mut scoring = BM25Scoring::new();
+        let doc_lengths = Arc::new(vec![10u32; 100]);
+        scoring.initialize(doc_lengths, 100);
+
+        let scorer = scoring.term_scorer(80, 5.0); // df=80 out of N=100
+        let score = scorer.score(1.0, 0);
+        assert!(
+            score > 0.0,
+            "score for a very common term must stay positive (floored idf), got {}",
+            score
         );
     }
 
