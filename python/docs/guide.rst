@@ -442,6 +442,43 @@ The index automatically detects and loads auxiliary components
     query = analyzer.analyze_query("quick fox")
     results = scored.search_maxscore(query, top_k=10)
 
+How BM25 scores are computed
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Scores are computed at query time: the index stores raw term frequencies,
+and :class:`~impact_index.BM25Scoring` turns them into scores. For a query
+``q`` and a document ``d`` of length ``dl`` (number of indexed tokens):
+
+.. math::
+
+    \mathrm{score}(q, d) = \sum_{t \in q} w_t \cdot \mathrm{idf}(t) \cdot
+        \frac{(k_1 + 1)\, \mathrm{tf}_{t,d}}
+             {k_1 \left(1 - b + b \frac{dl}{\mathrm{avgdl}}\right) + \mathrm{tf}_{t,d}}
+
+- ``k1`` and ``b``: the usual BM25 parameters (defaults 1.2 and 0.75).
+  ``avgdl`` is the average document length, and ``N`` below is the number
+  of documents.
+- ``idf`` depends on ``variant``. ``"bm25"`` (default, used by Terrier and
+  PISA) is ``ln((N - df + 0.5) / (df + 0.5))``, floored at a tiny positive
+  value so very common terms never get a negative weight. ``"lucene"``
+  (Pyserini/Anserini) is ``ln(1 + (N - df + 0.5) / (df + 0.5))``.
+- ``w_t`` is the query weight of term ``t``: its count in the query for
+  :meth:`~impact_index.TextAnalyzer.analyze_query`, or the value you put in
+  the query dict. With ``k3=None`` (default), weights are used as they are
+  (Lucene, PISA). With ``k3`` set (Terrier uses ``k3=8``), weights are
+  first divided by the query's largest weight, then saturated as
+  ``(k3 + 1) w / (k3 + w)``, as Terrier 5's BM25 does.
+
+Rankings match the reference systems. Absolute score values may differ by
+a constant factor: Terrier, for example, uses base-2 logarithms.
+
+.. code-block:: python
+
+    # Terrier 5's BM25
+    scored = index.with_scoring(impact_index.BM25Scoring(k1=1.2, b=0.75, k3=8))
+    # Pyserini/Anserini's BM25
+    scored = index.with_scoring(impact_index.BM25Scoring(k1=0.9, b=0.4, variant="lucene"))
+
 Token positions
 ~~~~~~~~~~~~~~~
 
@@ -463,6 +500,20 @@ structured query operators below need to evaluate.
     builder.add_text(1, "a quick brown cat jumps high")
     index = builder.build(in_memory=True)
 
+``position_gaps`` controls what happens to positions when stop words are
+removed at indexing time:
+
+- ``position_gaps=True`` (Lucene; the default without a pipeline and for
+  ``pipeline="pyserini"``): a removed stop word keeps its position, so
+  "bank of america" stores ``bank@0 america@2``.
+- ``position_gaps=False`` (Terrier 5; the default for
+  ``pipeline="terrier"`` and ``"terrier-pisa"``): positions only count the
+  tokens that were kept, so it stores ``bank@0 america@1``.
+
+Matchop queries drop stop words inside operators too, so
+``#1(bank of america)`` becomes ``#1(bank america)``. It matches "bank of
+america" only without gaps.
+
 .. note::
 
     From Python, positional indexing only goes through text: with
@@ -481,38 +532,84 @@ Beyond flat ``{term_id: weight}`` dicts,
 :meth:`~impact_index.Index.search_wand_query` /
 :meth:`~impact_index.Index.search_maxscore_query` (and the
 :class:`~impact_index.ScoredIndex` equivalents) accept Terrier-matchop-style
-structured queries, evaluated as "virtual" posting lists on top of the
-same WAND/MaxScore dynamic pruning used for flat queries:
+structured queries. They are evaluated as "virtual" posting lists, pruned
+by the same WAND/MaxScore algorithms as flat queries:
 
-- ``#combine(...)`` — weighted sum of children (the default combinator
-  when a query has multiple terms); ``#combine:0=2:1=1(quick fox)``
+- ``#combine(...)``: weighted sum of children (the default combinator
+  when a query has several terms). ``#combine:0=2:1=1(quick fox)``
   weights the first child 2x and the second 1x.
-- ``#syn(t1 t2 ...)`` — synonyms/OR: term frequencies are summed and the
-  merged postings scored as a single virtual term.
-- ``#band(n1 n2 ...)`` — boolean AND: only documents containing every
-  child match; score is the sum of the children's scores.
-- ``#1(t1 t2 ...)`` — exact phrase, adjacent positions only. **Requires
-  an index built with** ``positions=True``.
-- ``#uwN(t1 t2 ...)`` — unordered window: all terms within ``N`` tokens
-  of each other, any order. **Requires positions**, same as ``#1``.
+- ``#syn(t1 t2 ...)``: synonyms. Matches documents containing any of the
+  terms, scored as one term.
+- ``#band(n1 n2 ...)``: boolean AND. Matches documents containing every
+  child.
+- ``#1(t1 t2 ...)``: exact phrase (adjacent positions). **Requires an
+  index built with** ``positions=True``.
+- ``#uwN(t1 t2 ...)``: unordered window. All terms occur within a span of
+  ``N`` tokens, in any order. **Requires positions**, like ``#1``.
 
 .. code-block:: python
 
-    scored = index.with_scoring(impact_index.BM25Scoring())
+    scored = index.with_scoring(impact_index.BM25Scoring(k3=8))
 
     results = scored.search_wand_query(
         "#combine(#1(new york) #syn(city town) #band(guide budget))",
         top_k=10,
     )
 
-A matchop string is resolved against the index's own analyzer (the same
-tokenizer/stemmer/stop words used at indexing time), so it requires an
-index built via ``BOWIndexBuilder``. You can also build the query tree
-directly from term ids, with no analyzer involved, as nested dicts:
-``{"term": ix}`` (or ``{"term": [ix, weight]}``), ``{"combine": [[w1,
-node1], ...]}``, ``{"syn": [ix, ...]}``, ``{"band": [node, ...]}``,
-``{"phrase": [ix, ...]}``, or ``{"window": {"terms": [ix, ...], "width":
-N}}``.
+A matchop string is resolved with the index's own analyzer (the same
+tokenizer, stemmer and stop words used at indexing time), so it requires
+an index built with ``BOWIndexBuilder``. Stop words are removed
+everywhere, including inside ``#1``/``#uwN``/``#band``. A word that is not
+in the vocabulary is dropped from ``#combine``/``#syn``, but makes a whole
+``#1``/``#uwN``/``#band`` unmatchable, so that operator is dropped.
+
+You can also build the query tree directly from term ids, as nested
+dicts, with no analyzer involved: ``{"term": ix}`` (or ``{"term": [ix,
+weight]}``), ``{"combine": [[w1, node1], ...]}``, ``{"syn": [ix, ...]}``,
+``{"band": [node, ...]}``, ``{"phrase": [ix, ...]}``, or ``{"window":
+{"terms": [ix, ...], "width": N}}``.
+
+How structured queries are scored
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Scoring follows Terrier 5's matchop semantics. With a Terrier-aligned
+index (``pipeline="terrier", stemmer="porter"``) and
+``BM25Scoring(k3=8)``, rankings are identical to Terrier's.
+
+1. **Flattening.** Nested ``#combine`` operators are flattened into one
+   list of clauses. A clause's weight is the product of the ``#combine``
+   weights on its path: ``#combine:0=0.8:1=0.2(#combine(a b) #1(a b))``
+   has clauses ``a`` (0.8), ``b`` (0.8) and ``#1(a b)`` (0.2). Identical
+   clauses are merged and their weights summed, so ``#combine(a a b)`` is
+   ``#combine:0=2(a b)``.
+2. **Query weights.** The scoring model adjusts the clause weights
+   (``k3`` for BM25, see `How BM25 scores are computed`_). The score of a
+   document is the weighted sum of its clause scores.
+3. **Clause scores.** A term is scored as usual. Every other operator is
+   scored as one *virtual term*, with the model's own formula (for
+   example BM25 above), using this virtual term frequency (tf) and
+   document frequency (df):
+
+   ================ ============================================= ========================
+   Operator         Virtual tf in a document                      Virtual df
+   ================ ============================================= ========================
+   ``#syn``         sum of the children's tfs                     sum of the children's dfs
+   ``#band``        1 (the document contains every child)         sum of the children's dfs
+   ``#1``           number of phrase occurrences                  ``N / 100``
+   ``#uwN``         number of occurrences of the rarest term      ``N / 100``
+                    that fall in a window of ``N`` tokens
+                    containing all the other terms
+   ================ ============================================= ========================
+
+   ``N / 100`` (integer division) is a heuristic that Terrier inherited
+   from Ivory. Counting a phrase's real df would need a pass over every
+   document containing all its terms. As a result, every phrase and every
+   window gets the same idf, whatever its terms.
+
+Over a raw (unscored) index, the same operators evaluate to raw values
+instead: tfs for ``#syn``, counts for ``#1``/``#uwN``, and the sum of the
+children's values for ``#band``. This keeps ``#band`` useful on
+learned-impact indices.
 
 
 .. _compression:

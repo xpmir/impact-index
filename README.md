@@ -128,10 +128,14 @@ for doc in results:
     print(f"Document {doc.docid}: {doc.score:.4f}")
 ```
 
-Scoring:
-- `#1`/`#uwN`: single virtual term (sum-of-idfs for BM25, same as `#syn`).
-- `#band`: match-all filter, score = sum of children's scores.
-- `#syn`: term frequencies summed across children, scored once (not once per child).
+Scoring follows Terrier 5. Every operator is scored as one virtual term:
+- `#syn`: tf = sum of the children's tfs, df = sum of their dfs.
+- `#band`: tf = 1, df = sum of the children's dfs.
+- `#1`/`#uwN`: tf = number of matches, df = N/100 (Terrier's fixed heuristic).
+
+Nested `#combine` weights multiply. With `BM25Scoring(k3=8)` and
+`pipeline="terrier", stemmer="porter"`, rankings are identical to
+Terrier's. See the guide's "How structured queries are scored" section.
 
 ## Compression
 

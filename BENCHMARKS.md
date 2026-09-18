@@ -100,6 +100,49 @@ Notes:
 - **Java**: OpenJDK 25.
 - **PISA** via [`pyterrier-pisa`](https://github.com/terrierteam/pyterrier_pisa), Linux x86_64 only. Size excludes raw forward/inverted files.
 
+## Structured queries vs Terrier 5
+
+`examples/structured_terrier.py` runs Terrier-matchop queries built from
+MS MARCO dev/small through both systems. Each query is reduced to its unique
+non-stop words `w1 .. wn`, then:
+
+- `bow`: `#combine(w1 .. wn)`
+- `phrase`: bow plus `#1(wi wi+1)` for each adjacent pair
+- `uw8`: bow plus `#uw8(wi wi+1)` for each adjacent pair
+- `syn`: `#combine(#syn(w1 w2) w3 .. wn)`
+- `band`: bow plus `#band(w1 w2)`
+- `sdm`: `#combine:0=0.85:1=0.1:2=0.05(#combine(bow) #combine(#1 pairs) #combine(#uw8 pairs))`
+
+impact-index: `pipeline="terrier", stemmer="porter", positions=True` (so no
+position gaps, like Terrier), compressed, MaxScore, `BM25Scoring(k1=0.9,
+b=0.4, k3=8)`. Terrier 5.11: block index (`blocks=True`), BM25 with the
+same k1/b, via PyTerrier. Top-100, single-threaded, Apple M4 Max, 2026-09-18.
+
+| Family | Queries | impact-index q/s | Terrier 5 q/s | Speed-up | Overlap@10 | Overlap@100 |
+|--------|--------:|-----------------:|--------------:|---------:|-----------:|------------:|
+| bow    | 6,980 | 530 | 35.8 | 15× | 0.982 | 0.986 |
+| phrase | 6,598 | 174 | 19.8 |  9× | 0.984 | 0.986 |
+| uw8    | 6,598 | 196 | 19.5 | 10× | 0.983 | 0.986 |
+| syn    | 6,598 | 383 | 31.2 | 12× | 0.977 | 0.982 |
+| band   | 6,598 | 421 | 26.1 | 16× | 0.981 | 0.985 |
+| sdm    | 6,598 | 128 | 14.4 |  9× | 0.984 | 0.986 |
+
+- Structured operators add no disagreement of their own: every family's
+  overlap is within noise of `bow`. On a small hand-built corpus, all
+  operators give scores equal to Terrier's up to a constant factor
+  (Terrier uses log2 and keeps BM25's `(k1+1)` factor).
+- The remaining ~1.5% comes from bag-of-words: impact-index uses PISA's
+  tokenizer, not Terrier's Java one, so some document lengths and tfs
+  differ slightly and near-ties reorder.
+- Terrier's time includes PyTerrier's per-query Python overhead (a
+  DataFrame per query), as in the bag-of-words comparison above.
+- Index size: impact-index 0.76 GB (with positions), Terrier 1.6 GB (with
+  blocks).
+
+Reproduce with `uv run --with . --with python-terrier
+examples/structured_terrier.py --output-dir <dir>` (builds both indices
+on first run).
+
 ## Ablation: impact-index's own settings
 
 Single-threaded MaxScore, top-100, all builds compressed (`block_size=128`,

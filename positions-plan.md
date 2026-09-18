@@ -16,13 +16,27 @@ Design stance (from the Lucene/Terrier comparison):
 Settled decisions:
 - Exact token positions (no Terrier-style coarse blocks).
 - Stopword removal leaves **position gaps** (Lucene behavior): `#1(new york)`
-  must not match "new the york".
+  must not match "new the york". **Revised 2026-09-18:** now an index-time
+  option, `position_gaps`; `pipeline="terrier"`/`"terrier-pisa"` default to
+  no gaps (Terrier 5). Matchop queries drop stop words inside `#1`, so
+  `#1(bank of america)` = `#1(bank america)`, which can only match "bank of
+  america" without gaps.
 - Positions are **opt-in per index** (`positions=true`), BoW-only: rejected
   unless the posting value is a count-like tf. Learned-impact indices are
   untouched.
 - Virtual-term scoring: phrase/window tf scored by the query-time model with
   **sum of children's idfs** (Lucene's convention for phrases); doc-level
   `#band` emits tf = 1, `#syn` sums children tfs (Terrier semantics).
+  **Revised 2026-09-18: aligned on Terrier 5 throughout** (verified
+  score-for-score against Terrier 5.11 on a mini corpus). Each operator is
+  one virtual term: `#syn` df = sum of dfs; `#band` tf = 1, df = sum of dfs;
+  `#1`/`#uwN` df = N/100 (Ivory heuristic); `#uwN` tf = seed-occurrence
+  count (Terrier's `ProximityIterablePosting`). Nested `#combine` flattens
+  (weights multiply, duplicate clauses merge); BM25 `k3` (opt-in) normalizes
+  weights by the max, then `(k3+1)w/(k3+w)`. Rationale: sum-of-idfs
+  overstates rarity (wrong for `#syn`), and no other convention was more
+  principled than Terrier's. User-facing description: guide.rst, "How
+  structured queries are scored".
 - Positional data lives in a **separate stream** at every level (builder file,
   compressed file, checkpoint) so non-positional reads stay byte-identical.
 
