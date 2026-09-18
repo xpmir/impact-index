@@ -120,6 +120,7 @@ impl<V: PostingValue> TermsImpacts<V> {
      * Create a new term impacts in memory structure
      */
     fn new(folder: &Path, options: &BuilderOptions) -> TermsImpacts<V> {
+        std::fs::create_dir_all(folder).expect("Error while creating index folder.");
         let path = folder.join(format!("postings.dat"));
 
         let mut file_options = File::options();
