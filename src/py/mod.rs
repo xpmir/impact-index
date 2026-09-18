@@ -79,7 +79,19 @@ fn source_path_for_resolver(index: &dyn SparseIndex) -> Option<&Path> {
 
 /// Loads the `TextAnalyzer` used to resolve matchop query tokens to term
 /// ids, from `index`'s (or its inner index's) source directory.
-fn load_matchop_analyzer(index: &dyn SparseIndex) -> PyResult<TextAnalyzer> {
+///
+/// Cached process-wide: loading reads the whole vocabulary, which would
+/// otherwise dominate the cost of every matchop query string. The cache key
+/// includes the analyzer files' modification time and size, so an index
+/// rebuilt in place is reloaded.
+fn load_matchop_analyzer(index: &dyn SparseIndex) -> PyResult<Arc<TextAnalyzer>> {
+    type Key = (
+        std::path::PathBuf,
+        Vec<Option<(std::time::SystemTime, u64)>>,
+    );
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<Key, Arc<TextAnalyzer>>>> =
+        std::sync::OnceLock::new();
+
     let no_analyzer_err = || {
         pyo3::exceptions::PyValueError::new_err(
             "index has no analyzer/vocab (build with BOWIndexBuilder to enable matchop query \
@@ -88,9 +100,28 @@ fn load_matchop_analyzer(index: &dyn SparseIndex) -> PyResult<TextAnalyzer> {
     };
     let source = source_path_for_resolver(index).ok_or_else(no_analyzer_err)?;
     let path_str = source.to_str().ok_or_else(no_analyzer_err)?;
-    PyTextAnalyzer::from_index(path_str)
-        .map(|a| a.inner)
-        .map_err(|_| no_analyzer_err())
+
+    let stamps = ["analyzer.cbor", "vocab.fst"]
+        .iter()
+        .map(|f| {
+            std::fs::metadata(source.join(f))
+                .ok()
+                .and_then(|m| Some((m.modified().ok()?, m.len())))
+        })
+        .collect();
+    let key = (source.to_path_buf(), stamps);
+
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Some(analyzer) = cache.lock().unwrap().get(&key) {
+        return Ok(analyzer.clone());
+    }
+    let analyzer = Arc::new(
+        PyTextAnalyzer::from_index(path_str)
+            .map(|a| a.inner)
+            .map_err(|_| no_analyzer_err())?,
+    );
+    cache.lock().unwrap().insert(key, analyzer.clone());
+    Ok(analyzer)
 }
 
 /// Converts a `{"term": ix}` / `{"term": [ix, weight]}` dict value into a
@@ -243,8 +274,8 @@ fn build_query_node(obj: &Bound<'_, PyAny>) -> PyResult<QueryNode> {
 fn query_node_from_py(obj: &Bound<'_, PyAny>, index: &dyn SparseIndex) -> PyResult<QueryNode> {
     if let Ok(text) = obj.extract::<String>() {
         let analyzer = load_matchop_analyzer(index)?;
-        let resolve = |tok: &str| analyzer.analyze_query(tok).keys().next().copied();
-        return query::parse_matchop(&text, &resolve).map_err(map_query_error);
+        let resolve = |tok: &str| analyzer.resolve_query_token(tok);
+        return query::parse_matchop_with(&text, &resolve).map_err(map_query_error);
     }
     build_query_node(obj)
 }
@@ -515,11 +546,9 @@ impl PySparseIndex {
             doc_meta.doc_lengths.clone(),
         ));
 
-        let model = Box::new(BM25Scoring::with_variant(
-            scoring.k1,
-            scoring.b,
-            scoring.variant,
-        ));
+        let model = Box::new(
+            BM25Scoring::with_variant(scoring.k1, scoring.b, scoring.variant).with_k3(scoring.k3),
+        );
         let scored = ScoredIndex::new(self.index.clone(), doc_meta, model);
         let scored_box: Arc<Box<dyn SparseIndex>> = Arc::new(Box::new(scored));
 
@@ -1641,20 +1670,27 @@ impl PyDocMetadata {
 ///   get a negative weight. Matches PISA and Terrier.
 /// - `"lucene"`: Lucene's `BM25Similarity.idf`,
 ///   `ln(1 + (N - df + 0.5) / (df + 0.5))`. Matches Pyserini/Anserini.
+///
+/// `k3` sets query-term saturation. `None` (default) makes query weights
+/// linear, as in Lucene and PISA. With a value (Terrier uses 8), weights
+/// are first divided by the query's largest weight, then mapped to
+/// `(k3 + 1) * w / (k3 + w)`, as Terrier 5's BM25 does. This applies to
+/// repeated query terms and to `#combine` weights.
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
 #[pyclass(name = "BM25Scoring")]
 pub struct PyBM25Scoring {
     k1: f32,
     b: f32,
     variant: Bm25IdfVariant,
+    k3: Option<f32>,
 }
 
 #[cfg_attr(feature = "stub-gen", gen_stub_pymethods)]
 #[pymethods]
 impl PyBM25Scoring {
     #[new]
-    #[pyo3(signature = (k1=1.2, b=0.75, variant="bm25"))]
-    fn new(k1: f32, b: f32, variant: &str) -> PyResult<Self> {
+    #[pyo3(signature = (k1=1.2, b=0.75, variant="bm25", k3=None))]
+    fn new(k1: f32, b: f32, variant: &str, k3: Option<f32>) -> PyResult<Self> {
         let variant = match variant {
             "bm25" => Bm25IdfVariant::Bm25,
             "lucene" => Bm25IdfVariant::Lucene,
@@ -1665,7 +1701,7 @@ impl PyBM25Scoring {
                 )))
             }
         };
-        Ok(Self { k1, b, variant })
+        Ok(Self { k1, b, variant, k3 })
     }
 }
 
@@ -1863,8 +1899,16 @@ impl PyBOWIndexBuilder {
     ///         positions cost extra disk and are read lazily, so queries
     ///         without positional operators pay nothing. Overrides
     ///         ``options.positions`` when both are given.
+    ///     position_gaps: Whether stop words removed at index time leave a
+    ///         gap in token positions. ``True`` (Lucene): ``#1(new york)``
+    ///         does not match "new of york". ``False`` (Terrier 5):
+    ///         positions only count kept tokens, so it does -- consistent
+    ///         with matchop queries dropping stop words inside ``#1``/
+    ///         ``#uwN``. Default: ``False`` for the ``"terrier"`` and
+    ///         ``"terrier-pisa"`` pipelines, ``True`` otherwise. Only
+    ///         matters with ``positions=True``.
     #[new]
-    #[pyo3(signature = (folder, options=None, dtype=None, pipeline=None, stemmer=None, language=None, stop_words=None, positions=false))]
+    #[pyo3(signature = (folder, options=None, dtype=None, pipeline=None, stemmer=None, language=None, stop_words=None, positions=false, position_gaps=None))]
     fn new(
         folder: &str,
         options: Option<&PyBuilderOptions>,
@@ -1874,6 +1918,7 @@ impl PyBOWIndexBuilder {
         language: Option<&str>,
         stop_words: Option<&Bound<'_, PyAny>>,
         positions: bool,
+        position_gaps: Option<bool>,
     ) -> PyResult<Self> {
         let mut builder_options = match options {
             Some(o) => o.0.clone(),
@@ -1900,6 +1945,10 @@ impl PyBOWIndexBuilder {
             // time -- see `TextAnalyzer::query_stop_words`. `None` for every
             // pipeline except `"terrier-pisa"`.
             query_only_stop_words_family: Option<crate::vocab::stopwords::StopWordFamily>,
+            // Whether index-time stop word removal leaves position gaps
+            // (`AnalyzerConfig::position_gaps`): Lucene does, Terrier 5
+            // doesn't.
+            position_gaps: bool,
         }
         let pipeline_defaults = pipeline
             .map(|name| match name.to_lowercase().as_str() {
@@ -1908,6 +1957,7 @@ impl PyBOWIndexBuilder {
                     tokenizer: crate::vocab::analyzer::Tokenizer::LuceneEnglish,
                     stop_words_family: Some(crate::vocab::stopwords::StopWordFamily::Lucene),
                     filter_mode: crate::vocab::analyzer::StopWordFilterMode::PreStem,
+                    position_gaps: true,
                     query_only_stop_words_family: None,
                 }),
                 "terrier" => Ok(PipelineDefaults {
@@ -1921,6 +1971,7 @@ impl PyBOWIndexBuilder {
                     // first). Verified by dumping an isolated Terrier 5
                     // lexicon directly. PostStem was the wrong timing.
                     filter_mode: crate::vocab::analyzer::StopWordFilterMode::PreStem,
+                    position_gaps: false,
                     query_only_stop_words_family: None,
                 }),
                 "terrier-pisa" => Ok(PipelineDefaults {
@@ -1953,6 +2004,7 @@ impl PyBOWIndexBuilder {
                     // list.
                     stop_words_family: None,
                     filter_mode: crate::vocab::analyzer::StopWordFilterMode::PreStem,
+                    position_gaps: false,
                     query_only_stop_words_family: Some(
                         crate::vocab::stopwords::StopWordFamily::Terrier,
                     ),
@@ -1965,6 +2017,9 @@ impl PyBOWIndexBuilder {
             .transpose()?;
 
         let stemmer = stemmer.or_else(|| pipeline_defaults.as_ref().map(|pd| pd.stemmer));
+        let position_gaps = position_gaps
+            .or_else(|| pipeline_defaults.as_ref().map(|pd| pd.position_gaps))
+            .unwrap_or(true);
 
         // Resolve stop words: True/"lucene"/"terrier" = built-in family list,
         // list = explicit, None = no stop words (or, with a `pipeline`, that
@@ -2109,6 +2164,7 @@ impl PyBOWIndexBuilder {
                 english_possessive_filter: tokenizer
                     == crate::vocab::analyzer::Tokenizer::LuceneEnglish,
                 tokenizer,
+                position_gaps,
             });
             a
         };

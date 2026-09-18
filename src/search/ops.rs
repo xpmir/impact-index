@@ -193,11 +193,16 @@ fn leapfrog_align<'a>(
     }
 }
 
-/// Boolean AND (`#band`): matches only docs present in every child;
-/// value = sum of children's values at the aligned doc (Lucene MUST
-/// semantics).
+/// Boolean AND (`#band`): matches only docs present in every child.
+///
+/// The value at an aligned doc depends on [`AndValue`]: over a scored index
+/// `#band` is a Terrier virtual term whose tf is always 1
+/// ([`AndValue::One`], scored afterwards by `src/query.rs`); over a raw
+/// (unscored) index it is the sum of the children's values
+/// ([`AndValue::Sum`]).
 pub(crate) struct AndCursor<'a> {
     children: Vec<AndChild<'a>>,
+    mode: AndValue,
     cached: Option<TermImpact>,
     max_value: ImpactValue,
     max_doc_id: DocId,
@@ -205,9 +210,24 @@ pub(crate) struct AndCursor<'a> {
     exhausted: bool,
 }
 
+/// What an [`AndCursor`] reports as its value on a matching document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AndValue {
+    /// Sum of the children's values.
+    Sum,
+    /// Always `1.0` (Terrier's `ANDIterablePosting` frequency).
+    One,
+}
+
 impl<'a> AndCursor<'a> {
-    pub(crate) fn new(children: Vec<Box<dyn BlockTermImpactIterator + 'a>>) -> Self {
-        let max_value: ImpactValue = children.iter().map(|c| c.max_value()).sum();
+    pub(crate) fn new(
+        children: Vec<Box<dyn BlockTermImpactIterator + 'a>>,
+        mode: AndValue,
+    ) -> Self {
+        let max_value: ImpactValue = match mode {
+            AndValue::Sum => children.iter().map(|c| c.max_value()).sum(),
+            AndValue::One => 1.0,
+        };
         let max_doc_id = children.iter().map(|c| c.max_doc_id()).min().unwrap_or(0);
         let length = children.iter().map(|c| c.length()).min().unwrap_or(0);
         let exhausted = children.is_empty();
@@ -219,6 +239,7 @@ impl<'a> AndCursor<'a> {
 
         Self {
             children,
+            mode,
             cached: None,
             max_value,
             max_doc_id,
@@ -236,7 +257,10 @@ impl<'a> BlockTermImpactIterator for AndCursor<'a> {
         let target = doc_id.max(self.cached.map(|c| c.docid + 1).unwrap_or(0));
 
         let docid = leapfrog_align(&mut self.children, target, &mut self.exhausted)?;
-        let value = self.children.iter().map(|c| c.iter.current().value).sum();
+        let value = match self.mode {
+            AndValue::Sum => self.children.iter().map(|c| c.iter.current().value).sum(),
+            AndValue::One => 1.0,
+        };
         self.cached = Some(TermImpact { docid, value });
         Some(docid)
     }
@@ -288,24 +312,15 @@ struct PositionalCursor<'a> {
 
 impl<'a> PositionalCursor<'a> {
     fn new(children: Vec<Box<dyn BlockTermImpactIterator + 'a>>, kind: MatchKind) -> Self {
-        let max_value: ImpactValue = match kind {
-            // Every phrase match consumes a distinct start position from the
-            // pivot (rarest) list, so tf_phrase <= min child tf -- `min` of
-            // children's max values is a safe (and tight) bound.
-            MatchKind::Phrase => children
-                .iter()
-                .map(|c| c.max_value())
-                .reduce(f32::min)
-                .unwrap_or(0.0),
-            // NOT so for windows: `window_count`'s minimal-cover sweep
-            // advances one pointer per counted window, so interleaved
-            // occurrences ("a b a b a", width 3) yield a count EXCEEDING
-            // every single child's tf. The count is bounded by the total
-            // number of pointer advances, i.e. the sum of the children's
-            // tfs -- `min` here would under-estimate the bound and let
-            // WAND/MaxScore prune genuinely competitive documents.
-            MatchKind::Window(_) => children.iter().map(|c| c.max_value()).sum(),
-        };
+        // Every phrase match (`phrase_count`) and every window match
+        // (`window_count`) consumes a distinct position of the rarest
+        // child, so the virtual tf is <= min child tf -- `min` of the
+        // children's max values is a safe (and tight) bound for both.
+        let max_value: ImpactValue = children
+            .iter()
+            .map(|c| c.max_value())
+            .reduce(f32::min)
+            .unwrap_or(0.0);
         let max_doc_id = children.iter().map(|c| c.max_doc_id()).min().unwrap_or(0);
         let length = children.iter().map(|c| c.length()).min().unwrap_or(0);
         let exhausted = children.is_empty();
@@ -396,7 +411,7 @@ impl<'a> BlockTermImpactIterator for PositionalCursor<'a> {
 /// Exact phrase (`#1`): adjacent positions, one virtual "term" whose tf is
 /// the phrase's occurrence count. Constructed only over *raw* (unscored)
 /// positional children -- see `src/query.rs::evaluate`, which wraps the
-/// result with a compound scorer.
+/// result with the model's scorer for the phrase's virtual statistics.
 pub(crate) struct PhraseCursor<'a>(PositionalCursor<'a>);
 
 impl<'a> PhraseCursor<'a> {
@@ -428,7 +443,7 @@ impl<'a> BlockTermImpactIterator for PhraseCursor<'a> {
     }
 }
 
-/// Unordered window (`#uwN`): minimal-interval semantics, see
+/// Unordered window (`#uwN`): Terrier 5's seed-occurrence semantics, see
 /// [`window_count`]. Same construction/wrapping story as [`PhraseCursor`].
 pub(crate) struct WindowCursor<'a>(PositionalCursor<'a>);
 
@@ -521,53 +536,73 @@ pub(crate) fn phrase_count(lists: &[&[u32]]) -> u32 {
     count
 }
 
-/// Counts unordered-window (`#uwN`) matches on an already-aligned document:
-/// the number of *minimal* windows covering at least one occurrence of
-/// every term with span `< width` (span = max position - min position
-/// among the window's chosen occurrences).
+/// Counts unordered-window (`#uwN`) matches on an already-aligned
+/// document, with Terrier 5's semantics (`ProximityIterablePosting`): the
+/// number of occurrences of the *seed* term (the one with the fewest
+/// positions in this document, first on ties) for which every other term
+/// has an occurrence inside some window of `width` consecutive positions
+/// that also contains the seed occurrence. Like Terrier, `width` is raised
+/// to the number of terms when smaller (a window can't hold fewer
+/// positions than terms), and a position can only be used once per match
+/// (relevant when the same term is listed twice).
 ///
-/// Standard "smallest range covering all lists" two-pointer sweep: at each
-/// step, look at the current frontier (one pointer per list), record
-/// whether its span is a match, then advance the pointer sitting at the
-/// minimum position (the only one that can shrink -- or, moving on, find a
-/// new -- minimal window). Stops when any list is exhausted. This counts
-/// non-degenerate minimal covers (Indri/Terrier-style); duplicate/overlap
-/// counting subtleties beyond that are out of scope for v1.
+/// Every match consumes a distinct seed position, so the count never
+/// exceeds the smallest child tf -- which is what makes `min` of the
+/// children's `max_value()` a safe bound (see [`PositionalCursor::new`]).
 ///
-/// e.g. `a` at `[0]`, `b` at `[1]`, `width = 3`: span is `1 < 3`, one
-/// match. `a` at `[0]`, `b` at `[10]`, `width = 3`: span `10 >= 3`, zero
-/// matches.
+/// e.g. `a` at `[0]`, `b` at `[1]`, `width = 3`: one match. `a` at `[0]`,
+/// `b` at `[10]`, `width = 3`: zero. `a` at `[0, 2, 4]`, `b` at `[1, 3]`,
+/// `width = 3`: seed `b` has two occurrences, both matched -> 2.
 pub(crate) fn window_count(lists: &[&[u32]], width: u32) -> u32 {
     let k = lists.len();
     if k == 0 || lists.iter().any(|l| l.is_empty()) {
         return 0;
     }
 
-    let mut pointers = vec![0usize; k];
+    let seed = lists
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, l)| l.len())
+        .map(|(i, _)| i)
+        .expect("k >= 1 checked above");
+    if k == 1 {
+        return lists[seed].len() as u32;
+    }
+
+    let diameter = (width as i64).max(k as i64);
+    let mut chosen: Vec<i64> = Vec::with_capacity(k);
     let mut count = 0u32;
 
-    loop {
-        let mut min_val = u32::MAX;
-        let mut min_idx = 0usize;
-        let mut max_val = 0u32;
-        for (i, &ptr) in pointers.iter().enumerate() {
-            let v = lists[i][ptr];
-            if v < min_val {
-                min_val = v;
-                min_idx = i;
-            }
-            if v > max_val {
-                max_val = v;
-            }
-        }
-
-        if max_val - min_val < width {
+    for &p in lists[seed] {
+        let p = p as i64;
+        // Slide a `diameter`-wide window [start, start + diameter) over
+        // every placement that still contains `p`.
+        let matched = (p - diameter + 1..=p).any(|start| {
+            let end = start + diameter;
+            chosen.clear();
+            chosen.push(p);
+            lists.iter().enumerate().all(|(i, list)| {
+                if i == seed {
+                    return true;
+                }
+                // First unused position of this list inside the window.
+                let from = list.partition_point(|&q| (q as i64) < start);
+                match list[from..]
+                    .iter()
+                    .map(|&q| q as i64)
+                    .take_while(|&q| q < end)
+                    .find(|q| !chosen.contains(q))
+                {
+                    Some(q) => {
+                        chosen.push(q);
+                        true
+                    }
+                    None => false,
+                }
+            })
+        });
+        if matched {
             count += 1;
-        }
-
-        pointers[min_idx] += 1;
-        if pointers[min_idx] >= lists[min_idx].len() {
-            break;
         }
     }
 

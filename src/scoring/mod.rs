@@ -89,21 +89,18 @@ pub trait ScoringModel: Send + Sync {
     /// at query entry. See [`crate::index::SparseIndex::as_any`].
     fn as_any(&self) -> &dyn std::any::Any;
 
-    /// Scorer for a "virtual term" made of several underlying terms
-    /// (phrase, window, synonym -- see `crate::query::QueryNode`): `dfs`
-    /// are the children's document frequencies, `max_value` the virtual
-    /// term's max raw value (e.g. a phrase's max possible occurrence
-    /// count).
+    /// Adjusts a query's per-clause weights in place, before scoring --
+    /// the query-side half of a model (the document side is
+    /// [`Self::term_scorer`]). Called once per query on the weights of the
+    /// flat top-level clause list, both for plain `HashMap` queries
+    /// ([`crate::search::maxscore::search_maxscore`]/
+    /// [`crate::search::wand::search_wand`]) and for structured ones
+    /// ([`crate::query::evaluate`]).
     ///
-    /// Default: conservative fallback -- score like a single term whose df
-    /// is the smallest child df (the highest single-term idf, so still a
-    /// safe/reasonable bound for models that don't define anything
-    /// smarter). Override for models with a real compound-scoring
-    /// convention, e.g. [`bm25::BM25Scoring`] sums the children's idfs
-    /// (Lucene's convention for phrase scoring).
-    fn compound_scorer(&self, dfs: &[u64], max_value: f32) -> Box<dyn ScoringFunction> {
-        self.term_scorer(dfs.iter().copied().min().unwrap_or(1), max_value)
-    }
+    /// Default: no-op (weights multiply scores linearly, Lucene-style).
+    /// [`bm25::BM25Scoring`] with `k3` set applies Terrier's query-term
+    /// frequency saturation instead.
+    fn query_weights(&self, _weights: &mut [f32]) {}
 }
 
 /// Wraps a [`BlockTermImpactIterator`], applying a [`ScoringFunction`] to each posting.
@@ -217,9 +214,9 @@ impl<'a> BlockTermImpactIterator for ScoringBlockIterator<'a> {
 /// Wraps a raw (unscored) cursor with a [`ScoringFunction`], the way
 /// [`ScoredIndex::block_iterator`] wraps a plain term's inner iterator --
 /// exposed so structured-query evaluation (`crate::query::evaluate`) can
-/// wrap the raw virtual-tf cursor a phrase/window/synonym composite
-/// produces (`crate::search::ops`) with a [`ScoringModel::compound_scorer`]
-/// the same way.
+/// wrap the raw virtual-tf cursor a phrase/window/synonym/band composite
+/// produces (`crate::search::ops`) with a [`ScoringModel::term_scorer`]
+/// built from the composite's own (Terrier-style) statistics.
 ///
 /// `max_value` is computed the same way `ScoredIndex::block_iterator` does:
 /// `scorer.max_score_with_dl(inner.max_value(), inner.min_dl())` -- safe
@@ -245,6 +242,23 @@ pub(crate) fn wrap_scored_cursor<'a>(
         cached_scored_block_max: 0.0,
         max_value,
     })
+}
+
+/// Applies the scoring model's query-weight adjustment
+/// ([`ScoringModel::query_weights`]) to a flat query, if `index` is a
+/// [`ScoredIndex`]; any other index gets the query back unchanged.
+pub(crate) fn adjust_query<'q>(
+    index: &dyn SparseIndex,
+    query: &'q std::collections::HashMap<TermIndex, ImpactValue>,
+) -> std::borrow::Cow<'q, std::collections::HashMap<TermIndex, ImpactValue>> {
+    use std::borrow::Cow;
+    let Some(scored) = index.as_any().downcast_ref::<ScoredIndex>() else {
+        return Cow::Borrowed(query);
+    };
+    let (terms, mut weights): (Vec<TermIndex>, Vec<f32>) =
+        query.iter().map(|(&t, &w)| (t, w)).unzip();
+    scored.model().query_weights(&mut weights);
+    Cow::Owned(terms.into_iter().zip(weights).collect())
 }
 
 /// A wrapper around a [`SparseIndex`] that applies scoring functions to iterators.
@@ -287,11 +301,16 @@ impl ScoredIndex {
         self.model.as_any()
     }
 
-    /// The scoring model (for structured-query evaluation, which needs
-    /// [`ScoringModel::compound_scorer`] -- `model_any` only offers a
-    /// downcast to one specific known model).
+    /// The scoring model (for structured-query evaluation, which scores
+    /// virtual terms through [`ScoringModel::term_scorer`] -- `model_any`
+    /// only offers a downcast to one specific known model).
     pub(crate) fn model(&self) -> &dyn ScoringModel {
         &*self.model
+    }
+
+    /// Number of documents in the collection (`N`).
+    pub(crate) fn num_docs(&self) -> u64 {
+        self.doc_meta.num_docs()
     }
 }
 

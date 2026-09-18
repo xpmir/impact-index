@@ -18,9 +18,9 @@ use impact_index::compress::CompressionTransform;
 use impact_index::docmeta::DocMetadata;
 use impact_index::index::{BlockTermImpactIterator, SparseIndex};
 use impact_index::query::{evaluate, parse_matchop, search_maxscore_query, search_wand_query};
-use impact_index::query::{QueryError, QueryNode};
+use impact_index::query::{parse_matchop_with, QueryError, QueryNode, Resolved};
 use impact_index::scoring::bm25::BM25Scoring;
-use impact_index::scoring::ScoredIndex;
+use impact_index::scoring::{ScoredIndex, ScoringModel};
 use impact_index::search::maxscore::{search_maxscore, MaxScoreOptions};
 use impact_index::search::wand::search_wand;
 use impact_index::search::{ScoredDocument, TopScoredDocuments};
@@ -151,14 +151,13 @@ fn test_window_semantics_within_and_outside_width() {
     );
 }
 
-/// Regression: the minimal-window sweep counts one window per pointer
-/// advance, so interleaved occurrences ("rock jazz rock jazz rock",
-/// width 3) produce a count (4) EXCEEDING both children's tfs (3 and 2).
-/// The cursor's `max_value()` bound must still dominate the real value --
-/// with a `min`-of-children bound (the original bug) it would report 2.0
-/// and WAND/MaxScore could prune the document.
+/// `#uwN` counts occurrences of the seed (rarest) term that sit in a
+/// matching window, as Terrier 5 does: "rock jazz rock jazz rock" (width
+/// 3) has two `jazz` occurrences, both inside a window with a `rock` -> 2,
+/// never more than the smallest child tf. The cursor's `max_value()` (min
+/// of the children's bounds) must still dominate every real value.
 #[test]
-fn test_window_count_exceeds_child_tf_bound_stays_safe() {
+fn test_window_count_uses_seed_occurrences() {
     init_logger();
     let (index, terms) = build_small();
 
@@ -166,10 +165,7 @@ fn test_window_count_exceeds_child_tf_bound_stays_safe() {
         terms: vec![terms["rock"], terms["jazz"]],
         width: 3,
     };
-
-    // rock@[0,2,4], jazz@[1,3]: sweep visits frontiers (0,1) (2,1) (2,3)
-    // (4,3), all with span 1 < 3 -> count 4.
-    assert_eq!(eval_pairs(&index, &node), vec![(14, 4.0)]);
+    assert_eq!(eval_pairs(&index, &node), vec![(14, 2.0)]);
 
     let mut cursors = evaluate(&index, &node).expect("evaluate should succeed");
     let (_, mut cursor) = cursors.remove(0);
@@ -994,4 +990,227 @@ fn test_parse_window_width() {
             width: 8,
         }
     );
+}
+
+// =======================================================================
+// Terrier-compatible scoring of virtual terms
+// =======================================================================
+
+/// Scores of a scored-index clause, per doc.
+fn scored_pairs(index: &dyn SparseIndex, node: &QueryNode) -> Vec<(DocId, ImpactValue)> {
+    eval_pairs(index, node)
+}
+
+/// A BM25 model initialized on the big corpus, to compute expected scores.
+fn big_bm25(forward: &SparseBuilderIndex<f32>) -> BM25Scoring {
+    let dir = temp_dir::TempDir::new().unwrap();
+    forward.save_auxiliary(dir.path()).unwrap();
+    let doc_meta = DocMetadata::load(dir.path()).unwrap();
+    let mut model = BM25Scoring::new();
+    model.initialize(Arc::new(doc_meta.doc_lengths.clone()), doc_meta.num_docs());
+    model
+}
+
+fn df(index: &dyn SparseIndex, term: TermIndex) -> u64 {
+    index.block_iterator(term).length() as u64
+}
+
+/// `#syn`, `#band`, `#1` and `#uwN` are scored as one virtual term with
+/// Terrier's statistics: df = sum of children dfs (`#syn`, `#band`), or
+/// N / 100 (`#1`, `#uwN`); tf = summed tfs / 1 / match count.
+#[test]
+fn test_virtual_term_statistics() {
+    init_logger();
+    let (forward, t) = build_big(true);
+    let scored = compress_and_score(&forward);
+    let model = big_bm25(&forward);
+    let num_docs = big_corpus().len() as u64;
+    let term = |w: &str| QueryNode::Term {
+        term: t[w],
+        weight: 1.0,
+    };
+
+    let cases: Vec<(QueryNode, QueryNode, u64)> = vec![
+        (
+            QueryNode::Syn {
+                terms: vec![t["delta"], t["epsilon"]],
+            },
+            QueryNode::Syn {
+                terms: vec![t["delta"], t["epsilon"]],
+            },
+            df(&forward, t["delta"]) + df(&forward, t["epsilon"]),
+        ),
+        (
+            QueryNode::Phrase {
+                terms: vec![t["new"], t["york"]],
+            },
+            QueryNode::Phrase {
+                terms: vec![t["new"], t["york"]],
+            },
+            num_docs / 100,
+        ),
+        (
+            QueryNode::Window {
+                terms: vec![t["new"], t["york"]],
+                width: 4,
+            },
+            QueryNode::Window {
+                terms: vec![t["new"], t["york"]],
+                width: 4,
+            },
+            num_docs / 100,
+        ),
+    ];
+    for (scored_node, raw_node, virtual_df) in cases {
+        let scorer = model.term_scorer(virtual_df, 0.0);
+        let expected: Vec<(DocId, ImpactValue)> = eval_pairs(&forward, &raw_node)
+            .into_iter()
+            .map(|(d, tf)| (d, scorer.score(tf, d)))
+            .collect();
+        assert!(!expected.is_empty(), "{:?} matches nothing", raw_node);
+        let got = scored_pairs(&scored, &scored_node);
+        assert_eq!(got.len(), expected.len(), "{:?}", scored_node);
+        for ((gd, gs), (ed, es)) in got.iter().zip(&expected) {
+            assert_eq!(gd, ed);
+            assert!(
+                (gs - es).abs() <= 1e-5 * es.abs(),
+                "{:?}: {} vs {}",
+                scored_node,
+                gs,
+                es
+            );
+        }
+    }
+
+    // #band: tf = 1 on every doc containing all children, df = sum of dfs.
+    let band = QueryNode::Band {
+        children: vec![term("alpha"), term("gamma")],
+    };
+    let scorer = model.term_scorer(df(&forward, t["alpha"]) + df(&forward, t["gamma"]), 0.0);
+    let got = scored_pairs(&scored, &band);
+    let raw = eval_pairs(&forward, &band);
+    assert!(!got.is_empty());
+    assert_eq!(got.len(), raw.len());
+    for ((gd, gs), (rd, _)) in got.iter().zip(&raw) {
+        assert_eq!(gd, rd);
+        let es = scorer.score(1.0, *gd);
+        assert!((gs - es).abs() <= 1e-5 * es.abs(), "band: {} vs {}", gs, es);
+    }
+}
+
+/// BM25 `k3`: weights are normalized by the largest one, then saturated
+/// as `(k3 + 1) w / (k3 + w)` (Terrier); without `k3`, weights stay linear.
+#[test]
+fn test_bm25_k3_query_weights() {
+    let mut w = vec![2.0f32, 1.0, 0.5];
+    BM25Scoring::new().query_weights(&mut w);
+    assert_eq!(w, vec![2.0, 1.0, 0.5]);
+
+    let mut w = vec![2.0f32, 1.0, 0.5];
+    BM25Scoring::new().with_k3(Some(8.0)).query_weights(&mut w);
+    let sat = |x: f32| 9.0 * x / (8.0 + x);
+    for (got, expected) in w.iter().zip([sat(1.0), sat(0.5), sat(0.25)]) {
+        assert!((got - expected).abs() < 1e-6, "{} vs {}", got, expected);
+    }
+}
+
+/// Nested `#combine`s flatten into top-level clauses with multiplied
+/// weights (so pruning sees every leaf).
+#[test]
+fn test_nested_combine_flattens() {
+    init_logger();
+    let (forward, t) = build_big(true);
+    let scored = compress_and_score(&forward);
+    let term = |w: &str| QueryNode::Term {
+        term: t[w],
+        weight: 1.0,
+    };
+    let node = QueryNode::Combine {
+        children: vec![
+            (
+                0.5,
+                QueryNode::Combine {
+                    children: vec![(1.0, term("alpha")), (4.0, term("beta"))],
+                },
+            ),
+            (
+                2.0,
+                QueryNode::Phrase {
+                    terms: vec![t["new"], t["york"]],
+                },
+            ),
+        ],
+    };
+    let weights: Vec<f32> = evaluate(&scored, &node)
+        .unwrap()
+        .iter()
+        .map(|(w, _)| *w)
+        .collect();
+    assert_eq!(weights, vec![0.5, 2.0, 2.0]);
+}
+
+/// Stop words inside `#1`/`#uwN`/`#band` are skipped (Terrier's term
+/// pipeline), while an unknown term still drops the whole node.
+#[test]
+fn test_parse_stopword_skipped_inside_phrase() {
+    let resolve = |tok: &str| match tok {
+        "bank" => Resolved::Term(1),
+        "america" => Resolved::Term(2),
+        "of" | "the" => Resolved::Stopword,
+        _ => Resolved::Unknown,
+    };
+    assert_eq!(
+        parse_matchop_with("#1(bank of america)", &resolve).unwrap(),
+        QueryNode::Phrase { terms: vec![1, 2] }
+    );
+    assert_eq!(
+        parse_matchop_with("#uw8(the bank america)", &resolve).unwrap(),
+        QueryNode::Window {
+            terms: vec![1, 2],
+            width: 8
+        }
+    );
+    assert_eq!(
+        parse_matchop_with("#band(bank of america)", &resolve).unwrap(),
+        QueryNode::Band {
+            children: vec![
+                QueryNode::Term {
+                    term: 1,
+                    weight: 1.0
+                },
+                QueryNode::Term {
+                    term: 2,
+                    weight: 1.0
+                },
+            ]
+        }
+    );
+    assert_eq!(
+        parse_matchop_with("bank #1(bank zork)", &resolve).unwrap(),
+        QueryNode::Term {
+            term: 1,
+            weight: 1.0
+        }
+    );
+}
+
+/// `position_gaps = false` numbers positions among kept tokens only
+/// (Terrier), so a removed stop word no longer separates its neighbours.
+#[test]
+fn test_position_gaps_option() {
+    let positions = |gaps: bool| {
+        let mut analyzer = TextAnalyzer::with_stop_words(Box::new(NoStemmer), &["of", "the"]);
+        analyzer.set_position_gaps(gaps);
+        let doc: HashMap<TermIndex, Vec<u32>> = analyzer
+            .analyze_doc_positional("bank of the america")
+            .into_iter()
+            .collect();
+        let vocab = analyzer.vocab();
+        (
+            doc[&vocab.get("bank").unwrap()].clone(),
+            doc[&vocab.get("america").unwrap()].clone(),
+        )
+    };
+    assert_eq!(positions(true), (vec![0], vec![3]));
+    assert_eq!(positions(false), (vec![0], vec![1]));
 }

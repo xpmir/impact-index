@@ -20,6 +20,14 @@ SENTENCES = [
     "the slow red fox hides from the lazy dog",
     "quick foxes and lazy dogs rarely meet",
     "the lazy dog sleeps all day while the fox runs",
+    # Filler documents, so that the query words are not in most of the
+    # collection (BM25's idf is ~0 for words in more than half the docs).
+    "stock markets fell sharply as rates rose",
+    "a recipe for bread needs flour water and salt",
+    "the museum opens a new exhibition on modern art",
+    "heavy rain is expected across the north tomorrow",
+    "the team won the final after extra time",
+    "solar panels convert sunlight into electricity",
 ]
 
 

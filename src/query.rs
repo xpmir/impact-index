@@ -20,7 +20,7 @@ use crate::base::TermIndex;
 use crate::index::{BlockTermImpactIterator, SparseIndex};
 use crate::scoring::{wrap_scored_cursor, ScoredIndex};
 use crate::search::maxscore::MaxScoreOptions;
-use crate::search::ops::{AndCursor, PhraseCursor, SumCursor, WindowCursor};
+use crate::search::ops::{AndCursor, AndValue, PhraseCursor, SumCursor, WindowCursor};
 use crate::search::ScoredDocument;
 
 // ---------------------------------------------------------------------
@@ -40,23 +40,26 @@ use crate::search::ScoredDocument;
 pub enum QueryNode {
     /// A single term with a query weight (multiplies its score).
     Term { term: TermIndex, weight: f32 },
-    /// Weighted sum of children's scores (matchop `#combine`). The root
-    /// combinator: [`evaluate`] flattens a root `Combine` directly into the
-    /// top-level `(weight, cursor)` list the search loops consume.
+    /// Weighted sum of children's scores (matchop `#combine`). [`evaluate`]
+    /// flattens every `Combine` (nested ones included) into the top-level
+    /// `(weight, cursor)` list the search loops consume.
     Combine { children: Vec<(f32, QueryNode)> },
     /// Synonym/OR (matchop `#syn`): children's term frequencies are summed
-    /// and the merged posting list is scored as ONE virtual term.
-    /// v1 restriction: children must be plain terms.
+    /// and the merged posting list is scored as ONE virtual term (df = sum
+    /// of the children's dfs). Children must be plain terms.
     Syn { terms: Vec<TermIndex> },
-    /// Boolean AND (matchop `#band`): matches docs containing every child;
-    /// score = sum of children's scores (Lucene MUST semantics).
+    /// Boolean AND (matchop `#band`): matches docs containing every child.
+    /// Scored as ONE virtual term with tf = 1 and df = sum of the
+    /// children's dfs (Terrier); over a raw index, the value is the sum of
+    /// the children's values instead. Children can't be `Combine`.
     Band { children: Vec<QueryNode> },
-    /// Exact phrase (matchop `#1`): adjacent positions. Requires an index
+    /// Exact phrase (matchop `#1`): adjacent positions, scored as a virtual
+    /// term with tf = match count and df = N / 100. Requires an index
     /// built with positions ([`QueryError::PositionsNotAvailable`]
     /// otherwise).
     Phrase { terms: Vec<TermIndex> },
-    /// Unordered window of width `width` tokens (matchop `#uwN`). Requires
-    /// positions, same as [`Phrase`](QueryNode::Phrase).
+    /// Unordered window of width `width` tokens (matchop `#uwN`), scored
+    /// like [`Phrase`](QueryNode::Phrase). Requires positions.
     Window { terms: Vec<TermIndex>, width: u32 },
 }
 
@@ -149,212 +152,196 @@ impl QueryNode {
 /// the search loops consume ([`crate::search::wand::search_wand_cursors`]/
 /// [`crate::search::maxscore::search_maxscore_cursors`]).
 ///
-/// The root [`QueryNode::Combine`] is flattened directly into the returned
-/// list (its per-child weight, further multiplied by that child's own
-/// [`QueryNode::Term::weight`] when the child is a plain term); any other
-/// root becomes a single entry with weight `1.0`. `EmptyQuery` (see
-/// [`QueryError`]) can come from either [`QueryNode::validate`] or from
-/// evaluating a composite down to zero live children -- both
-/// [`search_wand_query`]/[`search_maxscore_query`] treat it as "no
-/// results", not a hard error.
+/// Scoring follows Terrier 5's matchop semantics (see the "Structured
+/// queries" section of the Python guide for the full description):
+///
+/// - Every `Combine` is flattened: each non-`Combine` descendant becomes
+///   one top-level clause whose weight is the product of the `#combine`
+///   weights on its path (times [`QueryNode::Term::weight`] for a term);
+///   identical clauses are merged, their weights summed.
+///   Over a [`ScoredIndex`] the resulting weights then go through
+///   [`crate::scoring::ScoringModel::query_weights`] (e.g. BM25's `k3`).
+/// - A term clause is scored like a plain term.
+/// - `Syn`/`Band`/`Phrase`/`Window` clauses are *virtual terms*: a raw
+///   posting list whose "tf" is the operator's own frequency (summed tfs /
+///   1 / occurrence count), scored by the model's
+///   [`crate::scoring::ScoringModel::term_scorer`] with a virtual document
+///   frequency -- the sum of the children's dfs for `Syn` and `Band`, and
+///   `N / 100` for `Phrase`/`Window` (Terrier's heuristic, from Ivory).
+///
+/// Over a raw (unscored) index the same tree evaluates in raw-value space
+/// (no scorer, weights unchanged); there `Band` sums its children's values
+/// instead of reporting 1, which keeps it useful on learned-impact indices.
+///
+/// A clause that cannot match anything (e.g. an empty sub-tree) is
+/// dropped; `EmptyQuery` (see [`QueryError`]) is returned only when no
+/// clause is left. [`search_wand_query`]/[`search_maxscore_query`] treat it
+/// as "no results", not a hard error.
 pub fn evaluate<'a>(
     index: &'a dyn SparseIndex,
     node: &QueryNode,
 ) -> Result<Vec<(f32, Box<dyn BlockTermImpactIterator + 'a>)>, QueryError> {
     node.validate()?;
-
-    match node {
-        QueryNode::Combine { children } => {
-            let mut entries = Vec::with_capacity(children.len());
-            for (weight, child) in children {
-                let (child_weight, cursor) = eval_weighted(index, child)?;
-                entries.push((weight * child_weight, cursor));
-            }
-            if entries.is_empty() {
-                return Err(QueryError::EmptyQuery);
-            }
-            Ok(entries)
-        }
-        _ => Ok(vec![(1.0, eval_node(index, node)?)]),
-    }
-}
-
-/// Evaluates `node`, additionally reporting its own weight if it is a
-/// [`QueryNode::Term`] (so a `Combine`/`Band` parent can fold `weight *
-/// term.weight` without an extra wrapper cursor). Any other node
-/// contributes weight `1.0` here -- its own internal weighting (if any) is
-/// already baked into its cursor's values by [`eval_node`].
-fn eval_weighted<'a>(
-    index: &'a dyn SparseIndex,
-    node: &QueryNode,
-) -> Result<(f32, Box<dyn BlockTermImpactIterator + 'a>), QueryError> {
-    match node {
-        QueryNode::Term { term, weight } => Ok((*weight, index.block_iterator(*term))),
-        _ => Ok((1.0, eval_node(index, node)?)),
-    }
-}
-
-/// Wraps `cursor` in a single-child, weighted [`SumCursor`] to scale its
-/// value by `weight` -- used to apply [`QueryNode::Term::weight`] in
-/// contexts (e.g. [`QueryNode::Band`] children) that don't otherwise carry
-/// a per-child weight. A no-op (returns `cursor` unchanged) when `weight ==
-/// 1.0`, the overwhelmingly common case.
-fn apply_weight<'a>(
-    weight: f32,
-    cursor: Box<dyn BlockTermImpactIterator + 'a>,
-) -> Box<dyn BlockTermImpactIterator + 'a> {
-    if weight == 1.0 {
-        cursor
-    } else {
-        Box::new(SumCursor::new(vec![(weight, cursor)]))
-    }
-}
-
-/// Evaluates any [`QueryNode`] to a single cursor.
-///
-/// Dispatches once on whether `index` is a [`ScoredIndex`]
-/// (`index.as_any().downcast_ref`): a plain [`QueryNode::Term`] just calls
-/// `index.block_iterator` either way (already scored when `index` is a
-/// `ScoredIndex`, since virtual dispatch resolves to
-/// `ScoredIndex::block_iterator`). [`QueryNode::Syn`]/
-/// [`QueryNode::Phrase`]/[`QueryNode::Window`] are different: their
-/// virtual term frequency has to be computed in *raw* tf space (from
-/// `scored.inner_index()`'s cursors) before being scored, so those three
-/// branches special-case the `ScoredIndex` case to build the composite
-/// over raw children and then [`wrap_scored_cursor`] it with
-/// [`crate::scoring::ScoringModel::compound_scorer`]. Over a raw
-/// (unscored) index, the same tree evaluates directly in raw-value space
-/// (no wrapping) -- useful for quantized/learned-impact experimentation.
-fn eval_node<'a>(
-    index: &'a dyn SparseIndex,
-    node: &QueryNode,
-) -> Result<Box<dyn BlockTermImpactIterator + 'a>, QueryError> {
     let scored = index.as_any().downcast_ref::<ScoredIndex>();
 
+    let mut leaves = Vec::new();
+    flatten(node, 1.0, &mut leaves);
+    // Identical clauses merge into one, weights summed (Terrier's
+    // MatchingQueryTerms): `#combine(a a b)` is `#combine:0=2(a b)`, which
+    // matters once `query_weights` is non-linear.
+    let mut clauses: Vec<(f32, &QueryNode)> = Vec::with_capacity(leaves.len());
+    for (weight, leaf) in leaves {
+        match clauses.iter_mut().find(|(_, c)| same_clause(c, leaf)) {
+            Some((w, _)) => *w += weight,
+            None => clauses.push((weight, leaf)),
+        }
+    }
+
+    let mut weights = Vec::with_capacity(clauses.len());
+    let mut cursors = Vec::with_capacity(clauses.len());
+    for (weight, clause) in clauses {
+        match eval_clause(index, scored, clause) {
+            Ok(cursor) => {
+                weights.push(weight);
+                cursors.push(cursor);
+            }
+            Err(QueryError::EmptyQuery) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    if cursors.is_empty() {
+        return Err(QueryError::EmptyQuery);
+    }
+    if let Some(scored) = scored {
+        scored.model().query_weights(&mut weights);
+    }
+    Ok(weights.into_iter().zip(cursors).collect())
+}
+
+/// Collects every non-`Combine` node under `node` with its accumulated
+/// weight (product of the `#combine` weights on the path, times the term's
+/// own weight for a [`QueryNode::Term`]).
+fn flatten<'n>(node: &'n QueryNode, weight: f32, out: &mut Vec<(f32, &'n QueryNode)>) {
     match node {
-        QueryNode::Term { term, .. } => Ok(index.block_iterator(*term)),
-
         QueryNode::Combine { children } => {
-            let mut parts = Vec::with_capacity(children.len());
-            for (weight, child) in children {
-                let (child_weight, cursor) = eval_weighted(index, child)?;
-                parts.push((weight * child_weight, cursor));
+            for (w, child) in children {
+                flatten(child, weight * w, out);
             }
-            if parts.is_empty() {
-                return Err(QueryError::EmptyQuery);
-            }
-            Ok(Box::new(SumCursor::new(parts)))
+        }
+        QueryNode::Term { weight: w, .. } => out.push((weight * w, node)),
+        _ => out.push((weight, node)),
+    }
+}
+
+/// Whether two flattened clauses denote the same virtual term (a term's
+/// own weight is already folded into the clause weight, so it is ignored).
+fn same_clause(a: &QueryNode, b: &QueryNode) -> bool {
+    match (a, b) {
+        (QueryNode::Term { term: x, .. }, QueryNode::Term { term: y, .. }) => x == y,
+        _ => a == b,
+    }
+}
+
+/// Evaluates one top-level clause (anything but a `Combine`) to a cursor:
+/// scored when `index` is a [`ScoredIndex`], raw otherwise.
+fn eval_clause<'a>(
+    index: &'a dyn SparseIndex,
+    scored: Option<&'a ScoredIndex>,
+    node: &QueryNode,
+) -> Result<Box<dyn BlockTermImpactIterator + 'a>, QueryError> {
+    match (node, scored) {
+        (QueryNode::Term { term, .. }, _) => Ok(index.block_iterator(*term)),
+        (_, Some(scored)) => {
+            let num_docs = scored.num_docs();
+            let (df, raw) = eval_raw(scored.inner_index(), Some(num_docs), node)?;
+            // A summed df (`#syn`/`#band`) can exceed N, where idf formulas
+            // break down (Terrier's own BM25 takes the log of a negative
+            // number there); capping at N keeps every idf variant finite and
+            // non-negative without affecting any df <= N.
+            let scorer = scored
+                .model()
+                .term_scorer(df.min(num_docs), raw.max_value());
+            Ok(wrap_scored_cursor(raw, scorer))
+        }
+        (_, None) => Ok(eval_raw(index, None, node)?.1),
+    }
+}
+
+/// Evaluates `node` to a raw (unscored) virtual posting list over `source`,
+/// together with its virtual document frequency (Terrier's statistics, see
+/// [`evaluate`]). `num_docs` is `Some(N)` when the result is going to be
+/// scored -- which also selects `Band`'s tf = 1 semantics -- and `None`
+/// for raw-value evaluation.
+fn eval_raw<'a>(
+    source: &'a dyn SparseIndex,
+    num_docs: Option<u64>,
+    node: &QueryNode,
+) -> Result<(u64, Box<dyn BlockTermImpactIterator + 'a>), QueryError> {
+    match node {
+        QueryNode::Term { term, .. } => {
+            let cursor = source.block_iterator(*term);
+            Ok((cursor.length() as u64, cursor))
         }
 
-        QueryNode::Band { children } => {
-            let mut parts = Vec::with_capacity(children.len());
-            for child in children {
-                let (weight, cursor) = eval_weighted(index, child)?;
-                parts.push(apply_weight(weight, cursor));
-            }
-            if parts.is_empty() {
-                return Err(QueryError::EmptyQuery);
-            }
-            Ok(Box::new(AndCursor::new(parts)))
-        }
+        QueryNode::Combine { .. } => Err(QueryError::Parse(
+            "#combine can only appear at the top level or inside another #combine".to_string(),
+        )),
 
         QueryNode::Syn { terms } => {
             if terms.is_empty() {
                 return Err(QueryError::EmptyQuery);
             }
-            if let Some(scored) = scored {
-                let inner = scored.inner_index();
-                let (dfs, children) = raw_term_children(inner, terms);
-                let merged: Box<dyn BlockTermImpactIterator + 'a> =
-                    Box::new(SumCursor::new(children));
-                let max_value = merged.max_value();
-                // For synonyms Lucene blends idfs rather than summing them;
-                // summing children dfs directly would overcount docs that
-                // contain several synonyms. Passing per-child dfs and
-                // letting `compound_scorer` sum idfs follows the phrase
-                // convention instead -- documented v1 choice, see
-                // `positions-plan.md` Phase 3.
-                let scorer = scored.model().compound_scorer(&dfs, max_value);
-                Ok(wrap_scored_cursor(merged, scorer))
-            } else {
-                let children = terms
-                    .iter()
-                    .map(|&t| (1.0f32, index.block_iterator(t)))
-                    .collect();
-                Ok(Box::new(SumCursor::new(children)))
+            let (dfs, children) = raw_term_children(source, terms);
+            let children = children.into_iter().map(|c| (1.0f32, c)).collect();
+            Ok((dfs.iter().sum(), Box::new(SumCursor::new(children))))
+        }
+
+        QueryNode::Band { children } => {
+            if children.is_empty() {
+                return Err(QueryError::EmptyQuery);
             }
+            let mut df = 0u64;
+            let mut cursors = Vec::with_capacity(children.len());
+            for child in children {
+                let (child_df, cursor) = eval_raw(source, num_docs, child)?;
+                df += child_df;
+                cursors.push(cursor);
+            }
+            let mode = if num_docs.is_some() {
+                AndValue::One
+            } else {
+                AndValue::Sum
+            };
+            Ok((df, Box::new(AndCursor::new(cursors, mode))))
         }
 
-        QueryNode::Phrase { terms } => {
-            eval_positional(index, scored, terms, PositionalKind::Phrase)
-        }
-        QueryNode::Window { terms, width } => {
-            eval_positional(index, scored, terms, PositionalKind::Window(*width))
+        QueryNode::Phrase { terms } | QueryNode::Window { terms, .. } => {
+            if !SparseIndex::has_positions(source) {
+                return Err(QueryError::PositionsNotAvailable);
+            }
+            if terms.is_empty() {
+                return Err(QueryError::EmptyQuery);
+            }
+            let (_, children) = raw_term_children(source, terms);
+            let cursor: Box<dyn BlockTermImpactIterator + 'a> = match node {
+                QueryNode::Window { width, .. } => Box::new(WindowCursor::new(children, *width)),
+                _ => Box::new(PhraseCursor::new(children)),
+            };
+            // Terrier's PhraseOp/UnorderedWindowOp: a fixed df of N/100
+            // (integer division), whatever the terms.
+            Ok((num_docs.unwrap_or(0) / 100, cursor))
         }
     }
 }
 
-/// Which positional operator [`eval_positional`] should build.
-enum PositionalKind {
-    Phrase,
-    Window(u32),
-}
-
-/// Shared `Phrase`/`Window` evaluation: raw positional children (from the
-/// scored index's inner index, or `index` itself when unscored), wrapped
-/// with a compound scorer only in the scored case.
-fn eval_positional<'a>(
-    index: &'a dyn SparseIndex,
-    scored: Option<&'a ScoredIndex>,
-    terms: &[TermIndex],
-    kind: PositionalKind,
-) -> Result<Box<dyn BlockTermImpactIterator + 'a>, QueryError> {
-    if !SparseIndex::has_positions(index) {
-        return Err(QueryError::PositionsNotAvailable);
-    }
-    if terms.is_empty() {
-        return Err(QueryError::EmptyQuery);
-    }
-
-    let source: &'a dyn SparseIndex = match scored {
-        Some(s) => s.inner_index(),
-        None => index,
-    };
-    let (dfs, children) = raw_term_children(source, terms);
-    let children: Vec<Box<dyn BlockTermImpactIterator + 'a>> =
-        children.into_iter().map(|(_, c)| c).collect();
-
-    let positional: Box<dyn BlockTermImpactIterator + 'a> = match kind {
-        PositionalKind::Phrase => Box::new(PhraseCursor::new(children)),
-        PositionalKind::Window(width) => Box::new(WindowCursor::new(children, width)),
-    };
-
-    match scored {
-        Some(scored) => {
-            let max_value = positional.max_value();
-            let scorer = scored.model().compound_scorer(&dfs, max_value);
-            Ok(wrap_scored_cursor(positional, scorer))
-        }
-        None => Ok(positional),
-    }
-}
-
-/// Builds raw (unscored) per-term cursors from `source` for every term in
-/// `terms`, plus each one's document frequency (`length()`) -- the shared
-/// shape [`QueryNode::Syn`]/[`QueryNode::Phrase`]/[`QueryNode::Window`] all
-/// need before merging/aligning and (in the scored case) computing a
-/// compound scorer.
+/// Raw (unscored) per-term cursors from `source` for every term in
+/// `terms`, plus each one's document frequency (`length()`).
 fn raw_term_children<'a>(
     source: &'a dyn SparseIndex,
     terms: &[TermIndex],
-) -> (Vec<u64>, Vec<(f32, Box<dyn BlockTermImpactIterator + 'a>)>) {
-    let mut dfs = Vec::with_capacity(terms.len());
-    let mut children = Vec::with_capacity(terms.len());
-    for &t in terms {
-        let c = source.block_iterator(t);
-        dfs.push(c.length() as u64);
-        children.push((1.0f32, c));
-    }
+) -> (Vec<u64>, Vec<Box<dyn BlockTermImpactIterator + 'a>>) {
+    let children: Vec<_> = terms.iter().map(|&t| source.block_iterator(t)).collect();
+    let dfs = children.iter().map(|c| c.length() as u64).collect();
     (dfs, children)
 }
 
@@ -437,6 +424,10 @@ pub fn search_maxscore_query(
 ///   [`QueryError::EmptyQuery`], and the search entry points turn THAT into
 ///   an empty result set.
 ///
+/// Here every `None` from `resolve` counts as an unknown term; use
+/// [`parse_matchop_with`] to have stop words skipped instead (what the
+/// Python API does).
+///
 /// The parser itself is a small hand-rolled recursive descent (no new
 /// dependencies): malformed input (unbalanced parens, an unknown operator,
 /// a malformed `:IDX=WEIGHT` suffix, an operator nested where only plain
@@ -444,6 +435,34 @@ pub fn search_maxscore_query(
 pub fn parse_matchop(
     text: &str,
     resolve: &dyn Fn(&str) -> Option<TermIndex>,
+) -> Result<QueryNode, QueryError> {
+    parse_matchop_with(text, &|tok| match resolve(tok) {
+        Some(t) => Resolved::Term(t),
+        None => Resolved::Unknown,
+    })
+}
+
+/// How a query token resolved against the vocabulary (see
+/// [`parse_matchop_with`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolved {
+    /// The token maps to this term.
+    Term(TermIndex),
+    /// The token is removed by the analyzer (a stop word, or nothing left
+    /// after tokenization): it is skipped everywhere, as Terrier's term
+    /// pipeline does -- `#1(bank of america)` is `#1(bank america)`.
+    Stopword,
+    /// The token is a real word absent from the index: it can never match.
+    Unknown,
+}
+
+/// Like [`parse_matchop`], but with a resolver that tells stop words
+/// ([`Resolved::Stopword`], silently skipped even inside `#1`/`#uwN`/
+/// `#band`) apart from unknown terms ([`Resolved::Unknown`], which drop
+/// the whole enclosing `#1`/`#uwN`/`#band`).
+pub fn parse_matchop_with(
+    text: &str,
+    resolve: &dyn Fn(&str) -> Resolved,
 ) -> Result<QueryNode, QueryError> {
     let tokens = tokenize(text);
     let mut parser = Parser {
@@ -495,7 +514,22 @@ fn tokenize(text: &str) -> Vec<&str> {
 struct Parser<'a, 'r> {
     tokens: Vec<&'a str>,
     pos: usize,
-    resolve: &'r dyn Fn(&str) -> Option<TermIndex>,
+    resolve: &'r dyn Fn(&str) -> Resolved,
+}
+
+/// Outcome of parsing one node.
+enum Parsed {
+    Node(QueryNode),
+    /// Nothing to add, but nothing wrong either (a stop word).
+    Skip,
+    /// Can never match (unknown term, or an operator pruned to nothing).
+    Fail,
+}
+
+impl Parsed {
+    fn from_option(node: Option<QueryNode>) -> Self {
+        node.map_or(Parsed::Fail, Parsed::Node)
+    }
 }
 
 impl<'a, 'r> Parser<'a, 'r> {
@@ -530,7 +564,7 @@ impl<'a, 'r> Parser<'a, 'r> {
     fn parse_top_level(&mut self) -> Result<QueryNode, QueryError> {
         let mut children = Vec::new();
         while self.peek().is_some() && self.peek() != Some(")") {
-            if let Some(node) = self.parse_node()? {
+            if let Parsed::Node(node) = self.parse_node()? {
                 children.push((1.0f32, node));
             }
         }
@@ -541,18 +575,21 @@ impl<'a, 'r> Parser<'a, 'r> {
         }
     }
 
-    /// Parses one node: an operator (`#...`) or a bare term. `Ok(None)`
-    /// means "dropped" (an unresolved term, or an operator that pruned
-    /// itself away -- see [`parse_matchop`]'s doc comment).
-    fn parse_node(&mut self) -> Result<Option<QueryNode>, QueryError> {
+    /// Parses one node: an operator (`#...`) or a bare term (see
+    /// [`Parsed`] and [`parse_matchop`]'s doc comment for dropping rules).
+    fn parse_node(&mut self) -> Result<Parsed, QueryError> {
         let tok = self
             .peek()
             .ok_or_else(|| QueryError::Parse("unexpected end of input".to_string()))?;
         if let Some(stripped) = tok.strip_prefix('#') {
-            self.parse_op(stripped)
+            Ok(Parsed::from_option(self.parse_op(stripped)?))
         } else {
             self.next();
-            Ok((self.resolve)(tok).map(|term| QueryNode::Term { term, weight: 1.0 }))
+            Ok(match (self.resolve)(tok) {
+                Resolved::Term(term) => Parsed::Node(QueryNode::Term { term, weight: 1.0 }),
+                Resolved::Stopword => Parsed::Skip,
+                Resolved::Unknown => Parsed::Fail,
+            })
         }
     }
 
@@ -590,7 +627,7 @@ impl<'a, 'r> Parser<'a, 'r> {
                 let mut children = Vec::new();
                 let mut ix = 0usize;
                 while self.peek().is_some() && self.peek() != Some(")") {
-                    if let Some(node) = self.parse_node()? {
+                    if let Parsed::Node(node) = self.parse_node()? {
                         let w = weights.get(&ix).copied().unwrap_or(1.0);
                         children.push((w, node));
                     }
@@ -622,8 +659,9 @@ impl<'a, 'r> Parser<'a, 'r> {
                 let mut all_present = true;
                 while self.peek().is_some() && self.peek() != Some(")") {
                     match self.parse_node()? {
-                        Some(node) => children.push(node),
-                        None => all_present = false,
+                        Parsed::Node(node) => children.push(node),
+                        Parsed::Skip => {}
+                        Parsed::Fail => all_present = false,
                     }
                 }
                 self.expect(")")?;
@@ -690,16 +728,16 @@ impl<'a, 'r> Parser<'a, 'r> {
                     tok, op_name
                 )));
             }
-            if let Some(t) = (self.resolve)(tok) {
+            if let Resolved::Term(t) = (self.resolve)(tok) {
                 terms.push(t);
             }
         }
         Ok(terms)
     }
 
-    /// Term list for `#1`/`#uwN`: ANY unresolved term makes the whole node
-    /// unmatchable (`Ok(None)`), since positional matching needs every
-    /// term present. Still consumes every token up to the matching `)`.
+    /// Term list for `#1`/`#uwN`: stop words are skipped, but ANY unknown
+    /// term makes the whole node unmatchable (`Ok(None)`), since positional
+    /// matching needs every term present. Still consumes every token up to the matching `)`.
     fn parse_term_list_all_or_none(
         &mut self,
         op_name: &str,
@@ -715,8 +753,9 @@ impl<'a, 'r> Parser<'a, 'r> {
                 )));
             }
             match (self.resolve)(tok) {
-                Some(t) => terms.push(t),
-                None => all_resolved = false,
+                Resolved::Term(t) => terms.push(t),
+                Resolved::Stopword => {}
+                Resolved::Unknown => all_resolved = false,
             }
         }
         Ok(if all_resolved { Some(terms) } else { None })

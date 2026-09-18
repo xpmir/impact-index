@@ -47,12 +47,19 @@ class BM25Scoring:
       get a negative weight. Matches PISA and Terrier.
     - `"lucene"`: Lucene's `BM25Similarity.idf`,
       `ln(1 + (N - df + 0.5) / (df + 0.5))`. Matches Pyserini/Anserini.
+
+    `k3` sets query-term saturation. `None` (default) makes query weights
+    linear, as in Lucene and PISA. With a value (Terrier uses 8), weights
+    are first divided by the query's largest weight, then mapped to
+    `(k3 + 1) * w / (k3 + w)`, as Terrier 5's BM25 does. This applies to
+    repeated query terms and to `#combine` weights.
     """
     def __new__(
         cls,
         k1: builtins.float = 1.2000000476837158,
         b: builtins.float = 0.75,
         variant: builtins.str = "bm25",
+        k3: typing.Optional[builtins.float] = None,
     ) -> BM25Scoring: ...
 
 @typing.final

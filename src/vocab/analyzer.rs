@@ -305,6 +305,19 @@ pub struct AnalyzerConfig {
     /// [`Self::effective_tokenizer`].
     #[serde(default)]
     pub tokenizer: Tokenizer,
+    /// Whether stop words removed at index time leave a gap in token
+    /// positions (Lucene's position increments: `#1(new york)` does not
+    /// match "new of york") or not (Terrier 5: positions only count kept
+    /// tokens, so it does -- consistent with dropping the stop word from
+    /// the query phrase too). Only affects positional indices.
+    /// `#[serde(default = "default_true")]`: indices built before this
+    /// field existed were built with gaps.
+    #[serde(default = "default_true")]
+    pub position_gaps: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AnalyzerConfig {
@@ -319,6 +332,7 @@ impl Default for AnalyzerConfig {
             query_stop_words_list: Vec::new(),
             english_possessive_filter: false,
             tokenizer: Tokenizer::Standard,
+            position_gaps: true,
         }
     }
 }
@@ -456,6 +470,12 @@ impl TextAnalyzer {
         self.active_tokenizer = tokenizer;
         self.config.tokenizer = tokenizer;
         self.config.english_possessive_filter = tokenizer == Tokenizer::LuceneEnglish;
+    }
+
+    /// Whether index-time stop word removal leaves position gaps (see
+    /// [`AnalyzerConfig::position_gaps`]). Persisted with the index.
+    pub fn set_position_gaps(&mut self, gaps: bool) {
+        self.config.position_gaps = gaps;
     }
 
     /// Set the analyzer config (for serialization).
@@ -617,18 +637,7 @@ impl TextAnalyzer {
     /// `positions` is sorted ascending (tokens are processed in text
     /// order); tf for a term is `positions.len()`.
     pub fn analyze_doc_positional(&mut self, text: &str) -> Vec<(TermIndex, Vec<u32>)> {
-        let tokens = self.tokenize_indexed(text);
-
-        let mut positions_map: HashMap<String, Vec<u32>> = HashMap::new();
-        for (token, pos) in tokens {
-            let stemmed = self.stemmer.stem(&token);
-            if self.is_post_stem_stop_word(&stemmed) {
-                continue;
-            }
-            positions_map.entry(stemmed).or_default().push(pos);
-        }
-
-        positions_map
+        self.tokenize_and_stem_positional(text)
             .into_iter()
             .map(|(term, positions)| (self.vocab.get_or_insert(&term), positions))
             .collect()
@@ -661,6 +670,37 @@ impl TextAnalyzer {
         query
     }
 
+    /// Resolves a single matchop query token: [`Resolved::Stopword`] if
+    /// analysis removes it entirely (stop word, or no token at all),
+    /// [`Resolved::Term`] for its (first) term if in the vocabulary,
+    /// [`Resolved::Unknown`] otherwise.
+    ///
+    /// [`Resolved::Stopword`]: crate::query::Resolved::Stopword
+    /// [`Resolved::Term`]: crate::query::Resolved::Term
+    /// [`Resolved::Unknown`]: crate::query::Resolved::Unknown
+    pub fn resolve_query_token(&self, token: &str) -> crate::query::Resolved {
+        use crate::query::Resolved;
+        let mut unknown = false;
+        for tok in self.tokenize(token) {
+            if self.query_stop_words.contains(&tok) {
+                continue;
+            }
+            let stemmed = self.stemmer.stem(&tok);
+            if self.is_post_stem_stop_word(&stemmed) {
+                continue;
+            }
+            match self.vocab.get(&stemmed) {
+                Some(idx) => return Resolved::Term(idx),
+                None => unknown = true,
+            }
+        }
+        if unknown {
+            Resolved::Unknown
+        } else {
+            Resolved::Stopword
+        }
+    }
+
     /// Tokenize and stem text without vocabulary insertion (thread-safe).
     ///
     /// Returns a list of (stemmed_token, tf) pairs. This can be called
@@ -686,12 +726,18 @@ impl TextAnalyzer {
     /// Returns a list of `(stemmed_token, positions)` pairs.
     pub fn tokenize_and_stem_positional(&self, text: &str) -> Vec<(String, Vec<u32>)> {
         let tokens = self.tokenize_indexed(text);
+        let gaps = self.config.position_gaps;
         let mut positions_map: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut kept = 0u32;
         for (token, pos) in tokens {
             let stemmed = self.stemmer.stem(&token);
             if self.is_post_stem_stop_word(&stemmed) {
                 continue;
             }
+            // Without gaps, a token's position is its rank among the kept
+            // tokens (Terrier's block ids), not in the raw token stream.
+            let pos = if gaps { pos } else { kept };
+            kept += 1;
             positions_map.entry(stemmed).or_default().push(pos);
         }
         positions_map.into_iter().collect()

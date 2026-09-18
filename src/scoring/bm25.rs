@@ -60,6 +60,11 @@ pub struct BM25Scoring {
     /// Which IDF formula to use (default: [`Bm25IdfVariant::Bm25`], the
     /// original Robertson/Sparck-Jones formula).
     pub variant: Bm25IdfVariant,
+    /// Query-term frequency saturation (Terrier's `bm25.k_3`, default 8
+    /// there). `None` (default) keeps query weights linear, as Lucene and
+    /// PISA do; `Some(k3)` matches Terrier -- see
+    /// [`ScoringModel::query_weights`].
+    pub k3: Option<f32>,
 
     // Computed on initialize():
     min_dl_norm: f32,
@@ -85,6 +90,7 @@ impl BM25Scoring {
             k1: 1.2,
             b: 0.75,
             variant: Bm25IdfVariant::default(),
+            k3: None,
             min_dl_norm: 0.0,
             k1_one_minus_b: 0.0,
             k1_b_over_avgdl: 0.0,
@@ -99,6 +105,7 @@ impl BM25Scoring {
             k1,
             b,
             variant: Bm25IdfVariant::default(),
+            k3: None,
             min_dl_norm: 0.0,
             k1_one_minus_b: 0.0,
             k1_b_over_avgdl: 0.0,
@@ -107,12 +114,19 @@ impl BM25Scoring {
         }
     }
 
+    /// Sets Terrier-style query-term saturation (see [`Self::k3`]).
+    pub fn with_k3(mut self, k3: Option<f32>) -> Self {
+        self.k3 = k3;
+        self
+    }
+
     /// Create with custom k1, b, and IDF variant.
     pub fn with_variant(k1: f32, b: f32, variant: Bm25IdfVariant) -> Self {
         Self {
             k1,
             b,
             variant,
+            k3: None,
             min_dl_norm: 0.0,
             k1_one_minus_b: 0.0,
             k1_b_over_avgdl: 0.0,
@@ -153,17 +167,21 @@ impl ScoringModel for BM25Scoring {
         self
     }
 
-    /// Compound scorer for a virtual term (phrase/window/synonym): idf is
-    /// the SUM of the children's idfs -- Lucene's convention for phrase
-    /// scoring (a phrase is "rarer" than any single child term, and
-    /// summing idfs is the standard proxy for that without computing a
-    /// real joint document frequency).
-    fn compound_scorer(&self, dfs: &[u64], _max_value: f32) -> Box<dyn ScoringFunction> {
-        let idf: f32 = dfs
-            .iter()
-            .map(|&df| Self::idf(self.num_docs, df, self.variant))
-            .sum();
-        Box::new(self.build_term_scorer_with_idf(idf))
+    /// Terrier's query-term weighting, when `k3` is set: weights are
+    /// first divided by the largest one (Terrier's
+    /// `MatchingQueryTerms.normaliseTermWeights`), then saturated as
+    /// `(k3 + 1) * w / (k3 + w)` (the `keyFrequency` factor of Terrier's
+    /// `BM25.score`). With `k3 = None` (default) weights stay linear.
+    fn query_weights(&self, weights: &mut [f32]) {
+        let Some(k3) = self.k3 else { return };
+        let max = weights.iter().copied().fold(0.0f32, f32::max);
+        if max <= 0.0 {
+            return;
+        }
+        for w in weights.iter_mut() {
+            let n = *w / max;
+            *w = (k3 + 1.0) * n / (k3 + n);
+        }
     }
 }
 
@@ -186,9 +204,7 @@ impl BM25Scoring {
         self.build_term_scorer_with_idf(Self::idf(self.num_docs, df, self.variant))
     }
 
-    /// Builds a scorer from an already-computed idf -- shared by
-    /// `build_term_scorer` (single term) and `compound_scorer` (sum of
-    /// several terms' idfs).
+    /// Builds a scorer from an already-computed idf.
     fn build_term_scorer_with_idf(&self, idf: f32) -> BM25TermScorer {
         BM25TermScorer {
             idf,

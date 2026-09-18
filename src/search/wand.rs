@@ -216,6 +216,7 @@ pub fn search_wand<'a>(
     query: &HashMap<TermIndex, ImpactValue>,
     top_k: usize,
 ) -> Vec<ScoredDocument> {
+    let query = &*crate::scoring::adjust_query(index, query);
     let mut results = if let Some((compressed, bm25)) = as_bm25_compressed(index) {
         search_wand_bm25_compressed(compressed, bm25, query, top_k)
     } else {

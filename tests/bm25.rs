@@ -450,6 +450,7 @@ fn test_compressed_index_standalone() {
             query_stop_words_list: Vec::new(),
             english_possessive_filter: true,
             tokenizer: impact_index::vocab::analyzer::Tokenizer::LuceneEnglish,
+            position_gaps: true,
         });
     builder
         .analyzer_mut()
