@@ -30,6 +30,7 @@ __all__ = [
     "QuantizedBitPackedCompressor",
     "ReorderTransform",
     "ScoredIndex",
+    "SeismicSearcher",
     "SparseIndexIterator",
     "SplitIndexTransform",
     "TermImpact",
@@ -255,6 +256,20 @@ class Index(impactindex.IndexView):
     ) -> None:
         r"""
         Convert into a BMP index using streaming (memory-efficient) method.
+        """
+    def to_seismic(
+        self,
+        output: builtins.str,
+        n_postings: builtins.int = 6000,
+        centroid_fraction: builtins.float = 0.10000000149011612,
+        summary_energy: builtins.float = 0.4000000059604645,
+        max_fraction: builtins.float = 1.5,
+        knn: builtins.int = 0,
+    ) -> None:
+        r"""
+        Convert into a Seismic index directory (approximate search, opened
+        with `SeismicSearcher`). Defaults follow Seismic's recommendations
+        for SPLADE on MS MARCO. Requires the `seismic` cargo feature.
         """
     def analyzer(self) -> TextAnalyzer:
         r"""
@@ -484,6 +499,30 @@ class ScoredIndex(impactindex.IndexView):
         Search using MaxScore over a structured (matchop-style) query. See
         ``Index.search_wand_query`` for the accepted ``query`` forms.
         """
+
+@typing.final
+class SeismicSearcher:
+    r"""
+    Seismic searcher: approximate top-k retrieval by dot product over the
+    learned impacts (see `SparseIndex.to_seismic`).
+    """
+    def __new__(cls, path: builtins.str) -> SeismicSearcher: ...
+    def search(
+        self,
+        query: typing.Mapping[builtins.int, builtins.float],
+        top_k: builtins.int,
+        query_cut: builtins.int = 10,
+        heap_factor: builtins.float = 0.699999988079071,
+        n_knn: builtins.int = 0,
+    ) -> builtins.list[PyScoredDocument]:
+        r"""
+        Approximate search: `query` maps term indices to weights.
+
+        Only the `query_cut` highest-weighted terms are traversed, and
+        blocks scoring below `heap_factor` times the current k-th score are
+        skipped.
+        """
+    def num_documents(self) -> builtins.int: ...
 
 @typing.final
 class SparseIndexIterator:

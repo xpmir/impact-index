@@ -32,6 +32,19 @@ pip install maturin
 maturin develop --release
 ```
 
+### Seismic backend (`seismic` feature)
+Pinned git deps (`seismic`, `vectorium`) that need a recent nightly, hence
+the dated channel in `rust-toolchain.toml`. The feature is off for plain
+`cargo build`/`cargo test` but enabled for the Python package
+(`pyproject.toml`), so `maturin develop` includes it.
+```bash
+cargo test --features seismic --test seismic
+```
+When bumping the pinned `seismic` rev, also bump `SEISMIC_FORMAT` in
+`src/seismic/mod.rs` and keep `vectorium` at the rev seismic's lockfile uses.
+When bumping the nightly, update `rust-toolchain.toml` and the
+`rust-toolchain`/`rustup` lines in `.github/workflows/*.yml` together.
+
 ### Python Bindings (BMP)
 ```bash
 # Build and install (from BMP/python directory)
@@ -60,6 +73,7 @@ maturin build --release && pip install target/wheels/*.whl
 - **`src/search/`**: Search algorithms (WAND in `wand.rs`, MaxScore in `maxscore.rs`)
 - **`src/compress/`**: Compression schemes for doc IDs (Elias-Fano) and impact values
 - **`src/transforms/`**: Index transforms including split index (`split.rs`)
+- **`src/seismic/`** (feature `seismic`, on in the Python package): conversion to / search over a Seismic approximate index (`convert_to_seismic`, `SeismicSearcher`)
 - **`src/py/mod.rs`**: Python bindings exposing `IndexBuilder`, `Index`, compression classes
 
 ### Core Components (BMP)
@@ -93,7 +107,7 @@ maturin build --release && pip install target/wheels/*.whl
 `python/impact_index.pyi` is **auto-generated** by `pyo3-stub-gen`. Regenerate with:
 
 ```bash
-cargo run --bin stub_gen --no-default-features --features stub-gen
+cargo run --bin stub_gen --no-default-features --features stub-gen,seismic
 mv impact_index.pyi python/impact_index.pyi
 ```
 

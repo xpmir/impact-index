@@ -20,6 +20,9 @@ test = false
 [features]
 extension-module = ["pyo3/extension-module"]
 stub-gen = ["pyo3-stub-gen"]
+# Approximate learned-sparse search (Seismic). Opt-in: pulls git deps that
+# require nightly (vectorium uses gen_blocks/portable_simd).
+seismic = ["dep:seismic", "dep:vectorium"]
 
 # Fat LTO + single codegen unit: lets LLVM inline/devirtualize across the
 # whole crate graph, which matters for the dyn-heavy search hot paths.
@@ -27,6 +30,13 @@ stub-gen = ["pyo3-stub-gen"]
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+# Faster variant of `release` for the manual wheel-check workflow
+# (.github/workflows/build-wheels.yml): same optimizations, no fat LTO.
+[profile.wheel-check]
+inherits = "release"
+lto = false
+codegen-units = 16
 
 
 [[bin]]
@@ -89,6 +99,10 @@ ciborium = { version = "0.2" }
 zstd = "0.13"
 serde_json = "1.0.120"
 bmp = { path = "BMP" }
+# Pinned upstream main: crates.io 0.2.1 hard-depends on pyo3 0.21 (links conflict).
+# vectorium rev must match the one seismic uses so the types unify.
+seismic = { git = "https://github.com/TusKANNy/seismic", rev = "3c267137e202748e69ada8cd093f4c0b7c04479c", default-features = false, optional = true }
+vectorium = { git = "https://github.com/TusKANNy/vectorium", rev = "39e016c", optional = true }
 half = { version = "2", features = ["serde", "bytemuck"] }
 rayon = "1"
 bitpacking = "0.9"

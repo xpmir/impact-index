@@ -586,6 +586,17 @@ pub trait SparseIndex: Send + Sync + SparseIndexView + AsSparseIndexView {
         crate::bmp::convert_to_bmp_streaming(self.as_view(), output, bsize, compress_range)
     }
 
+    /// Convert into a Seismic index directory (approximate search, see
+    /// [`crate::seismic`]).
+    #[cfg(feature = "seismic")]
+    fn convert_to_seismic(
+        &self,
+        output: &Path,
+        config: &crate::seismic::SeismicConfig,
+    ) -> Result<()> {
+        crate::seismic::convert_to_seismic(self.as_view(), output, config)
+    }
+
     fn to_ciff(&self, writer: &mut dyn Write, quantization: u128) {
         let mut output = CodedOutputStream::new(writer);
         let index_view = self.as_view();

@@ -71,6 +71,10 @@ pub enum IndexKind {
     Compressed,
     /// Quantile-split index wrapping an inner (typically compressed) index.
     Split,
+    /// Seismic approximate index (`index.seismic`), opened with
+    /// `SeismicSearcher` rather than [`crate::base::load_index`]. Its data
+    /// file is owned by the upstream crate and is never migrated.
+    Seismic,
 }
 
 impl std::fmt::Display for IndexKind {
@@ -79,6 +83,7 @@ impl std::fmt::Display for IndexKind {
             IndexKind::Forward => "forward",
             IndexKind::Compressed => "compressed",
             IndexKind::Split => "split",
+            IndexKind::Seismic => "seismic",
         };
         write!(f, "{}", s)
     }
@@ -398,7 +403,8 @@ fn migrate_v1_to_v2(path: &Path) -> io::Result<()> {
                 update_index(&inner, None)?;
             }
         }
-        IndexKind::Forward => {}
+        // Seismic directories only exist from v3 on; nothing to rewrite.
+        IndexKind::Forward | IndexKind::Seismic => {}
     }
 
     let mut manifest =
@@ -431,7 +437,8 @@ fn migrate_v2_to_v3(path: &Path) -> io::Result<()> {
                 update_index(&inner, None)?;
             }
         }
-        IndexKind::Forward => {}
+        // Seismic directories only exist from v3 on; nothing to rewrite.
+        IndexKind::Forward | IndexKind::Seismic => {}
     }
 
     let mut manifest =

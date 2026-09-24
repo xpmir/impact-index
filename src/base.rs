@@ -286,6 +286,14 @@ pub fn load_index(path: &Path, in_memory: bool) -> Box<dyn SparseIndex> {
     // than letting a lower-level reader crash or (worse) silently
     // misinterpret bytes written by a different format version.
     let manifest = crate::manifest::check_index_manifest(path).unwrap_or_else(|e| panic!("{}", e));
+    if let Some(m) = &manifest {
+        if m.index_kind == crate::manifest::IndexKind::Seismic {
+            panic!(
+                "{} is a Seismic index: open it with SeismicSearcher, not load_index",
+                path.display()
+            );
+        }
+    }
 
     let info_path = path.join(BUILDER_INDEX_CBOR);
     let index: Box<dyn SparseIndex> = if info_path.exists() {

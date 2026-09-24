@@ -47,6 +47,7 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
+          rust-toolchain: nightly-2026-09-20
           target: ${{ matrix.platform.target }}
           args: --release --out dist -i python3.10 python3.11 python3.12 python3.13 python3.14
           sccache: 'true'
@@ -98,6 +99,7 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
+          rust-toolchain: nightly-2026-09-20
           target: ${{ matrix.platform.target }}
           args: --release --out dist -i ${{ steps.py310.outputs.python-path }} ${{ steps.py311.outputs.python-path }} ${{ steps.py312.outputs.python-path }} ${{ steps.py313.outputs.python-path }} ${{ steps.py314.outputs.python-path }}
           sccache: 'true'
@@ -144,6 +146,7 @@ jobs:
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
+          rust-toolchain: nightly-2026-09-20
           target: ${{ matrix.platform.target }}
           args: --release --out dist -i ${{ steps.py310.outputs.python-path }} ${{ steps.py311.outputs.python-path }} ${{ steps.py312.outputs.python-path }} ${{ steps.py313.outputs.python-path }} ${{ steps.py314.outputs.python-path }}
           sccache: 'true'
@@ -163,6 +166,7 @@ jobs:
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
+          rust-toolchain: nightly-2026-09-20
           command: sdist
           args: --out dist
       - name: Upload sdist

@@ -1,2 +1,5 @@
 [toolchain]
-channel = "nightly"
+# Pinned: the `seismic` feature (enabled in the Python package) depends on
+# vectorium, which needs a recent nightly (float_algebraic, gen_blocks...).
+channel = "nightly-2026-09-20"
+components = ["rustfmt"]

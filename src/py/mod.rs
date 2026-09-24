@@ -520,6 +520,35 @@ impl PySparseIndex {
         Ok(())
     }
 
+    /// Convert into a Seismic index directory (approximate search, opened
+    /// with `SeismicSearcher`). Defaults follow Seismic's recommendations
+    /// for SPLADE on MS MARCO. Requires the `seismic` cargo feature.
+    #[cfg(feature = "seismic")]
+    #[pyo3(signature = (output, n_postings=6000, centroid_fraction=0.1, summary_energy=0.4, max_fraction=1.5, knn=0))]
+    fn to_seismic(
+        &self,
+        py: Python<'_>,
+        output: &str,
+        n_postings: usize,
+        centroid_fraction: f32,
+        summary_energy: f32,
+        max_fraction: f32,
+        knn: usize,
+    ) -> PyResult<()> {
+        let index = self.index.clone();
+        let output_path = PathBuf::from(output);
+        let config = crate::seismic::SeismicConfig {
+            n_postings,
+            centroid_fraction,
+            summary_energy,
+            max_fraction,
+            knn,
+            ..Default::default()
+        };
+        py.detach(|| index.convert_to_seismic(&output_path, &config))
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    }
+
     /// Get the text analyzer for this index (stemmer, stop words, vocabulary).
     ///
     /// Get the text analyzer for this index (if available).
@@ -1377,6 +1406,61 @@ impl PyBmpSearcher {
 
     fn num_documents(&self) -> usize {
         self.index.num_documents()
+    }
+}
+
+/// Seismic searcher: approximate top-k retrieval by dot product over the
+/// learned impacts (see `SparseIndex.to_seismic`).
+#[cfg(feature = "seismic")]
+#[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
+#[pyclass(name = "SeismicSearcher")]
+pub struct PySeismicSearcher {
+    inner: crate::seismic::SeismicSearcher,
+}
+
+#[cfg(feature = "seismic")]
+#[cfg_attr(feature = "stub-gen", gen_stub_pymethods)]
+#[pymethods]
+impl PySeismicSearcher {
+    #[new]
+    fn new(path: &str) -> PyResult<Self> {
+        crate::seismic::SeismicSearcher::load(&PathBuf::from(path))
+            .map(|inner| Self { inner })
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    }
+
+    /// Approximate search: `query` maps term indices to weights.
+    ///
+    /// Only the `query_cut` highest-weighted terms are traversed, and
+    /// blocks scoring below `heap_factor` times the current k-th score are
+    /// skipped.
+    #[pyo3(signature = (query, top_k, query_cut=10, heap_factor=0.7, n_knn=0))]
+    fn search(
+        &self,
+        py: Python<'_>,
+        query: HashMap<usize, ImpactValue>,
+        top_k: usize,
+        query_cut: usize,
+        heap_factor: f32,
+        n_knn: usize,
+    ) -> Vec<PyScoredDocument> {
+        let query: Vec<(usize, ImpactValue)> = query.into_iter().collect();
+        let params = crate::seismic::SeismicSearchParams {
+            query_cut,
+            heap_factor,
+            n_knn,
+        };
+        py.detach(|| self.inner.search(&query, top_k, &params))
+            .into_iter()
+            .map(|r| PyScoredDocument {
+                docid: r.docid,
+                score: r.score,
+            })
+            .collect()
+    }
+
+    fn num_documents(&self) -> usize {
+        self.inner.num_documents()
     }
 }
 
@@ -2560,6 +2644,8 @@ fn impact_index(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PySplitIndexTransform>()?;
     module.add_class::<PyReorderTransform>()?;
     module.add_class::<PyBmpSearcher>()?;
+    #[cfg(feature = "seismic")]
+    module.add_class::<PySeismicSearcher>()?;
 
     module.add_class::<PyDocument>()?;
     module.add_class::<PyDocumentStoreBuilder>()?;

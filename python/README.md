@@ -23,7 +23,7 @@ Then open `docs/_build/index.html`.
 The `.pyi` stub file is **auto-generated** by `pyo3-stub-gen`. To regenerate:
 
 ```bash
-cargo run --bin stub_gen --no-default-features --features stub-gen
+cargo run --bin stub_gen --no-default-features --features stub-gen,seismic
 mv impact_index.pyi python/impact_index.pyi
 ```
 

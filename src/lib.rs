@@ -14,6 +14,7 @@
 //! - [`transforms`]: Index transformations (e.g., splitting posting lists by quantile)
 //! - [`docstore`]: Compressed document storage with key-based retrieval
 //! - [`bmp`]: Integration with Block-Max Pruning (BMP) for fast approximate search
+//! - `seismic` (cargo feature `seismic`): Seismic approximate search
 //!
 //! ## Quick Start (Rust)
 //!
@@ -50,6 +51,8 @@ pub mod manifest;
 pub mod query;
 pub mod scoring;
 pub mod search;
+#[cfg(feature = "seismic")]
+pub mod seismic;
 pub mod transforms;
 pub mod vocab;
 
