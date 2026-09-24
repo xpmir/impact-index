@@ -627,3 +627,54 @@ fn test_bmp_conversion_stress(
         diff_count
     );
 }
+
+/// Streaming BMP conversion written in several pass-2 chunks (including a
+/// chunk per block and a partial last chunk) is byte-identical to legacy.
+#[rstest]
+#[case(1, 8, false)]
+#[case(3, 8, true)]
+#[case(7, 16, false)]
+#[case(1000, 16, true)]
+fn test_bmp_streaming_chunked(
+    #[case] blocks_per_chunk: usize,
+    #[case] bsize: usize,
+    #[case] compress_range: bool,
+) {
+    init_logger();
+
+    let mut data = TestIndex::new(
+        100,
+        500,
+        10.,
+        20,
+        Some(17),
+        BuilderOptions {
+            checkpoint_frequency: 0,
+            in_memory_threshold: 10,
+            checkpoint_flush_ratio: 0.5,
+            positions: false,
+        },
+        &HashSet::<DocId>::from([]),
+    );
+
+    let index = data.indexer.to_index(true);
+    let legacy_path = data.dir.path().join("legacy.bmp");
+    let streaming_path = data.dir.path().join("streaming.bmp");
+
+    index
+        .convert_to_bmp(&legacy_path, bsize, compress_range)
+        .expect("Legacy conversion failed");
+    impact_index::bmp::builder::convert_to_bmp_streaming_chunked(
+        &index,
+        &streaming_path,
+        bsize,
+        compress_range,
+        blocks_per_chunk,
+    )
+    .expect("Streaming conversion failed");
+
+    assert!(
+        std::fs::read(&legacy_path).unwrap() == std::fs::read(&streaming_path).unwrap(),
+        "streaming output (chunks of {blocks_per_chunk} blocks) differs from legacy"
+    );
+}
