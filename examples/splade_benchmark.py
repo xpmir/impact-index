@@ -1076,6 +1076,71 @@ def exact_recall(
     return float(np.mean(fractions)) if fractions else 0.0
 
 
+class CompactRun:
+    """Search results of one run, stored as flat numpy arrays.
+
+    Behaves like the list of per-query ``[(doc_idx, score), ...]`` lists it
+    is built from, but takes ~12 bytes per hit instead of ~100 for Python
+    tuples: at depth 1000 on MS MARCO dev (7M hits per run), keeping a
+    dozen runs as tuples exhausted the memory of the benchmark machine."""
+
+    def __init__(self, docs: np.ndarray, scores: np.ndarray, offsets: np.ndarray):
+        self.docs, self.scores, self.offsets = docs, scores, offsets
+
+    @classmethod
+    def from_lists(cls, results: List[List[Tuple[int, float]]]) -> "CompactRun":
+        offsets = np.zeros(len(results) + 1, dtype=np.int64)
+        offsets[1:] = np.cumsum([len(hits) for hits in results])
+        docs = np.fromiter(
+            (d for hits in results for d, _ in hits), np.int64, offsets[-1]
+        )
+        scores = np.fromiter(
+            (s for hits in results for _, s in hits), np.float32, offsets[-1]
+        )
+        return cls(docs, scores, offsets)
+
+    def __len__(self):
+        return len(self.offsets) - 1
+
+    def __getitem__(self, i: int) -> List[Tuple[int, float]]:
+        start, end = self.offsets[i], self.offsets[i + 1]
+        return list(zip(self.docs[start:end].tolist(), self.scores[start:end].tolist()))
+
+    def __iter__(self):
+        return (self[i] for i in range(len(self)))
+
+
+def run_search(runs_dir: Path, name: str, top_k: int, num_queries: int, search):
+    """Runs ``search()`` -> (results, wall, cpu) and saves the results at once
+    (``runs/<tag>.npz`` with the timings), so that a crash later in the
+    benchmark loses at most the current run. A run already saved with the
+    same depth and number of queries is reused instead of searched again."""
+    tag = re.sub(r"[^A-Za-z0-9=.,_-]+", "_", name)
+    path = runs_dir / f"{tag}.npz"
+    if path.exists():
+        saved = np.load(path)
+        if int(saved["top_k"]) == top_k and len(saved["offsets"]) == num_queries + 1:
+            print(f"  Reusing saved run {path}")
+            run = CompactRun(saved["docs"], saved["scores"], saved["offsets"])
+            return run, float(saved["wall"]), float(saved["cpu"])
+    results, wall, cpu = search()
+    run = CompactRun.from_lists(results)
+    del results
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp.npz")
+    np.savez(
+        tmp,
+        docs=run.docs,
+        scores=run.scores,
+        offsets=run.offsets,
+        top_k=top_k,
+        wall=wall,
+        cpu=cpu,
+    )
+    tmp.rename(path)
+    return run, wall, cpu
+
+
 def save_run(path: Path, results, query_ids: List[str], doc_ids: List[str], tag: str):
     """Write results as a TREC run file (so they can be re-evaluated later)."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1385,20 +1450,33 @@ def main():
             )
             bmp_legacy_builder.build(impact_idx, load=False)
 
+        # Every run is saved as soon as it is searched (and reused if the
+        # benchmark is restarted in the same output directory)
+        runs_dir = output_dir / "runs"
+
+        def searched(name, search):
+            return run_search(runs_dir, name, args.top_k, len(query_encodings), search)
+
         # Search with WAND
         run_wand = not args.skip_wand
         if run_wand:
             print("\n=== Searching with WAND ===")
-            wand_results, wand_wall, wand_cpu = search_impact_index(
-                impact_idx, query_encodings, top_k=args.top_k, method="wand"
+            wand_results, wand_wall, wand_cpu = searched(
+                "wand",
+                lambda: search_impact_index(
+                    impact_idx, query_encodings, top_k=args.top_k, method="wand"
+                ),
             )
             print(f"  Wall time: {wand_wall:.2f}s ({len(queries) / wand_wall:.1f} q/s)")
             print(f"  CPU time: {wand_cpu:.2f}s")
 
         # Search with MaxScore
         print("\n=== Searching with MaxScore ===")
-        maxscore_results, maxscore_wall, maxscore_cpu = search_impact_index(
-            impact_idx, query_encodings, top_k=args.top_k, method="maxscore"
+        maxscore_results, maxscore_wall, maxscore_cpu = searched(
+            "maxscore",
+            lambda: search_impact_index(
+                impact_idx, query_encodings, top_k=args.top_k, method="maxscore"
+            ),
         )
         print(
             f"  Wall time: {maxscore_wall:.2f}s ({len(queries) / maxscore_wall:.1f} q/s)"
@@ -1436,16 +1514,26 @@ def main():
         # (one run per operating point, sequentially so timings do not overlap)
         bmp_runs = []
         if run_bmp:
-            bmp_searcher = bmp_builder._load_index()
-            for search_config in args.bmp_search_configs:
-                name = search_config.get_display_name()
-                print(f"\n=== Searching {name} ===")
-                b_results, b_wall, b_cpu = search_bmp_index(
+            # loaded on first use (not at all if every run was saved before)
+            bmp_searcher = None
+
+            def bmp_search(search_config):
+                nonlocal bmp_searcher
+                if bmp_searcher is None:
+                    bmp_searcher = bmp_builder._load_index()
+                return search_bmp_index(
                     bmp_searcher,
                     query_encodings,
                     top_k=args.top_k,
                     alpha=search_config.alpha,
                     beta=search_config.beta,
+                )
+
+            for search_config in args.bmp_search_configs:
+                name = search_config.get_display_name()
+                print(f"\n=== Searching {name} ===")
+                b_results, b_wall, b_cpu = searched(
+                    name, lambda c=search_config: bmp_search(c)
                 )
                 print(f"  Wall time: {b_wall:.2f}s ({len(queries) / b_wall:.1f} q/s)")
                 print(f"  CPU time: {b_cpu:.2f}s")
@@ -1470,8 +1558,11 @@ def main():
             for search_config in args.seismic_search_configs:
                 name = f"{build_config.get_display_name()} {search_config.get_display_name()}"
                 print(f"\n=== Searching {name} ===")
-                s_results, s_wall, s_cpu = search_seismic_index(
-                    seismic_searcher, query_encodings, search_config, top_k=args.top_k
+                s_results, s_wall, s_cpu = searched(
+                    name,
+                    lambda s=seismic_searcher, c=search_config: search_seismic_index(
+                        s, query_encodings, c, top_k=args.top_k
+                    ),
                 )
                 print(f"  Wall time: {s_wall:.2f}s ({len(queries) / s_wall:.1f} q/s)")
                 print(f"  CPU time: {s_cpu:.2f}s")
@@ -1513,8 +1604,11 @@ def main():
             if config.is_split():
                 # Split index: only MaxScore
                 print(f"\n=== Searching {config.get_display_name()} with MaxScore ===")
-                split_results, wall, cpu = search_impact_index(
-                    configured_idx, query_encodings, top_k=args.top_k, method="maxscore"
+                split_results, wall, cpu = searched(
+                    f"{config.get_display_name()} maxscore",
+                    lambda idx=configured_idx: search_impact_index(
+                        idx, query_encodings, top_k=args.top_k, method="maxscore"
+                    ),
                 )
                 print(f"  Wall time: {wall:.2f}s ({len(queries) / wall:.1f} q/s)")
                 print(f"  CPU time: {cpu:.2f}s")
@@ -1526,8 +1620,11 @@ def main():
             else:
                 # Regular compressed index: WAND and MaxScore
                 print(f"\n=== Searching {config.get_display_name()} with WAND ===")
-                wand_results_cfg, wand_wall_cfg, wand_cpu_cfg = search_impact_index(
-                    configured_idx, query_encodings, top_k=args.top_k, method="wand"
+                wand_results_cfg, wand_wall_cfg, wand_cpu_cfg = searched(
+                    f"{config.get_display_name()} wand",
+                    lambda idx=configured_idx: search_impact_index(
+                        idx, query_encodings, top_k=args.top_k, method="wand"
+                    ),
                 )
                 print(
                     f"  Wall time: {wand_wall_cfg:.2f}s ({len(queries) / wand_wall_cfg:.1f} q/s)"
@@ -1540,13 +1637,14 @@ def main():
                 }
 
                 print(f"\n=== Searching {config.get_display_name()} with MaxScore ===")
-                maxscore_results_cfg, maxscore_wall_cfg, maxscore_cpu_cfg = (
-                    search_impact_index(
-                        configured_idx,
+                maxscore_results_cfg, maxscore_wall_cfg, maxscore_cpu_cfg = searched(
+                    f"{config.get_display_name()} maxscore",
+                    lambda idx=configured_idx: search_impact_index(
+                        idx,
                         query_encodings,
                         top_k=args.top_k,
                         method="maxscore",
-                    )
+                    ),
                 )
                 print(
                     f"  Wall time: {maxscore_wall_cfg:.2f}s ({len(queries) / maxscore_wall_cfg:.1f} q/s)"
@@ -1664,7 +1762,6 @@ def main():
                 )
 
         # Save every run (TREC format) for later re-evaluation
-        runs_dir = output_dir / "runs"
         named_runs = [("wand", wand_results)] if run_wand else []
         named_runs.append(("maxscore", maxscore_results))
         named_runs += [(run["name"], run["results"]) for run in bmp_runs + seismic_runs]
