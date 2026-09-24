@@ -1,0 +1,130 @@
+name: Build wheels (no release)
+
+# Manually triggered dry run of the release builds (same targets and
+# toolchain as release.yml), to debug packaging problems before tagging.
+# Nothing is published: wheels are only uploaded as workflow artifacts.
+# Keep targets/toolchain in sync with release.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Cargo profile: wheel-check (fast, no fat LTO) or release (exactly as released)"
+        type: choice
+        options: [wheel-check, release]
+        default: wheel-check
+      python:
+        description: "Python version to build and test"
+        type: string
+        default: "3.12"
+
+env:
+  RUST_TOOLCHAIN: nightly-2026-09-20
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'true'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python }}
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          target: x86_64
+          args: --profile ${{ inputs.profile }} --out dist -i python${{ inputs.python }}
+          sccache: 'true'
+          manylinux: auto
+      - name: Test wheel
+        shell: bash
+        run: |
+          pip install numpy pytest pytest-asyncio
+          pip install --no-index --find-links dist impact-index
+          pytest -v python/test_seismic.py python/test_bmp_convert.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-check-linux-x86_64
+          path: dist
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'true'
+      - uses: actions/setup-python@v5
+        id: py
+        with:
+          python-version: ${{ inputs.python }}
+          architecture: x64
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          target: x64
+          args: --profile ${{ inputs.profile }} --out dist -i ${{ steps.py.outputs.python-path }}
+          sccache: 'true'
+      - name: Test wheel
+        shell: bash
+        run: |
+          pip install numpy pytest pytest-asyncio
+          pip install --no-index --find-links dist impact-index
+          pytest -v python/test_seismic.py python/test_bmp_convert.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-check-windows-x64
+          path: dist
+
+  macos:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'true'
+      - uses: actions/setup-python@v5
+        id: py
+        with:
+          python-version: ${{ inputs.python }}
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          target: ${{ matrix.target }}
+          args: --profile ${{ inputs.profile }} --out dist -i ${{ steps.py.outputs.python-path }}
+          sccache: 'true'
+      # macos-latest is arm64: the x86_64 wheel is cross-built and not run
+      - name: Test wheel
+        if: matrix.target == 'aarch64-apple-darwin'
+        run: |
+          pip install numpy pytest pytest-asyncio
+          pip install --no-index --find-links dist impact-index
+          pytest -v python/test_seismic.py python/test_bmp_convert.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-check-macos-${{ matrix.target }}
+          path: dist
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'true'
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-check-sdist
+          path: dist
