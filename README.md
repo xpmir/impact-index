@@ -2,7 +2,7 @@
 
 A Python/Rust library for efficient sparse retrieval. Built on Rust with PyO3 bindings for high performance.
 
-Supports both neural IR models with floating-point impact scores and traditional BM25 bag-of-words retrieval with performance competitive with Lucene/Pyserini and Terrier.
+Supports both neural IR models with floating-point impact scores and traditional BM25 bag-of-words retrieval with performance competitive with Lucene/Pyserini and Terrier. For learned sparse models, it also integrates two approximate search backends: BMP (Block-Max Pruning) and Seismic.
 
 ## Features
 
@@ -14,6 +14,7 @@ Supports both neural IR models with floating-point impact scores and traditional
 - **Posting list splitting** by quantile for term impact decomposition
 - **Index versioning**: per-index `manifest.json` with format version checks and one-step migration (`Index.update(path)`)
 - **BMP (Block-Max Pruning)** for fast approximate search ([SIGIR 2024](https://github.com/pisa-engine/BMP))
+- **Seismic** for very fast approximate search over learned impacts ([SIGIR 2024](https://github.com/TusKANNy/seismic)) — see [Approximate search with Seismic](#approximate-search-with-seismic)
 - **Document store** with zstd compression and key-based retrieval
 - **Async support** for non-blocking search and document retrieval
 - **Parallel index compression** with rayon
