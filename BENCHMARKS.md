@@ -1,8 +1,9 @@
 # Benchmarks
 
 Full methodology, per-system comparisons, and per-setting ablations for
-impact-index's BM25 bag-of-words path. See the [README](README.md#performance)
-for the headline numbers.
+impact-index's BM25 bag-of-words path, plus learned sparse retrieval with
+SPLADE-v3 ([below](#learned-sparse-splade-v3-on-ms-marco)). See the
+[README](README.md#performance) for the headline numbers.
 
 - BM25 on MS MARCO passage (8.8M docs, 6,980 queries, top-100, single-threaded).
 - ARM: Apple M-series, 2026-08. x86: Intel Xeon Silver 4214, 2026-09-17 (one session).
@@ -170,3 +171,103 @@ ablation`.
 
 `stemmer=None` isn't listed: `BOWIndexBuilder`'s raw-text path requires a
 `TextAnalyzer`, and only `"porter"`/`"snowball"` exist today.
+
+## Learned sparse: SPLADE-v3 on MS MARCO
+
+`naver/splade-v3` impacts, MS MARCO passage (8.8M docs), dev/small
+(6,980 queries), single-threaded search, Intel Xeon Silver 4214,
+2026-09-24/25, at retrieval depths k=10, 100 and 1000 (one run per depth).
+Exact = WAND/MaxScore over the raw (float) index. R@k is relevance recall
+against the MS MARCO qrels; ExactR@k is the fraction of the exact top-k
+that a method retrieves (its agreement with exact search).
+
+### Top-10
+
+| Index / search | ms/query | Index size | MRR@10 | nDCG@10 | R@10 | ExactR@10 |
+|----------------|---------:|-----------:|-------:|--------:|-----:|----------:|
+| Raw, WAND (exact) | 419 | 17.5 GB | 0.4026 | 0.4697 | 0.6937 | 1 |
+| Raw, MaxScore (exact) | 231 | 17.5 GB | 0.4026 | 0.4697 | 0.6937 | 1 |
+| Compressed 8-bit, MaxScore | 212 | 3.2 GB | 0.4020 | 0.4694 | 0.6936 | |
+| Compressed 16-bit, MaxScore | 215 | 4.6 GB | 0.4026 | 0.4697 | 0.6937 | |
+| Split 0.9 + 16-bit, MaxScore | 188 | 4.7 GB | 0.4026 | 0.4697 | 0.6937 | |
+| BMP, α=1 β=1 (safe) | 27.3 | 13.8 GB | 0.4021 | 0.4694 | 0.6944 | 0.974 |
+| BMP, α=0.95 β=1 | 18.2 | 13.8 GB | 0.4018 | 0.4690 | 0.6934 | 0.967 |
+| BMP, α=0.9 β=1 | 14.2 | 13.8 GB | 0.4027 | 0.4702 | 0.6951 | 0.925 |
+| BMP, α=0.8 β=1 | 9.4 | 13.8 GB | 0.4036 | 0.4709 | 0.6944 | 0.740 |
+| BMP, α=1 β=0.8 | 22.0 | 13.8 GB | 0.4019 | 0.4691 | 0.6926 | 0.970 |
+| BMP, α=0.9 β=0.8 | 12.8 | 13.8 GB | 0.4024 | 0.4698 | 0.6940 | 0.916 |
+| BMP, α=0.8 β=0.6 | 6.7 | 13.8 GB | 0.4033 | 0.4699 | 0.6896 | 0.697 |
+| Seismic, qc=5 hf=0.9 | **0.89** | 9.7 GB | 0.4024 | 0.4693 | 0.6924 | 0.983 |
+| Seismic, qc=10 hf=0.8 | 1.28 | 9.7 GB | 0.4026 | 0.4696 | 0.6933 | 0.993 |
+| Seismic, qc=30 hf=0.9 | 1.33 | 9.7 GB | 0.4026 | 0.4697 | 0.6937 | 0.993 |
+| Seismic, qc=10 hf=0.7 | 1.98 | 9.7 GB | 0.4028 | 0.4699 | 0.6938 | 0.994 |
+| Seismic, qc=20 hf=0.7 | 2.59 | 9.7 GB | 0.4027 | 0.4699 | 0.6938 | 0.996 |
+| Seismic, qc=20 hf=0.6 | 4.30 | 9.7 GB | 0.4027 | 0.4699 | 0.6938 | 0.997 |
+| Seismic n_postings=3500, qc=5 hf=0.9 | 0.68 | 8.1 GB | 0.4002 | 0.4660 | 0.6857 | 0.961 |
+| Seismic n_postings=3500, qc=10 hf=0.7 | 1.56 | 8.1 GB | 0.4011 | 0.4673 | 0.6882 | 0.980 |
+| Seismic n_postings=3500, qc=20 hf=0.6 | 2.81 | 8.1 GB | 0.4013 | 0.4677 | 0.6893 | 0.985 |
+
+### Top-100 and top-1000
+
+Same settings retrieving 100 and 1000 documents (ms/query grows with the
+depth). Exact MaxScore: R@100 0.9242, R@1000 0.9873.
+
+| Index / search | ms (k=100) | R@100 | ExactR@100 | ms (k=1000) | R@1000 | ExactR@1000 |
+|----------------|-----------:|------:|-----------:|------------:|-------:|------------:|
+| Raw, MaxScore (exact) | 334 | 0.9242 | 1 | 445 | 0.9873 | 1 |
+| Split 0.9 + 16-bit, MaxScore | 321 | 0.9242 | | 530 | 0.9873 | |
+| BMP, α=1 β=1 (safe) | 106 | 0.9245 | 0.975 | 381 | 0.9872 | 0.973 |
+| BMP, α=0.95 β=1 | 76 | 0.9243 | 0.973 | 309 | 0.9872 | 0.972 |
+| BMP, α=0.9 β=1 | 55 | 0.9249 | 0.959 | 243 | 0.9872 | 0.965 |
+| BMP, α=0.8 β=1 | 28 | 0.9239 | 0.863 | 140 | 0.9871 | 0.920 |
+| BMP, α=1 β=0.8 | 91 | 0.9237 | 0.971 | 334 | 0.9872 | 0.970 |
+| BMP, α=0.9 β=0.8 | 50 | 0.9238 | 0.954 | 221 | 0.9870 | 0.961 |
+| BMP, α=0.8 β=0.6 | 20 | 0.9239 | 0.818 | 103 | 0.9872 | 0.874 |
+| Seismic, qc=5 hf=0.9 | **2.6** | 0.9182 | 0.946 | **7.3** | 0.9760 | 0.840 |
+| Seismic, qc=10 hf=0.8 | 4.6 | 0.9221 | 0.976 | 8.7 | 0.9823 | 0.905 |
+| Seismic, qc=30 hf=0.9 | 4.4 | 0.9227 | 0.980 | 8.5 | 0.9842 | 0.929 |
+| Seismic, qc=10 hf=0.7 | 6.2 | 0.9221 | 0.978 | 9.9 | 0.9824 | 0.908 |
+| Seismic, qc=20 hf=0.7 | 7.7 | 0.9230 | 0.985 | 12.4 | 0.9842 | 0.935 |
+| Seismic, qc=20 hf=0.6 | 11.1 | 0.9233 | 0.986 | 15.1 | 0.9845 | 0.936 |
+| Seismic n_postings=3500, qc=5 hf=0.9 | 1.9 | 0.9025 | 0.894 | 4.5 | 0.9537 | 0.736 |
+| Seismic n_postings=3500, qc=10 hf=0.7 | 4.1 | 0.9102 | 0.935 | 7.1 | 0.9642 | 0.804 |
+| Seismic n_postings=3500, qc=20 hf=0.6 | 6.6 | 0.9122 | 0.949 | 10.1 | 0.9673 | 0.837 |
+
+### Findings
+
+- **Seismic** (default build, `n_postings=6000`; `qc` = `query_cut`,
+  `hf` = `heap_factor`) retrieves 98-99.7% of the exact top-10 at
+  0.9-4.3 ms/query, 50-260x faster than exact MaxScore. The heap factor
+  drives the cost more than the query cut. Build: 412 s, 35 GB peak
+  (including the raw index held in RAM).
+- **Seismic loses agreement with depth**: 99.5% of the exact top-10 but
+  98% of the top-100 and 84-94% of the top-1000 (R@1000 0.976-0.985
+  against 0.987). The search parameters barely move the top-1000 ceiling
+  (~94%): it comes from the build (posting lists statically pruned to
+  `n_postings` entries); the pruned `n_postings=3500` build is worse at
+  every depth. It is still 30-60x faster than exact search at k=1000.
+- **BMP** (block size 64): even the safe setting (α=β=1) is not exact
+  (8-bit score quantization: 97.4% of the exact top-10) and is 30x slower
+  than Seismic at similar top-10 agreement. Its agreement holds with depth
+  (97% of the exact top-1000, R@1000 equal to exact search), but at k=1000
+  the speed-up over exact MaxScore mostly vanishes (381 vs 445 ms). Lower
+  α trades agreement for speed quickly (α=0.8: 74% of the top-10).
+  Conversion (`to_bmp_streaming`): 387 s, ~33 GB peak, 13.8 GB file; the
+  loaded searcher needs ~45 GB of RAM.
+- At depth 10, MRR@10 hardly separates the methods (0.401-0.404 even at
+  70% agreement with the exact top-10): ExactR@k does.
+- Exact search is slow on SPLADE-v3 (long queries): MaxScore is ~2x faster
+  than WAND. 8-bit compression costs 0.0006 MRR@10; 16-bit is lossless.
+- **Split index** (0.9 quantile, 16-bit, after the split fix): the same
+  metrics as exact search at every depth in a quarter of the space; 18%
+  faster than raw MaxScore at k=10, as fast at k=100, 19% slower at
+  k=1000.
+- Encoding (SPLADE-v3, fp16, 2x RTX 2080 Ti) took 8 h.
+
+Reproduce with `examples/splade_benchmark.py --model naver/splade-v3
+--fp16 --top-k 10 --output-dir <dir> --compressed-index nbits=8 --seismic ''
+--seismic-search 'query-cut=10 heap-factor=0.7' --bmp-search 'alpha=1 beta=1'
+...`. The encoded index can be shared between runs with `--index-dir`
+(and memory-mapped with `--mmap-index`); every run's results are saved as
+TREC files under `<output-dir>/runs/` as soon as it is searched (with a
+`.npz` copy that a restarted benchmark reuses).

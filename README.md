@@ -48,6 +48,31 @@ MaxScore is its headline algorithm.
 
 See **[BENCHMARKS.md](BENCHMARKS.md)** for WAND/BMW numbers, full methodology, and a settings ablation (stemmer, tokenizer, stopwords, positions).
 
+**Learned sparse** — SPLADE-v3 on the same collection (dev/small,
+single-threaded, x86), retrieving the top-10 or the top-1000. "Exact
+top-k" is the fraction of the exact top-k retrieved:
+
+| Index / search | Index size | ms/query (top-10) | ms/query (top-1000) | MRR@10 | R@1000 | Exact top-10 | Exact top-1000 |
+|----------------|-----------:|------------------:|--------------------:|-------:|-------:|-------------:|---------------:|
+| Raw, MaxScore (exact) | 17.5 GB | 231 | 445 | 0.4026 | 0.9873 | 100% | 100% |
+| Split 0.9 + 16-bit, MaxScore | 4.7 GB | 188 | 530 | 0.4026 | 0.9873 | ≈100%¹ | ≈100%¹ |
+| BMP (`alpha=1`) | 13.8 GB | 27 | 381 | 0.4021 | 0.9872 | 97.4% | 97.3% |
+| BMP (`alpha=0.9`) | 13.8 GB | 14 | 243 | 0.4027 | 0.9872 | 92.5% | 96.5% |
+| **Seismic** (`query_cut=5`, `heap_factor=0.9`) | 9.7 GB | **0.9** | **7.3** | 0.4024 | 0.9760 | 98.3% | 84.0% |
+| **Seismic** (`query_cut=10`, `heap_factor=0.8`) | 9.7 GB | 1.3 | 8.7 | 0.4026 | 0.9823 | 99.3% | 90.5% |
+| **Seismic** (`query_cut=20`, `heap_factor=0.6`) | 9.7 GB | 4.3 | 15.1 | 0.4027 | 0.9845 | 99.7% | 93.6% |
+
+¹ Not measured directly: exact search over a 16-bit quantized index; its
+MRR, nDCG and recall match the raw index at every depth.
+
+Seismic is the fastest by far and near-exact for the top-10, but
+diverges from exact search deeper in the ranking (R@1000 0.976-0.985
+against 0.987); BMP keeps ~97% of the exact top-1000 but gets close to
+exact search in speed at that depth.
+
+See [BENCHMARKS.md](BENCHMARKS.md#learned-sparse-splade-v3-on-ms-marco) for
+all operating points, R@100 and build costs.
+
 ## Installation
 
 ```bash
@@ -202,6 +227,27 @@ index = builder.build(in_memory=True)
 # Search
 results = index.search_maxscore({5: 1.0, 10: 0.5}, top_k=10)
 ```
+
+### Approximate search with Seismic
+
+[Seismic](https://github.com/TusKANNy/seismic) (SIGIR 2024) gives fast
+**approximate** top-k over learned impacts (dot product only: not for
+BM25/LM or structured queries). It is included in the Python package
+(cargo feature `seismic`, which needs the nightly pinned in
+`rust-toolchain.toml`).
+
+```python
+index.to_seismic("/path/to/seismic")  # defaults tuned for SPLADE / MS MARCO
+searcher = impact_index.SeismicSearcher("/path/to/seismic")
+results = searcher.search({5: 1.0, 10: 0.5}, top_k=10, query_cut=10, heap_factor=0.7)
+```
+
+`query_cut` (terms traversed) and `heap_factor` (block-skipping
+aggressiveness) trade accuracy for speed. A Seismic directory cannot be
+migrated across Seismic versions: rebuild it with `to_seismic`.
+
+See [Performance](#performance) for SPLADE-v3 speed and accuracy
+against exact search and BMP.
 
 ## Stop Words
 
