@@ -1,11 +1,18 @@
 name: Build wheels (no release)
 
-# Manually triggered dry run of the release builds (same targets and
-# toolchain as release.yml), to debug packaging problems before tagging.
-# Nothing is published: wheels are only uploaded as workflow artifacts.
-# Keep targets/toolchain in sync with release.yml.
+# Dry run of the release builds (same targets and toolchain as release.yml),
+# to debug packaging problems before tagging: one wheel per platform and
+# Python version, each tested. Nothing is published: wheels are only
+# uploaded as workflow artifacts. Keep targets/toolchain/Python versions in
+# sync with release.yml.
+#
+# Run it manually (Actions tab, once this file is on the default branch), or
+# on any branch by pushing it as ci/wheels/<name>:
+#   git push -f origin HEAD:ci/wheels/<name>
 
 on:
+  push:
+    branches: ['ci/wheels/**']
   workflow_dispatch:
     inputs:
       profile:
@@ -13,30 +20,35 @@ on:
         type: choice
         options: [wheel-check, release]
         default: wheel-check
-      python:
-        description: "Python version to build and test"
+      pythons:
+        description: "Python versions to build and test (JSON list)"
         type: string
-        default: "3.12"
+        default: '["3.10", "3.11", "3.12", "3.13", "3.14"]'
 
 env:
   RUST_TOOLCHAIN: nightly-2026-09-20
+  PROFILE: ${{ inputs.profile || 'wheel-check' }}
 
 jobs:
   linux:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ${{ fromJSON(inputs.pythons || '["3.10", "3.11", "3.12", "3.13", "3.14"]') }}
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: 'true'
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ inputs.python }}
+          python-version: ${{ matrix.python }}
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
           rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
           target: x86_64
-          args: --profile ${{ inputs.profile }} --out dist -i python${{ inputs.python }}
+          args: --profile ${{ env.PROFILE }} --out dist -i python${{ matrix.python }}
           sccache: 'true'
           manylinux: auto
       - name: Test wheel
@@ -47,11 +59,15 @@ jobs:
           pytest -v python/test_seismic.py python/test_bmp_convert.py
       - uses: actions/upload-artifact@v4
         with:
-          name: wheel-check-linux-x86_64
+          name: wheel-check-linux-x86_64-py${{ matrix.python }}
           path: dist
 
   windows:
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ${{ fromJSON(inputs.pythons || '["3.10", "3.11", "3.12", "3.13", "3.14"]') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -59,14 +75,14 @@ jobs:
       - uses: actions/setup-python@v5
         id: py
         with:
-          python-version: ${{ inputs.python }}
+          python-version: ${{ matrix.python }}
           architecture: x64
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
           rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
           target: x64
-          args: --profile ${{ inputs.profile }} --out dist -i ${{ steps.py.outputs.python-path }}
+          args: --profile ${{ env.PROFILE }} --out dist -i ${{ steps.py.outputs.python-path }}
           sccache: 'true'
       - name: Test wheel
         shell: bash
@@ -76,7 +92,7 @@ jobs:
           pytest -v python/test_seismic.py python/test_bmp_convert.py
       - uses: actions/upload-artifact@v4
         with:
-          name: wheel-check-windows-x64
+          name: wheel-check-windows-x64-py${{ matrix.python }}
           path: dist
 
   macos:
@@ -85,6 +101,7 @@ jobs:
       fail-fast: false
       matrix:
         target: [x86_64-apple-darwin, aarch64-apple-darwin]
+        python: ${{ fromJSON(inputs.pythons || '["3.10", "3.11", "3.12", "3.13", "3.14"]') }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -92,13 +109,13 @@ jobs:
       - uses: actions/setup-python@v5
         id: py
         with:
-          python-version: ${{ inputs.python }}
+          python-version: ${{ matrix.python }}
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
           rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
           target: ${{ matrix.target }}
-          args: --profile ${{ inputs.profile }} --out dist -i ${{ steps.py.outputs.python-path }}
+          args: --profile ${{ env.PROFILE }} --out dist -i ${{ steps.py.outputs.python-path }}
           sccache: 'true'
       # macos-latest is arm64: the x86_64 wheel is cross-built and not run
       - name: Test wheel
@@ -109,7 +126,7 @@ jobs:
           pytest -v python/test_seismic.py python/test_bmp_convert.py
       - uses: actions/upload-artifact@v4
         with:
-          name: wheel-check-macos-${{ matrix.target }}
+          name: wheel-check-macos-${{ matrix.target }}-py${{ matrix.python }}
           path: dist
 
   sdist:

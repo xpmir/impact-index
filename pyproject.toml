@@ -8,7 +8,7 @@ features = ["extension-module", "seismic"]
 
 [project]
 name = "impact-index"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 dynamic = ["version"]
 classifiers = [
     "Programming Language :: Rust",
