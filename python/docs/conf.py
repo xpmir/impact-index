@@ -43,7 +43,8 @@ exclude_patterns = ["_build"]
 # -- HTML output --
 html_theme = "furo"
 html_title = "impact-index"
-html_static_path = []
+html_static_path = ["_static"]
+html_css_files = ["custom.css"]
 
 # GitHub banner (view/edit-on-GitHub links + icon in the sidebar)
 html_theme_options = {
