@@ -1,5 +1,7 @@
 # Impact Index for Information Retrieval
 
+📖 **Documentation: https://experimaestro-ir-rust.readthedocs.io/en/latest/**
+
 A Python/Rust library for efficient sparse retrieval. Built on Rust with PyO3 bindings for high performance.
 
 Supports both neural IR models with floating-point impact scores and traditional BM25 bag-of-words retrieval with performance competitive with Lucene/Pyserini and Terrier. For learned sparse models, it also integrates two approximate search backends: BMP (Block-Max Pruning) and Seismic.
