@@ -41,7 +41,8 @@ upstream issues in `pyo3-stub-gen`:
 - **`PyArray1<usize>`**: `usize` doesn't implement `NumPyScalar`
   ([#97](https://github.com/Jij-Inc/pyo3-stub-gen/issues/97))
 - **`&[u8]`**: byte slices don't implement `PyStubType`
-  ([#97](https://github.com/Jij-Inc/pyo3-stub-gen/issues/97))
+  ([#97](https://github.com/Jij-Inc/pyo3-stub-gen/issues/97)); use
+  `Bound<'_, PyBytes>` instead, which maps to `bytes`
 - **`(Self, Parent)` constructors**: `#[new]` returning a tuple for
   inheritance causes `Self` scope errors
 

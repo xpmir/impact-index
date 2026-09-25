@@ -2,7 +2,9 @@ use log::debug;
 use pyo3::PyClassInitializer;
 use pyo3::{
     pyclass, pymethods, pymodule,
-    types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods},
+    types::{
+        PyAnyMethods, PyBytes, PyBytesMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods,
+    },
     Bound, Py, PyAny, PyRef, PyResult, Python,
 };
 
@@ -282,7 +284,7 @@ fn query_node_from_py(obj: &Bound<'_, PyAny>, index: &dyn SparseIndex) -> PyResu
 
 /// A single term impact: a (document ID, impact value) pair.
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name = "TermImpact")]
+#[pyclass(name = "TermImpact", module = "impact_index")]
 struct PyTermImpact {
     /// The impact value.
     #[pyo3(get)]
@@ -295,7 +297,7 @@ struct PyTermImpact {
 
 /// A document with its retrieval score, returned by search methods.
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass]
+#[pyclass(name = "ScoredDocument", module = "impact_index")]
 pub struct PyScoredDocument {
     /// The relevance score.
     #[pyo3(get)]
@@ -311,7 +313,7 @@ pub struct PyScoredDocument {
 /// Yields TermImpact objects with (docid, value) pairs.
 /// Also provides metadata: length(), max_value(), max_doc_id().
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name = "SparseIndexIterator", unsendable)]
+#[pyclass(name = "SparseIndexIterator", unsendable, module = "impact_index")]
 struct PySparseIndexIterator {
     // Use dead code to ensure we have a valid index when iterating
     #[allow(dead_code)]
@@ -354,7 +356,7 @@ impl PySparseIndexIterator {
 
 /// Base class for index views.
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(subclass, name = "IndexView")]
+#[pyclass(subclass, name = "IndexView", module = "impact_index")]
 pub struct PyIndexView {}
 
 /// A loaded sparse index that supports searching and iteration.
@@ -372,7 +374,7 @@ pub struct PyIndexView {}
 ///     print(doc.docid, doc.score)
 /// ```
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name = "Index", extends=PyIndexView)]
+#[pyclass(name = "Index", extends=PyIndexView, module = "impact_index")]
 pub struct PySparseIndex {
     index: Arc<Box<dyn SparseIndex>>,
 }
@@ -811,7 +813,7 @@ impl PySparseIndex {
 
 /// Configuration options for IndexBuilder.
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name = "BuilderOptions")]
+#[pyclass(name = "BuilderOptions", module = "impact_index")]
 struct PyBuilderOptions(BuilderOptions);
 
 #[cfg_attr(feature = "stub-gen", gen_stub_pymethods)]
@@ -858,7 +860,7 @@ impl PyBuilderOptions {
 
 /// Builds a sparse index from document impact vectors.
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name = "IndexBuilder")]
+#[pyclass(name = "IndexBuilder", module = "impact_index")]
 pub struct PyIndexBuilder {
     inner: Arc<Mutex<IndexerEnum>>,
 }
@@ -1045,14 +1047,14 @@ impl PyIndexBuilder {
 
 /// Base class for document ID compressors.
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(subclass)]
+#[pyclass(name = "DocIdCompressor", subclass, module = "impact_index")]
 pub struct PyDocIdCompressor {
     inner: Arc<Box<dyn compress::DocIdCompressorFactory>>,
 }
 
 /// Elias-Fano encoding for document ID compression.
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name="EliasFanoCompressor", extends=PyDocIdCompressor)]
+#[pyclass(name="EliasFanoCompressor", extends=PyDocIdCompressor, module = "impact_index")]
 pub struct PyEliasFanoCompressor {}
 
 // gen_stub_pymethods skipped: (Self, Parent) return in #[new] unsupported
@@ -1071,7 +1073,7 @@ impl PyEliasFanoCompressor {
 
 /// SIMD bitpacking for document ID compression (faster than Elias-Fano).
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name="BitPackingCompressor", extends=PyDocIdCompressor)]
+#[pyclass(name="BitPackingCompressor", extends=PyDocIdCompressor, module = "impact_index")]
 pub struct PyBitPackingCompressor {}
 
 // gen_stub_pymethods skipped: (Self, Parent) return in #[new] unsupported
@@ -1090,7 +1092,7 @@ impl PyBitPackingCompressor {
 
 /// PFOR-delta doc ID compressor (better compression than BitPacking with outliers).
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name="PForCompressor", extends=PyDocIdCompressor)]
+#[pyclass(name="PForCompressor", extends=PyDocIdCompressor, module = "impact_index")]
 pub struct PyPForCompressor {}
 
 // gen_stub_pymethods skipped: (Self, Parent) return in #[new] unsupported
@@ -1109,14 +1111,14 @@ impl PyPForCompressor {
 
 /// Base class for impact value compressors.
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name = "ImpactCompressor", subclass)]
+#[pyclass(name = "ImpactCompressor", subclass, module = "impact_index")]
 pub struct PyImpactCompressorFactory {
     inner: Arc<Box<dyn compress::ImpactCompressorFactory>>,
 }
 
 /// Fixed-range quantizer for impact values.
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name="ImpactQuantizer", extends=PyImpactCompressorFactory)]
+#[pyclass(name="ImpactQuantizer", extends=PyImpactCompressorFactory, module = "impact_index")]
 pub struct PyImpactQuantizer {}
 
 // gen_stub_pymethods skipped: (Self, Parent) return in #[new] unsupported
@@ -1135,7 +1137,7 @@ impl PyImpactQuantizer {
 
 /// Auto-ranging quantizer that determines min/max from the index.
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name="GlobalImpactQuantizer", extends=PyImpactCompressorFactory)]
+#[pyclass(name="GlobalImpactQuantizer", extends=PyImpactCompressorFactory, module = "impact_index")]
 pub struct PyGlobalQuantizerFactory {}
 
 // gen_stub_pymethods skipped: (Self, Parent) return in #[new] unsupported
@@ -1157,7 +1159,7 @@ impl PyGlobalQuantizerFactory {
 /// For BM25 indices with integer term frequencies, uses ~2-3 bits per value
 /// (adaptive per block) vs 8 bits for quantized floats.
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name="BitPackedIntCompressor", extends=PyImpactCompressorFactory)]
+#[pyclass(name="BitPackedIntCompressor", extends=PyImpactCompressorFactory, module = "impact_index")]
 pub struct PyBitPackedIntCompressor {}
 
 #[pymethods]
@@ -1178,7 +1180,7 @@ impl PyBitPackedIntCompressor {
 /// Quantizes float impacts to N-bit integers, then compresses with
 /// adaptive SIMD bitpacking (~3-4 bits/value instead of fixed N bits).
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name="QuantizedBitPackedCompressor", extends=PyImpactCompressorFactory)]
+#[pyclass(name="QuantizedBitPackedCompressor", extends=PyImpactCompressorFactory, module = "impact_index")]
 pub struct PyQuantizedBitPackedCompressor {}
 
 #[pymethods]
@@ -1202,7 +1204,7 @@ trait PyTransformFactory: Send + Sync {
 
 /// Base class for index transforms.
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(subclass)]
+#[pyclass(name = "Transform", subclass, module = "impact_index")]
 pub struct PyTransform {
     factory: Box<dyn PyTransformFactory>,
 }
@@ -1240,7 +1242,7 @@ impl PyTransformFactory for PyCompressionTransformFactory {
 
 /// Transform that compresses an index using block-based encoding.
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(extends=PyTransform, name="CompressionTransform")]
+#[pyclass(extends=PyTransform, name="CompressionTransform", module = "impact_index")]
 pub struct PyCompressionTransform {}
 
 // gen_stub_pymethods skipped: (Self, Parent) return in #[new] unsupported
@@ -1278,7 +1280,7 @@ impl PyTransformFactory for PySplitIndexTransformFactory {
 
 /// Transform that splits posting lists by impact quantiles.
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name="SplitIndexTransform", extends=PyTransform)]
+#[pyclass(name="SplitIndexTransform", extends=PyTransform, module = "impact_index")]
 struct PySplitIndexTransform {}
 
 // gen_stub_pymethods skipped: (Self, Parent) return in #[new] unsupported
@@ -1317,7 +1319,7 @@ impl PyTransformFactory for PyReorderTransformFactory {
 /// `Index.compress(...)` does. Permuted `docmeta` and `reorder_map.dat`
 /// are always written directly by the transform itself.
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name="ReorderTransform", extends=PyTransform)]
+#[pyclass(name="ReorderTransform", extends=PyTransform, module = "impact_index")]
 struct PyReorderTransform {}
 
 // gen_stub_pymethods skipped: (Self, Parent) return in #[new] unsupported
@@ -1347,7 +1349,7 @@ impl PyReorderTransform {
 
 /// BMP (Block-Max Pruning) Searcher for fast approximate search
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name = "BmpSearcher")]
+#[pyclass(name = "BmpSearcher", module = "impact_index")]
 pub struct PyBmpSearcher {
     index: bmp::index::inverted_index::Index,
     bfwd: bmp::index::forward_index::BlockForwardIndex,
@@ -1413,7 +1415,7 @@ impl PyBmpSearcher {
 /// learned impacts (see `SparseIndex.to_seismic`).
 #[cfg(feature = "seismic")]
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name = "SeismicSearcher")]
+#[pyclass(name = "SeismicSearcher", module = "impact_index")]
 pub struct PySeismicSearcher {
     inner: crate::seismic::SeismicSearcher,
 }
@@ -1467,14 +1469,12 @@ impl PySeismicSearcher {
 // --- DocumentStore Python bindings ---
 
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name = "Document")]
+#[pyclass(name = "Document", module = "impact_index")]
 pub struct PyDocument {
     inner: docstore::Document,
 }
 
-// gen_stub_pymethods skipped: &[u8] not supported
-// https://github.com/Jij-Inc/pyo3-stub-gen/issues/97
-// gen_stub_pymethods skipped: (Self, Parent) return in #[new] unsupported
+#[cfg_attr(feature = "stub-gen", gen_stub_pymethods)]
 #[pymethods]
 impl PyDocument {
     #[getter]
@@ -1488,20 +1488,18 @@ impl PyDocument {
     }
 
     #[getter]
-    fn content(&self) -> &[u8] {
-        &self.inner.content
+    fn content<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.inner.content)
     }
 }
 
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name = "DocumentStoreBuilder")]
+#[pyclass(name = "DocumentStoreBuilder", module = "impact_index")]
 pub struct PyDocumentStoreBuilder {
     builder: Option<docstore::builder::DocumentStoreBuilder>,
 }
 
-// gen_stub_pymethods skipped: &[u8] not supported
-// https://github.com/Jij-Inc/pyo3-stub-gen/issues/97
-// gen_stub_pymethods skipped: (Self, Parent) return in #[new] unsupported
+#[cfg_attr(feature = "stub-gen", gen_stub_pymethods)]
 #[pymethods]
 impl PyDocumentStoreBuilder {
     /// Create a new DocumentStoreBuilder.
@@ -1511,6 +1509,7 @@ impl PyDocumentStoreBuilder {
     ///     block_size: Uncompressed block size in bytes before flushing.
     ///     zstd_level: zstd compression level.
     ///     checkpoint_frequency: Controls checkpointing/recovery.
+    ///
     ///         - ``0`` (default): disabled — output files are truncated on
     ///           open and any existing checkpoint is removed.
     ///         - ``N > 0``: recover from any existing checkpoint, then
@@ -1546,10 +1545,14 @@ impl PyDocumentStoreBuilder {
     /// Add a document. Returns ``True`` if this call triggered an automatic
     /// checkpoint (only possible when ``checkpoint_frequency`` is a positive
     /// integer).
-    fn add(&mut self, keys: HashMap<String, String>, content: &[u8]) -> PyResult<bool> {
+    fn add(
+        &mut self,
+        keys: HashMap<String, String>,
+        content: &Bound<'_, PyBytes>,
+    ) -> PyResult<bool> {
         let doc = docstore::DocumentData {
             keys,
-            content: content.to_vec(),
+            content: content.as_bytes().to_vec(),
         };
         self.builder
             .as_mut()
@@ -1594,14 +1597,12 @@ impl PyDocumentStoreBuilder {
 }
 
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name = "DocumentStore")]
+#[pyclass(name = "DocumentStore", module = "impact_index")]
 pub struct PyDocumentStore {
     store: Arc<docstore::store::DocumentStore>,
 }
 
-// gen_stub_pymethods skipped: &[u8] in return types
-// https://github.com/Jij-Inc/pyo3-stub-gen/issues/97
-// gen_stub_pymethods skipped: (Self, Parent) return in #[new] unsupported
+#[cfg_attr(feature = "stub-gen", gen_stub_pymethods)]
 #[pymethods]
 impl PyDocumentStore {
     #[staticmethod]
@@ -1705,7 +1706,7 @@ impl PyDocumentStore {
 
 /// Document metadata (document lengths) for use with scoring models.
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name = "DocMetadata")]
+#[pyclass(name = "DocMetadata", module = "impact_index")]
 pub struct PyDocMetadata {
     inner: Arc<DocMetadata>,
 }
@@ -1762,7 +1763,7 @@ impl PyDocMetadata {
 /// `(k3 + 1) * w / (k3 + w)`, as Terrier 5's BM25 does. This applies to
 /// repeated query terms and to `#combine` weights.
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name = "BM25Scoring")]
+#[pyclass(name = "BM25Scoring", module = "impact_index")]
 pub struct PyBM25Scoring {
     k1: f32,
     b: f32,
@@ -1792,7 +1793,7 @@ impl PyBM25Scoring {
 
 /// A scored index that applies a scoring model to raw postings.
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name = "ScoredIndex", extends = PyIndexView)]
+#[pyclass(name = "ScoredIndex", extends = PyIndexView, module = "impact_index")]
 pub struct PyScoredIndex {
     index: Arc<Box<dyn SparseIndex>>,
 }
@@ -1898,7 +1899,7 @@ impl PyScoredIndex {
 /// results = scored.search_wand(query, top_k=10)
 /// ```
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name = "BOWIndexBuilder")]
+#[pyclass(name = "BOWIndexBuilder", module = "impact_index")]
 pub struct PyBOWIndexBuilder {
     inner: Arc<Mutex<Option<BOWBuilderEnum>>>,
     /// Mirrors `options.positions`; gates `add()` (see [`PyBOWIndexBuilder::add`]).
@@ -2466,7 +2467,7 @@ impl PyBOWIndexBuilder {
 }
 
 #[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
-#[pyclass(name = "TextAnalyzer")]
+#[pyclass(name = "TextAnalyzer", module = "impact_index")]
 pub struct PyTextAnalyzer {
     inner: TextAnalyzer,
 }
@@ -2630,6 +2631,12 @@ fn impact_index(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()> {
     debug!("Loading xpmir-rust extension");
 
     module.add_class::<PyBuilderOptions>()?;
+    module.add_class::<PyIndexView>()?;
+    module.add_class::<PyTermImpact>()?;
+    module.add_class::<PyScoredDocument>()?;
+    module.add_class::<PyDocIdCompressor>()?;
+    module.add_class::<PyImpactCompressorFactory>()?;
+    module.add_class::<PyTransform>()?;
     module.add_class::<PyIndexBuilder>()?;
     module.add_class::<PySparseIndex>()?;
     module.add_class::<PySparseIndexIterator>()?;

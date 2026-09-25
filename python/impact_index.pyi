@@ -12,6 +12,7 @@ __all__ = [
     "BmpSearcher",
     "BuilderOptions",
     "CompressionTransform",
+    "DocIdCompressor",
     "DocMetadata",
     "Document",
     "DocumentStore",
@@ -24,17 +25,16 @@ __all__ = [
     "IndexBuilder",
     "IndexView",
     "PForCompressor",
-    "PyDocIdCompressor",
-    "PyScoredDocument",
-    "PyTransform",
     "QuantizedBitPackedCompressor",
     "ReorderTransform",
+    "ScoredDocument",
     "ScoredIndex",
     "SeismicSearcher",
     "SparseIndexIterator",
     "SplitIndexTransform",
     "TermImpact",
     "TextAnalyzer",
+    "Transform",
 ]
 
 @typing.final
@@ -83,7 +83,7 @@ class BOWIndexBuilder:
     ...
 
 @typing.final
-class BitPackedIntCompressor(impactindex.ImpactCompressor):
+class BitPackedIntCompressor(ImpactCompressor):
     r"""
     SIMD bitpacked integer compressor for raw TF counts.
 
@@ -94,7 +94,7 @@ class BitPackedIntCompressor(impactindex.ImpactCompressor):
     ...
 
 @typing.final
-class BitPackingCompressor(impactindex.PyDocIdCompressor):
+class BitPackingCompressor(DocIdCompressor):
     r"""
     SIMD bitpacking for document ID compression (faster than Elias-Fano).
     """
@@ -140,9 +140,16 @@ class BuilderOptions:
     def __new__(cls) -> BuilderOptions: ...
 
 @typing.final
-class CompressionTransform(impactindex.PyTransform):
+class CompressionTransform(Transform):
     r"""
     Transform that compresses an index using block-based encoding.
+    """
+
+    ...
+
+class DocIdCompressor:
+    r"""
+    Base class for document ID compressors.
     """
 
     ...
@@ -161,16 +168,81 @@ class DocMetadata:
     def copy_files(src: builtins.str, dst: builtins.str) -> None: ...
 
 @typing.final
-class Document: ...
+class Document:
+    @property
+    def internal_id(self) -> builtins.int: ...
+    @property
+    def keys(self) -> builtins.dict[builtins.str, builtins.str]: ...
+    @property
+    def content(self) -> bytes: ...
 
 @typing.final
-class DocumentStore: ...
+class DocumentStore:
+    @staticmethod
+    def load(
+        folder: builtins.str, content_access: builtins.str = "memory"
+    ) -> DocumentStore: ...
+    def num_documents(self) -> builtins.int: ...
+    def key_names(self) -> builtins.list[builtins.str]: ...
+    def get_by_number(
+        self, doc_numbers: typing.Sequence[builtins.int]
+    ) -> builtins.list[Document]: ...
+    def get_by_key(
+        self, key_name: builtins.str, key_values: typing.Sequence[builtins.str]
+    ) -> builtins.list[typing.Optional[Document]]: ...
+    def aio_get_by_number(
+        self, doc_numbers: typing.Sequence[builtins.int]
+    ) -> typing.Any: ...
+    def aio_get_by_key(
+        self, key_name: builtins.str, key_values: typing.Sequence[builtins.str]
+    ) -> typing.Any: ...
 
 @typing.final
-class DocumentStoreBuilder: ...
+class DocumentStoreBuilder:
+    def __new__(
+        cls,
+        folder: builtins.str,
+        block_size: builtins.int = 4096,
+        zstd_level: builtins.int = 3,
+        checkpoint_frequency: typing.Optional[builtins.int] = 0,
+    ) -> DocumentStoreBuilder:
+        r"""
+        Create a new DocumentStoreBuilder.
+
+        Args:
+            folder: Directory to write the store into.
+            block_size: Uncompressed block size in bytes before flushing.
+            zstd_level: zstd compression level.
+            checkpoint_frequency: Controls checkpointing/recovery.
+
+                - ``0`` (default): disabled — output files are truncated on
+                  open and any existing checkpoint is removed.
+                - ``N > 0``: recover from any existing checkpoint, then
+                  automatically checkpoint every ``N`` added documents.
+                - ``None``: recover from any existing checkpoint, but never
+                  auto-checkpoint — call ``checkpoint()`` manually.
+        """
+    def add(
+        self, keys: typing.Mapping[builtins.str, builtins.str], content: bytes
+    ) -> builtins.bool:
+        r"""
+        Add a document. Returns ``True`` if this call triggered an automatic
+        checkpoint (only possible when ``checkpoint_frequency`` is a positive
+        integer).
+        """
+    def num_documents(self) -> builtins.int:
+        r"""
+        Number of documents added so far (including any restored from a checkpoint).
+        """
+    def checkpoint(self) -> None:
+        r"""
+        Force a checkpoint now. Only useful when the builder was created with
+        a non-zero ``checkpoint_frequency``.
+        """
+    def build(self) -> None: ...
 
 @typing.final
-class EliasFanoCompressor(impactindex.PyDocIdCompressor):
+class EliasFanoCompressor(DocIdCompressor):
     r"""
     Elias-Fano encoding for document ID compression.
     """
@@ -178,7 +250,7 @@ class EliasFanoCompressor(impactindex.PyDocIdCompressor):
     ...
 
 @typing.final
-class GlobalImpactQuantizer(impactindex.ImpactCompressor):
+class GlobalImpactQuantizer(ImpactCompressor):
     r"""
     Auto-ranging quantizer that determines min/max from the index.
     """
@@ -193,7 +265,7 @@ class ImpactCompressor:
     ...
 
 @typing.final
-class ImpactQuantizer(impactindex.ImpactCompressor):
+class ImpactQuantizer(ImpactCompressor):
     r"""
     Fixed-range quantizer for impact values.
     """
@@ -201,7 +273,7 @@ class ImpactQuantizer(impactindex.ImpactCompressor):
     ...
 
 @typing.final
-class Index(impactindex.IndexView):
+class Index(IndexView):
     r"""
     A loaded sparse index that supports searching and iteration.
 
@@ -415,47 +487,15 @@ class IndexView:
     ...
 
 @typing.final
-class PForCompressor(impactindex.PyDocIdCompressor):
+class PForCompressor(DocIdCompressor):
     r"""
     PFOR-delta doc ID compressor (better compression than BitPacking with outliers).
     """
 
     ...
 
-class PyDocIdCompressor:
-    r"""
-    Base class for document ID compressors.
-    """
-
-    ...
-
 @typing.final
-class PyScoredDocument:
-    r"""
-    A document with its retrieval score, returned by search methods.
-    """
-    @property
-    def score(self) -> builtins.float:
-        r"""
-        The relevance score.
-        """
-    @property
-    def docid(self) -> builtins.int:
-        r"""
-        The document identifier.
-        """
-
-class PyTransform:
-    r"""
-    Base class for index transforms.
-    """
-    def process(self, path: builtins.str, index: Index) -> None:
-        r"""
-        Apply this transform to an index, writing the result to path.
-        """
-
-@typing.final
-class QuantizedBitPackedCompressor(impactindex.ImpactCompressor):
+class QuantizedBitPackedCompressor(ImpactCompressor):
     r"""
     Quantized + adaptive bitpacked compressor for neural IR (SPLADE).
 
@@ -466,7 +506,7 @@ class QuantizedBitPackedCompressor(impactindex.ImpactCompressor):
     ...
 
 @typing.final
-class ReorderTransform(impactindex.PyTransform):
+class ReorderTransform(Transform):
     r"""
     Transform that renumbers document ids by recursive graph bisection
     (BP, see `optimizations.md` P2) before delegating to `sink` (typically
@@ -482,7 +522,23 @@ class ReorderTransform(impactindex.PyTransform):
     ...
 
 @typing.final
-class ScoredIndex(impactindex.IndexView):
+class ScoredDocument:
+    r"""
+    A document with its retrieval score, returned by search methods.
+    """
+    @property
+    def score(self) -> builtins.float:
+        r"""
+        The relevance score.
+        """
+    @property
+    def docid(self) -> builtins.int:
+        r"""
+        The document identifier.
+        """
+
+@typing.final
+class ScoredIndex(IndexView):
     r"""
     A scored index that applies a scoring model to raw postings.
     """
@@ -515,7 +571,7 @@ class SeismicSearcher:
         query_cut: builtins.int = 10,
         heap_factor: builtins.float = 0.699999988079071,
         n_knn: builtins.int = 0,
-    ) -> builtins.list[PyScoredDocument]:
+    ) -> builtins.list[ScoredDocument]:
         r"""
         Approximate search: `query` maps term indices to weights.
 
@@ -549,7 +605,7 @@ class SparseIndexIterator:
         """
 
 @typing.final
-class SplitIndexTransform(impactindex.PyTransform):
+class SplitIndexTransform(Transform):
     r"""
     Transform that splits posting lists by impact quantiles.
     """
@@ -609,4 +665,13 @@ class TextAnalyzer:
         Analyze a query string into term IDs and frequencies.
 
         Unknown terms (not in the vocabulary) are skipped.
+        """
+
+class Transform:
+    r"""
+    Base class for index transforms.
+    """
+    def process(self, path: builtins.str, index: Index) -> None:
+        r"""
+        Apply this transform to an index, writing the result to path.
         """
