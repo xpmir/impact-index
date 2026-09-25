@@ -53,9 +53,26 @@ From source (requires Rust toolchain)::
     pip install maturin
     maturin develop --release
 
+Documentation
+-------------
+
+- :doc:`first-index`: build an index from learned sparse vectors
+  (e.g. SPLADE) and search it with WAND or MaxScore
+- :doc:`bow`: BM25 indexing from text or term frequencies, text analysis,
+  positions and structured queries
+- :doc:`compression`: compressed, split and reordered indices, and
+  approximate search with BMP and Seismic
+- :doc:`docstore`: compressed storage for the documents themselves
+- :doc:`versioning`: on-disk format versions and migrating old indices
+
+Each page ends with the API reference of the classes it covers.
+
 .. toctree::
    :maxdepth: 2
-   :caption: Contents
+   :caption: User guide
 
-   guide
-   api
+   first-index
+   bow
+   compression
+   docstore
+   versioning

@@ -35,7 +35,7 @@ Settled decisions:
   (weights multiply, duplicate clauses merge); BM25 `k3` (opt-in) normalizes
   weights by the max, then `(k3+1)w/(k3+w)`. Rationale: sum-of-idfs
   overstates rarity (wrong for `#syn`), and no other convention was more
-  principled than Terrier's. User-facing description: guide.rst, "How
+  principled than Terrier's. User-facing description: python/docs/bow.rst, "How
   structured queries are scored".
 - Positional data lives in a **separate stream** at every level (builder file,
   compressed file, checkpoint) so non-positional reads stay byte-identical.

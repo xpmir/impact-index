@@ -1,5 +1,7 @@
 # Configuration file for the Sphinx documentation builder.
 
+import re
+
 project = "impact-index"
 copyright = "2024, Benjamin Piwowarski"
 author = "Benjamin Piwowarski"
@@ -16,8 +18,10 @@ extensions = [
 autoapi_type = "python"
 autoapi_dirs = [".."]  # parent (python/), where impact_index.pyi lives
 autoapi_file_patterns = ["*.pyi"]
-autoapi_generate_api_docs = True
-autoapi_add_toctree_entry = False  # linked from api.rst instead
+# No generated module page: each guide page documents its own classes with
+# autoapiclass directives (see _check_api_coverage below).
+autoapi_generate_api_docs = False
+autoapi_add_toctree_entry = False
 autoapi_options = [
     "members",
     "undoc-members",
@@ -95,5 +99,33 @@ def _markdown_fences_to_rst(app, what, name, obj, options, lines):
     lines[:] = out
 
 
+# Every public name in the stubs must be documented on one of the guide
+# pages, otherwise a new class would silently be missing from the docs.
+def _check_api_coverage(app):
+    import ast
+    from pathlib import Path
+
+    from sphinx.util import logging
+
+    docs = Path(app.srcdir)
+    tree = ast.parse((docs.parent / "impact_index.pyi").read_text())
+    public = next(
+        ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(getattr(t, "id", None) == "__all__" for t in node.targets)
+    )
+    documented = set()
+    for rst in docs.glob("*.rst"):
+        documented.update(
+            re.findall(r"^\.\. autoapi\w+:: impact_index\.(\w+)", rst.read_text(), re.M)
+        )
+    for name in sorted(set(public) - documented):
+        logging.getLogger(__name__).warning(
+            "impact_index.%s is not documented on any page", name
+        )
+
+
 def setup(app):
     app.connect("autodoc-process-docstring", _markdown_fences_to_rst)
+    app.connect("builder-inited", _check_api_coverage)
