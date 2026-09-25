@@ -43,6 +43,7 @@ class BM25Scoring:
     BM25 scoring model.
 
     `variant` selects the IDF formula:
+
     - `"bm25"` (default): the original Robertson/Sparck-Jones formula
       `ln((N - df + 0.5) / (df + 0.5))`, floored so very common terms don't
       get a negative weight. Matches PISA and Terrier.

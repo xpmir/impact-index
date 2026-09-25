@@ -17,8 +17,10 @@ autoapi_type = "python"
 autoapi_dirs = [".."]  # parent (python/), where impact_index.pyi lives
 autoapi_file_patterns = ["*.pyi"]
 autoapi_generate_api_docs = True
+autoapi_add_toctree_entry = False  # linked from api.rst instead
 autoapi_options = [
     "members",
+    "undoc-members",
     "show-inheritance",
     "show-module-summary",
     "imported-members",
@@ -71,3 +73,27 @@ html_theme_options = {
         },
     ],
 }
+
+
+# Docstrings come from Rust doc comments, which are Markdown: turn ```lang
+# fences into RST code blocks so they render instead of breaking the page.
+def _markdown_fences_to_rst(app, what, name, obj, options, lines):
+    out, in_fence = [], False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            if not in_fence:
+                lang = stripped[3:].split(",")[0].strip() or "text"
+                out.extend([f".. code-block:: {lang}", ""])
+            else:
+                out.append("")
+            in_fence = not in_fence
+        elif in_fence:
+            out.append("   " + line if line else "")
+        else:
+            out.append(line)
+    lines[:] = out
+
+
+def setup(app):
+    app.connect("autodoc-process-docstring", _markdown_fences_to_rst)

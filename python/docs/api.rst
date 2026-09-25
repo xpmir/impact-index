@@ -1,8 +1,10 @@
 API Reference
 =============
 
-This page is auto-generated from the type stubs (``impact_index.pyi``).
+Full reference for the ``impact_index`` module, generated from its type
+stubs (``impact_index.pyi``).
 
-.. autoapi-nested-parse::
+.. toctree::
+   :maxdepth: 2
 
-   Full API reference for the ``impact_index`` module.
+   autoapi/impact_index/index

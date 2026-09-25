@@ -2,7 +2,7 @@
 
 This directory contains the Python type stubs and Sphinx documentation source for the `impact_index` module.
 
-For the full user documentation, see: https://experimaestro-ir-rust.readthedocs.io/en/latest/index.html
+For the full user documentation, see: https://impact-index.readthedocs.io/en/latest/index.html
 
 ## Files
 

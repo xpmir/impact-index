@@ -1,6 +1,6 @@
 # Impact Index for Information Retrieval
 
-📖 **Documentation: https://experimaestro-ir-rust.readthedocs.io/en/latest/**
+📖 **Documentation: https://impact-index.readthedocs.io/en/latest/**
 
 A Python/Rust library for efficient sparse retrieval. Built on Rust with PyO3 bindings for high performance.
 
@@ -283,4 +283,4 @@ builder = impact_index.BOWIndexBuilder(
 
 Full documentation including guides on compression, BMP search, and the document store:
 
-**https://experimaestro-ir-rust.readthedocs.io/en/latest/index.html**
+**https://impact-index.readthedocs.io/en/latest/index.html**

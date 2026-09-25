@@ -250,26 +250,30 @@ to ``pipeline="pyserini"`` for English text), so existing code that sets
 
 **Why all three axes at once matters:**
 
-======================== ================= ===================== ==================================
-System                   Tokenizer         Stemmer               Stop words checked
-======================== ================= ===================== ==================================
-Lucene/Anserini/Pyserini strips trailing    classic Porter         *before* stemming, against the raw
-                         ``'s`` only        (``PorterStemFilter``) token (Lucene's ~33-word list)
-Terrier 5 (real)         (Java tokenizer,   classic Porter         *before* stemming, against the raw
-                         not independently                         token (Terrier's own ~730-word
-                         verified here)                             list) -- default
-                                                                     ``termpipelines=Stopwords,``
-                                                                     ``PorterStemmer``, verified by
-                                                                     dumping an isolated Terrier 5
-                                                                     index's lexicon directly
-PISA (native CLI)        truncates at the   Snowball/Porter2       *after* stemming, against the raw
-                         *first* apostrophe                        (never-stemmed) list -- PISA's
-                         anywhere                                  own ``tools/app.cpp``, not
-                                                                     exercised by the
-                                                                     ``pyterrier_pisa`` wrapper this
-                                                                     project benchmarks against (see
-                                                                     below)
-======================== ================= ===================== ==================================
+.. list-table::
+   :header-rows: 1
+   :widths: 20 20 20 40
+
+   * - System
+     - Tokenizer
+     - Stemmer
+     - Stop words checked
+   * - Lucene/Anserini/Pyserini
+     - strips trailing ``'s`` only
+     - classic Porter (``PorterStemFilter``)
+     - *before* stemming, against the raw token (Lucene's ~33-word list)
+   * - Terrier 5 (real)
+     - (Java tokenizer, not independently verified here)
+     - classic Porter
+     - *before* stemming, against the raw token (Terrier's own ~730-word
+       list) -- default ``termpipelines=Stopwords,PorterStemmer``, verified
+       by dumping an isolated Terrier 5 index's lexicon directly
+   * - PISA (native CLI)
+     - truncates at the *first* apostrophe anywhere
+     - Snowball/Porter2
+     - *after* stemming, against the raw (never-stemmed) list -- PISA's own
+       ``tools/app.cpp``, not exercised by the ``pyterrier_pisa`` wrapper
+       this project benchmarks against (see below)
 
 ``pipeline="terrier"`` matches the middle row (real Terrier 5, verified):
 pre-stem filtering, both at index time and query time, plus PISA's own
@@ -287,7 +291,7 @@ returns no results). ``"terrier-pisa"`` reproduces exactly that asymmetry:
 nothing filtered when building the index, Terrier's list still filtered
 when analyzing a query. Filtering neither side, or both, measurably hurts
 agreement with a real PISA index built this way. See `BENCHMARKS.md
-<https://github.com/experimaestro/experimaestro-ir-rust/blob/main/BENCHMARKS.md>`_
+<https://github.com/xpmir/impact-index/blob/master/BENCHMARKS.md>`_
 for the measured numbers (full-query-set result overlap: 0.98 against PISA
 with ``"terrier-pisa"``, 0.96 against Terrier 5 with ``"terrier"`` -- each
 pipeline is a close match for the system it targets, not for the other
@@ -800,6 +804,91 @@ BMP search parameters:
 - ``k`` — number of results to return
 - ``alpha`` — controls early termination aggressiveness (default: 1.0)
 - ``beta`` — controls block skipping (default: 1.0)
+
+
+.. _seismic:
+
+Seismic (approximate search)
+----------------------------
+
+`Seismic <https://github.com/TusKANNy/seismic>`__ (Bruch et al., SIGIR 2024)
+gives very fast **approximate** top-k retrieval over learned impacts. Like
+BMP, a Seismic index is a separate artefact built from an existing impact
+index. It scores by dot product over the stored impacts only, so it
+supports neither query-time scoring models (BM25, LM) nor structured
+queries.
+
+Seismic is included in the Python package from PyPI. When building from
+source, it is the ``seismic`` cargo feature (enabled by ``maturin
+develop``), which needs the nightly toolchain pinned in
+``rust-toolchain.toml``. You can check whether your build has it with
+``hasattr(impact_index, "SeismicSearcher")``.
+
+Converting to Seismic format
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:meth:`~impact_index.Index.to_seismic` writes a Seismic index
+directory. The defaults follow Seismic's recommendations for SPLADE on
+MS MARCO:
+
+.. code-block:: python
+
+    import impact_index
+
+    index = impact_index.Index.load("/path/to/index", in_memory=True)
+    index.to_seismic("/path/to/seismic")
+
+Build parameters:
+
+- ``n_postings`` -- average number of postings kept per term (default:
+  6000). Postings beyond this global budget are pruned *at build time*, so
+  this sets a ceiling on recall at large depths.
+- ``max_fraction`` -- maximum posting list length, as a multiple of
+  ``n_postings`` (default: 1.5)
+- ``centroid_fraction`` -- number of blocks (k-means centroids) per
+  posting list, as a fraction of its length (default: 0.1)
+- ``summary_energy`` -- fraction of the L1 mass kept in each block
+  summary (default: 0.4)
+- ``knn`` -- number of nearest neighbours stored per document; 0 (the
+  default) builds no kNN graph
+
+Searching with Seismic
+~~~~~~~~~~~~~~~~~~~~~~
+
+Open the directory with :class:`~impact_index.SeismicSearcher`. Queries use
+the same ``{term_index: weight}`` dictionaries as exact search, and results
+are the same scored documents:
+
+.. code-block:: python
+
+    searcher = impact_index.SeismicSearcher("/path/to/seismic")
+    print(f"Documents: {searcher.num_documents()}")
+
+    results = searcher.search({5: 1.0, 10: 0.5}, top_k=10,
+                              query_cut=10, heap_factor=0.7)
+    for r in results:
+        print(r.docid, r.score)
+
+Search parameters:
+
+- ``top_k`` -- number of results to return
+- ``query_cut`` -- only the ``query_cut`` highest-weighted query terms are
+  traversed (default: 10)
+- ``heap_factor`` -- blocks whose summary score is below ``heap_factor``
+  times the current k-th score are skipped; lower is faster and less
+  accurate, 1.0 disables this approximation (default: 0.7)
+- ``n_knn`` -- number of kNN neighbours used to refine the results; needs
+  an index built with ``knn > 0`` (default: 0)
+
+Raising ``query_cut`` and ``heap_factor`` trades speed for accuracy. On
+SPLADE-v3 / MS MARCO, Seismic is near-exact on the top-10 but drifts from
+exact search deeper in the ranking (mostly because of ``n_postings``
+pruning); see the `benchmarks
+<https://github.com/xpmir/impact-index/blob/master/BENCHMARKS.md>`_.
+
+A Seismic directory is tied to the Seismic version it was built with and
+cannot be migrated: after an upgrade that changes the format, loading it
+fails and you need to rebuild it with ``to_seismic``.
 
 
 .. _document-store:
