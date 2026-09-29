@@ -6,11 +6,16 @@ on:
   pull_request:
     branches: [master]
 
+# A new push to the same branch/PR supersedes any run still in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
       with:
         submodules: 'true'
     - run: rustup toolchain install nightly-2026-09-20 --profile minimal
@@ -19,7 +24,7 @@ jobs:
   python:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
       with:
         submodules: 'true'
     - run: rustup toolchain install nightly-2026-09-20 --profile minimal

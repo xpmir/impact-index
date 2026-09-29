@@ -56,5 +56,7 @@ pub mod seismic;
 pub mod transforms;
 pub mod vocab;
 
+// Docstrings here are Python (RST) docs, not rustdoc: keep them out of doctests.
+#[cfg(not(doctest))]
 pub mod py;
 mod utils;
