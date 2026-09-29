@@ -51,7 +51,11 @@ impl Quantizer {
             levels: levels,
             min: min,
             max: max,
-            step: (max - min) / ((levels + 1) as f32),
+            // `levels` bins of equal width tile `[min, max]` exactly, so every
+            // value decodes within half a bin (the old `levels + 1` divisor
+            // left the top of the range outside the last bin). The step is
+            // serialized, so existing indices still decode as written.
+            step: (max - min) / (levels as f32),
         }
     }
 }
@@ -535,6 +539,49 @@ impl QuantizedBitPackedCompressor {
                     data[offset + 3],
                 ]);
                 buffer.push((v as ImpactValue) * step + min + half_step);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block_info(length: usize) -> TermBlockInformation {
+        TermBlockInformation {
+            docid_position_range: (0, 0),
+            impact_position_range: (0, 0),
+            length,
+            max_value: 0.,
+            min_doc_id: 0,
+            max_doc_id: 0,
+            min_doc_length: 0,
+            positions_position_range: (0, 0),
+            num_positions: 0,
+        }
+    }
+
+    /// Every value in `[min, max]` must decode within half a quantization
+    /// bin, including values near `max` (which land in the last level).
+    #[test]
+    fn quantizer_error_is_at_most_half_a_bin() {
+        for nbits in [4, 8, 16] {
+            let q = Quantizer::new(nbits, 0., 5.);
+            let values: Vec<ImpactValue> = (0..=1000).map(|i| i as f32 * 5. / 1000.).collect();
+            let info = block_info(values.len());
+
+            let mut data = Vec::new();
+            q.write(&mut data, &values, 0, &info);
+            let mut decoded = Vec::new();
+            q.decode_into_bytes(&data, 0, &info, &mut decoded);
+
+            let bound = 5. / (2. * q.levels as f32) + 1e-5;
+            for (x, y) in values.iter().zip(decoded.iter()) {
+                assert!(
+                    (x - y).abs() <= bound,
+                    "nbits={nbits}: {x} decoded as {y} (bound {bound})"
+                );
             }
         }
     }
