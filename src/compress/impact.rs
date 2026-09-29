@@ -25,6 +25,14 @@ const BLOCK_LEN: usize = 128;
 // --- Quantizer
 // ---
 
+/// Width of each of `levels` equal bins tiling `[min, max]`, so that every
+/// value in range decodes within half a bin. (A `levels + 1` divisor, used
+/// before 1.7.1, left the top of the range outside the last bin.) The step
+/// is serialized with the compressor, so existing indices decode as written.
+fn quantization_step(min: ImpactValue, max: ImpactValue, levels: u32) -> ImpactValue {
+    (max - min) / (levels as f32)
+}
+
 /// Uniform quantizer that maps floating-point impact values to N-bit integers.
 ///
 /// Values are linearly mapped from `[min, max]` into `2^nbits` levels.
@@ -51,11 +59,7 @@ impl Quantizer {
             levels: levels,
             min: min,
             max: max,
-            // `levels` bins of equal width tile `[min, max]` exactly, so every
-            // value decodes within half a bin (the old `levels + 1` divisor
-            // left the top of the range outside the last bin). The step is
-            // serialized, so existing indices still decode as written.
-            step: (max - min) / (levels as f32),
+            step: quantization_step(min, max, levels),
         }
     }
 }
@@ -431,8 +435,7 @@ impl ImpactCompressorFactory for QuantizedBitPackedFactory {
             min = min.min(term_min);
             max = max.max(term_max);
         }
-        let levels = 1u32 << self.nbits;
-        let step = (max - min) / (levels as f32 + 1.0);
+        let step = quantization_step(min, max, 1u32 << self.nbits);
         Box::new(QuantizedBitPackedCompressor {
             nbits: self.nbits,
             step,
@@ -582,6 +585,38 @@ mod tests {
                     (x - y).abs() <= bound,
                     "nbits={nbits}: {x} decoded as {y} (bound {bound})"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn bitpacked_quantizer_error_is_at_most_half_a_bin() {
+        for nbits in [4, 8] {
+            let q = QuantizedBitPackedCompressor {
+                nbits,
+                step: quantization_step(0., 5., 1 << nbits),
+                min: 0.,
+                max: 5.,
+            };
+            let bound = q.step / 2. + 1e-5;
+            // A full bit-packed block and a shorter (tail) block.
+            for len in [BLOCK_LEN, 50] {
+                let values: Vec<ImpactValue> =
+                    (0..len).map(|i| i as f32 * 5. / (len - 1) as f32).collect();
+                let info = block_info(len);
+
+                let mut data = Vec::new();
+                q.write(&mut data, &values, 0, &info);
+                let mut decoded = Vec::new();
+                q.decode_into_bytes(&data, 0, &info, &mut decoded);
+
+                assert_eq!(decoded.len(), len);
+                for (x, y) in values.iter().zip(decoded.iter()) {
+                    assert!(
+                        (x - y).abs() <= bound,
+                        "nbits={nbits}, len={len}: {x} decoded as {y} (bound {bound})"
+                    );
+                }
             }
         }
     }
