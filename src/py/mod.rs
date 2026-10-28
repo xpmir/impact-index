@@ -35,9 +35,13 @@ use bmp::search::b_search_verbose;
 
 use crate::base::load_index;
 use crate::base::{DocId, ImpactValue, PostingValue, TermIndex};
+use crate::compress::impact::{QuantizationRange, QuantizerParams};
 use crate::index::SparseIndex;
 use crate::query::{self, QueryError, QueryNode};
-use crate::search::maxscore::{search_maxscore, MaxScoreOptions};
+use crate::search::filter::{DocBitSet, DocSetFilter};
+use crate::search::maxscore::{search_maxscore, search_maxscore_filtered, MaxScoreOptions};
+use crate::search::segments::{segment_size, Segment, SegmentAlgorithm, SegmentedSearch};
+use crate::search::wand::search_wand_filtered;
 use crate::transforms::IndexTransform;
 use crate::{
     base::TermImpactIterator, builder::Indexer as SparseIndexer, search::wand::search_wand,
@@ -359,6 +363,143 @@ impl PySparseIndexIterator {
 #[pyclass(subclass, name = "IndexView", module = "impact_index")]
 pub struct PyIndexView {}
 
+/// Doc-id set from a numpy boolean mask (`mask[docid]`) or a sequence of
+/// doc ids.
+fn doc_set_from_py(obj: &Bound<'_, PyAny>) -> PyResult<DocBitSet> {
+    if let Ok(mask) = obj.downcast::<PyArray1<bool>>() {
+        let mask = mask.readonly();
+        return Ok(DocBitSet::from_mask(mask.as_slice()?));
+    }
+    let docids: Vec<DocId> = obj.extract().map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err(
+            "expected a numpy boolean mask or a sequence of document ids",
+        )
+    })?;
+    Ok(docids.into_iter().collect())
+}
+
+/// Filter from the optional `deleted` / `allowed` arguments.
+fn doc_filter_from_py(
+    deleted: Option<&Bound<'_, PyAny>>,
+    allowed: Option<&Bound<'_, PyAny>>,
+) -> PyResult<DocSetFilter> {
+    Ok(DocSetFilter {
+        deleted: deleted.map(doc_set_from_py).transpose()?,
+        allowed: allowed.map(doc_set_from_py).transpose()?,
+    })
+}
+
+/// Filtered search shared by `Index` and `ScoredIndex` (GIL released).
+fn filtered_search_py(
+    py: Python<'_>,
+    index: &dyn SparseIndex,
+    py_query: &Bound<'_, PyDict>,
+    top_k: usize,
+    deleted: Option<&Bound<'_, PyAny>>,
+    allowed: Option<&Bound<'_, PyAny>>,
+    wand: bool,
+) -> PyResult<Vec<PyScoredDocument>> {
+    let query: HashMap<usize, ImpactValue> = py_query.extract()?;
+    let filter = doc_filter_from_py(deleted, allowed)?;
+    let results = py.detach(|| {
+        if wand {
+            search_wand_filtered(index, &query, top_k, &filter)
+        } else {
+            search_maxscore_filtered(index, &query, top_k, MaxScoreOptions::default(), &filter)
+        }
+    });
+    Ok(results
+        .into_iter()
+        .map(|r| PyScoredDocument {
+            docid: r.docid,
+            score: r.score,
+        })
+        .collect())
+}
+
+/// Quantisation range from Python: `None` (per index), a `(min, max)`
+/// pair (fixed) or a `QuantizerParams` (reference).
+fn quantization_range_from_py(obj: Option<&Bound<'_, PyAny>>) -> PyResult<QuantizationRange> {
+    let Some(obj) = obj else {
+        return Ok(QuantizationRange::PerIndex);
+    };
+    if let Ok(params) = obj.extract::<PyRef<PyQuantizerParams>>() {
+        return Ok(QuantizationRange::Reference(params.0));
+    }
+    let (min, max): (ImpactValue, ImpactValue) = obj.extract().map_err(|_| {
+        pyo3::exceptions::PyTypeError::new_err(
+            "quantization must be None, a (min, max) pair or a QuantizerParams",
+        )
+    })?;
+    if !(min < max) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "quantization range: min ({min}) must be below max ({max})"
+        )));
+    }
+    Ok(QuantizationRange::Fixed { min, max })
+}
+
+/// Parameters of a quantised impact codec, from ``Index.quantizer()``.
+///
+/// Level ``q`` decodes to ``q * step + min + step / 2``; values outside
+/// ``[min, max]`` are clamped. Passed as ``quantization=`` to
+/// ``Index.compress``, they make the new index decode impacts exactly like
+/// the one they come from, so the scores of segments are comparable.
+#[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
+#[pyclass(name = "QuantizerParams", module = "impact_index", frozen)]
+#[derive(Clone)]
+pub struct PyQuantizerParams(QuantizerParams);
+
+#[cfg_attr(feature = "stub-gen", gen_stub_pymethods)]
+#[pymethods]
+impl PyQuantizerParams {
+    /// Parameters tiling ``[min, max]`` with ``2**nbits`` levels.
+    #[new]
+    fn new(nbits: u32, min: ImpactValue, max: ImpactValue) -> PyResult<Self> {
+        if !(1..=16).contains(&nbits) || !(min < max) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "nbits must be in 1..=16 and min below max",
+            ));
+        }
+        Ok(Self(QuantizerParams::new(nbits, min, max)))
+    }
+
+    /// Number of bits per quantised value.
+    #[getter]
+    fn nbits(&self) -> u32 {
+        self.0.nbits
+    }
+
+    /// Lower bound of the range.
+    #[getter]
+    fn min(&self) -> ImpactValue {
+        self.0.min
+    }
+
+    /// Upper bound of the range.
+    #[getter]
+    fn max(&self) -> ImpactValue {
+        self.0.max
+    }
+
+    /// Quantisation step.
+    #[getter]
+    fn step(&self) -> ImpactValue {
+        self.0.step
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "QuantizerParams(nbits={}, min={}, max={}, step={})",
+            self.0.nbits, self.0.min, self.0.max, self.0.step
+        )
+    }
+}
+
 /// A loaded sparse index that supports searching and iteration.
 ///
 /// Use ``Index.load(folder, in_memory)`` to load an existing index,
@@ -377,6 +518,9 @@ pub struct PyIndexView {}
 #[pyclass(name = "Index", extends=PyIndexView, module = "impact_index")]
 pub struct PySparseIndex {
     index: Arc<Box<dyn SparseIndex>>,
+    /// Impacts clamped by the `compress` call that produced this index
+    /// (`None` for an index built or loaded otherwise).
+    clamped_impacts: Option<u64>,
 }
 
 impl PySparseIndex {
@@ -477,6 +621,59 @@ impl PySparseIndex {
             let options = MaxScoreOptions::default();
             search_maxscore(index, query, top_k, options)
         })
+    }
+
+    /// Search using MaxScore, skipping filtered documents.
+    ///
+    /// Args:
+    ///     deleted: Documents never returned (e.g. tombstones), as a numpy
+    ///         boolean mask indexed by docid or a sequence of docids.
+    ///     allowed: If given, only these documents may be returned (same
+    ///         forms as ``deleted``).
+    ///
+    /// The filter is applied before heap insertion, so the result is
+    /// exactly the top-k of the accepted documents. Docids are the original
+    /// ones for a reordered index.
+    #[pyo3(signature = (py_query, top_k, deleted=None, allowed=None))]
+    fn search_maxscore_filtered(
+        &self,
+        py: Python<'_>,
+        py_query: &Bound<'_, PyDict>,
+        top_k: usize,
+        deleted: Option<&Bound<'_, PyAny>>,
+        allowed: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<PyScoredDocument>> {
+        filtered_search_py(py, &**self.index, py_query, top_k, deleted, allowed, false)
+    }
+
+    /// Search using WAND, skipping filtered documents (see
+    /// ``search_maxscore_filtered``).
+    #[pyo3(signature = (py_query, top_k, deleted=None, allowed=None))]
+    fn search_wand_filtered(
+        &self,
+        py: Python<'_>,
+        py_query: &Bound<'_, PyDict>,
+        top_k: usize,
+        deleted: Option<&Bound<'_, PyAny>>,
+        allowed: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<PyScoredDocument>> {
+        filtered_search_py(py, &**self.index, py_query, top_k, deleted, allowed, true)
+    }
+
+    /// Quantisation parameters of a compressed index with quantised
+    /// impacts (``None`` otherwise). Pass them as ``quantization=`` to
+    /// ``compress`` so that another index (segment) decodes impacts
+    /// exactly like this one.
+    fn quantizer(&self) -> Option<PyQuantizerParams> {
+        self.index.quantizer().map(PyQuantizerParams)
+    }
+
+    /// Number of impacts outside the quantisation range, clamped by the
+    /// ``compress`` call that returned this index (``None`` if the index
+    /// was loaded or built otherwise). Always 0 for a per-index range.
+    #[getter]
+    fn clamped_impacts(&self) -> Option<u64> {
+        self.clamped_impacts
     }
 
     /// Async version of search_wand.
@@ -600,7 +797,16 @@ impl PySparseIndex {
     ///         lossless integer bitpacking (best for BM25 with integer TF).
     ///         Set to 8 or 16 for quantized float compression.
     ///     in_memory: Load the compressed index in memory (default: True).
-    #[pyo3(signature = (output_folder, block_size=128, nbits=0, in_memory=true))]
+    ///     quantization: Range of the quantised impacts: ``None`` (default)
+    ///         for this index's min/max, a ``(min, max)`` pair for a fixed
+    ///         range, or the ``QuantizerParams`` of another index
+    ///         (``other.quantizer()``) to decode impacts exactly like it.
+    ///         The last two make scores comparable across indices
+    ///         (segments); values outside the range are clamped, and
+    ///         counted in ``clamped_impacts`` of the returned index. A
+    ///         ``QuantizerParams`` also sets the number of bits, so
+    ///         ``nbits`` may then be left to 0.
+    #[pyo3(signature = (output_folder, block_size=128, nbits=0, in_memory=true, quantization=None))]
     fn compress(
         &self,
         py: Python<'_>,
@@ -608,13 +814,28 @@ impl PySparseIndex {
         block_size: usize,
         nbits: u32,
         in_memory: bool,
+        quantization: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        let impacts_factory: Box<dyn compress::ImpactCompressorFactory> = if nbits == 0 {
+        let range = quantization_range_from_py(quantization)?;
+        let impacts_factory: Box<dyn compress::ImpactCompressorFactory> = match range {
             // Lossless integer bitpacking (best for BM25 integer TF counts)
-            Box::new(compress::impact::BitPackedIntCompressor {})
-        } else {
+            QuantizationRange::PerIndex if nbits == 0 => {
+                Box::new(compress::impact::BitPackedIntCompressor {})
+            }
             // Quantized float compression
-            Box::new(compress::impact::QuantizedBitPackedFactory { nbits })
+            QuantizationRange::PerIndex => {
+                Box::new(compress::impact::QuantizedBitPackedFactory { nbits })
+            }
+            QuantizationRange::Fixed { .. } if nbits == 0 => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "a (min, max) quantization range needs nbits > 0",
+                ))
+            }
+            range => Box::new(compress::impact::RangedQuantizerFactory {
+                nbits,
+                range,
+                codec: compress::impact::QuantizerCodec::BitPacked,
+            }),
         };
         let transform = CompressionTransform {
             max_block_size: block_size,
@@ -623,8 +844,8 @@ impl PySparseIndex {
             positions_codec: None,
         };
         let path = Path::new(output_folder);
-        transform
-            .process(path, &**self.index)
+        let report = transform
+            .compress(path, &**self.index)
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("{}", e)))?;
 
         // Let the source index save its auxiliary data to the compressed dir
@@ -635,6 +856,7 @@ impl PySparseIndex {
         let base = PyClassInitializer::from(PyIndexView {});
         let sub = base.add_subclass(PySparseIndex {
             index: Arc::new(load_index(path, in_memory)),
+            clamped_impacts: Some(report.clamped_impacts),
         });
         Ok(Py::new(py, sub)?.into_any())
     }
@@ -708,6 +930,7 @@ impl PySparseIndex {
         let base = PyClassInitializer::from(PyIndexView {});
         let sub = base.add_subclass(PySparseIndex {
             index: Arc::new(load_index(path, in_memory)),
+            clamped_impacts: None,
         });
         Ok(Py::new(py, sub)?.into_any())
     }
@@ -731,6 +954,7 @@ impl PySparseIndex {
         let base = PyClassInitializer::from(PyIndexView {});
         let sub = base.add_subclass(PySparseIndex {
             index: Arc::new(load_index(Path::new(folder), in_memory)),
+            clamped_impacts: None,
         });
         Ok(Py::new(py, sub)?.into_any())
     }
@@ -1029,6 +1253,7 @@ impl PyIndexBuilder {
                 let index = $indexer.to_index(in_memory);
                 let sub = base.add_subclass(PySparseIndex {
                     index: Arc::new(Box::new(index)),
+                    clamped_impacts: None,
                 });
                 Ok(Py::new(py, sub)?.into_any())
             }};
@@ -1185,16 +1410,34 @@ pub struct PyQuantizedBitPackedCompressor {}
 
 #[pymethods]
 impl PyQuantizedBitPackedCompressor {
+    /// Args:
+    ///     nbits: Quantization bits.
+    ///     quantization: Range of the quantised impacts, as in
+    ///         ``Index.compress``: ``None`` (the index's min/max), a
+    ///         ``(min, max)`` pair, or a ``QuantizerParams``.
     #[new]
-    fn new(nbits: u32) -> (Self, PyImpactCompressorFactory) {
-        (
+    #[pyo3(signature = (nbits, quantization=None))]
+    fn new(
+        nbits: u32,
+        quantization: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<(Self, PyImpactCompressorFactory)> {
+        let factory: Box<dyn compress::ImpactCompressorFactory> =
+            match quantization_range_from_py(quantization)? {
+                QuantizationRange::PerIndex => {
+                    Box::new(compress::impact::QuantizedBitPackedFactory { nbits })
+                }
+                range => Box::new(compress::impact::RangedQuantizerFactory {
+                    nbits,
+                    range,
+                    codec: compress::impact::QuantizerCodec::BitPacked,
+                }),
+            };
+        Ok((
             PyQuantizedBitPackedCompressor {},
             PyImpactCompressorFactory {
-                inner: Arc::new(Box::new(compress::impact::QuantizedBitPackedFactory {
-                    nbits,
-                })),
+                inner: Arc::new(factory),
             },
-        )
+        ))
     }
 }
 
@@ -1885,6 +2128,201 @@ impl PyScoredIndex {
             .collect();
         Ok(pyo3::IntoPyObject::into_pyobject(v, py)?.into())
     }
+
+    /// Search using MaxScore, skipping filtered documents. See
+    /// ``Index.search_maxscore_filtered``.
+    #[pyo3(signature = (py_query, top_k, deleted=None, allowed=None))]
+    fn search_maxscore_filtered(
+        &self,
+        py: Python<'_>,
+        py_query: &Bound<'_, PyDict>,
+        top_k: usize,
+        deleted: Option<&Bound<'_, PyAny>>,
+        allowed: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<PyScoredDocument>> {
+        filtered_search_py(py, &**self.index, py_query, top_k, deleted, allowed, false)
+    }
+
+    /// Search using WAND, skipping filtered documents. See
+    /// ``Index.search_maxscore_filtered``.
+    #[pyo3(signature = (py_query, top_k, deleted=None, allowed=None))]
+    fn search_wand_filtered(
+        &self,
+        py: Python<'_>,
+        py_query: &Bound<'_, PyDict>,
+        top_k: usize,
+        deleted: Option<&Bound<'_, PyAny>>,
+        allowed: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<PyScoredDocument>> {
+        filtered_search_py(py, &**self.index, py_query, top_k, deleted, allowed, true)
+    }
+}
+
+/// A document of a ``SegmentedIndex`` search result.
+#[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
+#[pyclass(name = "SegmentScoredDocument", module = "impact_index")]
+pub struct PySegmentScoredDocument {
+    /// Position of the segment in the list given to ``SegmentedIndex``.
+    #[pyo3(get)]
+    segment: usize,
+
+    /// Document identifier within that segment.
+    #[pyo3(get)]
+    docid: DocId,
+
+    /// The relevance score.
+    #[pyo3(get)]
+    score: ImpactValue,
+}
+
+/// Several indices (segments of one collection) searched as one.
+///
+/// Each segment is searched with its own top-k, skipping its deleted
+/// documents, and the results are merged into a global top-k. Scores must
+/// be comparable across segments: compress them with a common
+/// ``quantization`` range (a fixed ``(min, max)`` or the first segment's
+/// ``quantizer()``). Which segments exist, and their tombstones, are the
+/// caller's to keep.
+///
+/// Example:
+///
+/// ```python,ignore
+/// segments = impact_index.SegmentedIndex([seg0, seg1])
+/// hits = segments.search({42: 1.5}, top_k=10, deleted=[tomb0, None])
+/// for hit in hits:
+///     print(hit.segment, hit.docid, hit.score)
+/// ```
+#[cfg_attr(feature = "stub-gen", gen_stub_pyclass)]
+#[pyclass(name = "SegmentedIndex", module = "impact_index")]
+pub struct PySegmentedIndex {
+    segments: Vec<Arc<Box<dyn SparseIndex>>>,
+    sizes: Vec<usize>,
+}
+
+/// One optional filter per segment (`None`, or a list with one entry per
+/// segment, each `None` or a doc set).
+fn segment_doc_sets(
+    arg: Option<&Bound<'_, PyAny>>,
+    n: usize,
+    name: &str,
+) -> PyResult<Vec<Option<DocBitSet>>> {
+    let Some(arg) = arg else {
+        return Ok(vec![None; n]);
+    };
+    let items: Vec<Bound<'_, PyAny>> = arg.extract()?;
+    if items.len() != n {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "{name}: expected one entry per segment ({n}), got {}",
+            items.len()
+        )));
+    }
+    items
+        .iter()
+        .map(|x| {
+            if x.is_none() {
+                Ok(None)
+            } else {
+                doc_set_from_py(x).map(Some)
+            }
+        })
+        .collect()
+}
+
+#[cfg_attr(feature = "stub-gen", gen_stub_pymethods)]
+#[pymethods]
+impl PySegmentedIndex {
+    /// Args:
+    ///     segments: ``Index`` or ``ScoredIndex`` objects.
+    #[new]
+    fn new(py: Python<'_>, segments: Vec<Bound<'_, PyAny>>) -> PyResult<Self> {
+        let segments = segments
+            .iter()
+            .map(|s| {
+                if let Ok(index) = s.extract::<PyRef<PySparseIndex>>() {
+                    Ok(index.index.clone())
+                } else if let Ok(index) = s.extract::<PyRef<PyScoredIndex>>() {
+                    Ok(index.index.clone())
+                } else {
+                    Err(pyo3::exceptions::PyTypeError::new_err(
+                        "segments must be Index or ScoredIndex objects",
+                    ))
+                }
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let sizes = py.detach(|| segments.iter().map(|s| segment_size(&***s)).collect());
+        Ok(Self { segments, sizes })
+    }
+
+    fn __len__(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Top-k documents over all segments, by decreasing score.
+    ///
+    /// Args:
+    ///     py_query: Map from term index to query weight.
+    ///     top_k: Number of documents to return.
+    ///     deleted: One entry per segment: ``None``, or the segment's
+    ///         deleted documents (numpy boolean mask or sequence of docids).
+    ///     allowed: One entry per segment: ``None``, or the only documents
+    ///         that segment may return (same forms).
+    ///     algorithm: ``"maxscore"`` (default) or ``"wand"``.
+    ///     share_threshold: Pass the global k-th score found so far to the
+    ///         next segment (searched largest first), so that small
+    ///         segments prune harder. Results are the same either way, up
+    ///         to ties at the k-th score.
+    #[pyo3(signature = (py_query, top_k, deleted=None, allowed=None, algorithm="maxscore", share_threshold=true))]
+    fn search(
+        &self,
+        py: Python<'_>,
+        py_query: &Bound<'_, PyDict>,
+        top_k: usize,
+        deleted: Option<&Bound<'_, PyAny>>,
+        allowed: Option<&Bound<'_, PyAny>>,
+        algorithm: &str,
+        share_threshold: bool,
+    ) -> PyResult<Vec<PySegmentScoredDocument>> {
+        let query: HashMap<usize, ImpactValue> = py_query.extract()?;
+        let algorithm = match algorithm {
+            "maxscore" => SegmentAlgorithm::MaxScore(MaxScoreOptions::default()),
+            "wand" => SegmentAlgorithm::Wand,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown algorithm {other:?} (expected \"maxscore\" or \"wand\")"
+                )))
+            }
+        };
+        let n = self.segments.len();
+        let filters: Vec<DocSetFilter> = segment_doc_sets(deleted, n, "deleted")?
+            .into_iter()
+            .zip(segment_doc_sets(allowed, n, "allowed")?)
+            .map(|(deleted, allowed)| DocSetFilter { deleted, allowed })
+            .collect();
+
+        let results = py.detach(|| {
+            let segments = self
+                .segments
+                .iter()
+                .zip(filters)
+                .map(|(index, filter)| Segment {
+                    index: &***index,
+                    filter,
+                })
+                .collect();
+            let mut search = SegmentedSearch::with_sizes(segments, &self.sizes);
+            search.algorithm = algorithm;
+            search.share_threshold = share_threshold;
+            search.search(&query, top_k)
+        });
+        Ok(results
+            .into_iter()
+            .map(|r| PySegmentScoredDocument {
+                segment: r.segment,
+                docid: r.docid,
+                score: r.score,
+            })
+            .collect())
+    }
 }
 
 /// Bag-of-words index builder for traditional IR (BM25, TF-IDF, etc.).
@@ -2453,6 +2891,7 @@ impl PyBOWIndexBuilder {
                 let base = PyClassInitializer::from(PyIndexView {});
                 let sub = base.add_subclass(PySparseIndex {
                     index: Arc::new(Box::new(index)),
+                    clamped_impacts: None,
                 });
                 Ok(Py::new(py, sub)?.into_any())
             }};
@@ -2663,6 +3102,9 @@ fn impact_index(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyDocMetadata>()?;
     module.add_class::<PyBM25Scoring>()?;
     module.add_class::<PyScoredIndex>()?;
+    module.add_class::<PyQuantizerParams>()?;
+    module.add_class::<PySegmentedIndex>()?;
+    module.add_class::<PySegmentScoredDocument>()?;
     module.add_class::<PyBOWIndexBuilder>()?;
     module.add_class::<PyTextAnalyzer>()?;
 

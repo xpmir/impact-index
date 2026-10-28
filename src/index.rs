@@ -427,6 +427,15 @@ pub trait SparseIndex: Send + Sync + SparseIndexView + AsSparseIndexView {
         None
     }
 
+    /// Quantisation parameters of the impacts, for a compressed index with
+    /// a quantising codec (`None` otherwise). Passed as a
+    /// [`crate::compress::impact::QuantizationRange::Reference`] when
+    /// compressing another index, they make its scores exactly comparable
+    /// with this one's (segments of one collection).
+    fn quantizer(&self) -> Option<crate::compress::impact::QuantizerParams> {
+        None
+    }
+
     /// Source directory path (for loading vocab, copying files).
     fn source_path(&self) -> Option<&Path> {
         None

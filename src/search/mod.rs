@@ -3,10 +3,16 @@
 //! Provides two main algorithms:
 //! - [`wand::search_wand`]: WAND (Weak AND) algorithm for top-k retrieval
 //! - [`maxscore::search_maxscore`]: MaxScore algorithm with optional term impact decomposition
+//!
+//! Both have `_filtered` variants taking a [`filter::DocFilter`] (tombstones,
+//! allow-lists), and [`segments::SegmentedSearch`] searches several indices
+//! (segments of one collection) as one.
 
 pub mod cursor;
+pub mod filter;
 pub mod maxscore;
 pub(crate) mod ops;
+pub mod segments;
 pub mod wand;
 
 /// Reordered indices renumber documents internally (see

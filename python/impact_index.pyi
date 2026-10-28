@@ -26,9 +26,12 @@ __all__ = [
     "IndexView",
     "PForCompressor",
     "QuantizedBitPackedCompressor",
+    "QuantizerParams",
     "ReorderTransform",
     "ScoredDocument",
     "ScoredIndex",
+    "SegmentScoredDocument",
+    "SegmentedIndex",
     "SeismicSearcher",
     "SparseIndexIterator",
     "SplitIndexTransform",
@@ -290,6 +293,13 @@ class Index(IndexView):
         print(doc.docid, doc.score)
     ```
     """
+    @property
+    def clamped_impacts(self) -> typing.Optional[builtins.int]:
+        r"""
+        Number of impacts outside the quantisation range, clamped by the
+        ``compress`` call that returned this index (``None`` if the index
+        was loaded or built otherwise). Always 0 for a per-index range.
+        """
     def postings(self, term: builtins.int) -> SparseIndexIterator:
         r"""
         Returns an iterator over the posting list for the given term index.
@@ -309,6 +319,44 @@ class Index(IndexView):
     def search_maxscore(self, py_query: dict, top_k: builtins.int) -> typing.Any:
         r"""
         Search using the MaxScore algorithm.
+        """
+    def search_maxscore_filtered(
+        self,
+        py_query: dict,
+        top_k: builtins.int,
+        deleted: typing.Optional[typing.Any] = None,
+        allowed: typing.Optional[typing.Any] = None,
+    ) -> builtins.list[ScoredDocument]:
+        r"""
+        Search using MaxScore, skipping filtered documents.
+
+        Args:
+            deleted: Documents never returned (e.g. tombstones), as a numpy
+                boolean mask indexed by docid or a sequence of docids.
+            allowed: If given, only these documents may be returned (same
+                forms as ``deleted``).
+
+        The filter is applied before heap insertion, so the result is
+        exactly the top-k of the accepted documents. Docids are the original
+        ones for a reordered index.
+        """
+    def search_wand_filtered(
+        self,
+        py_query: dict,
+        top_k: builtins.int,
+        deleted: typing.Optional[typing.Any] = None,
+        allowed: typing.Optional[typing.Any] = None,
+    ) -> builtins.list[ScoredDocument]:
+        r"""
+        Search using WAND, skipping filtered documents (see
+        ``search_maxscore_filtered``).
+        """
+    def quantizer(self) -> typing.Optional[QuantizerParams]:
+        r"""
+        Quantisation parameters of a compressed index with quantised
+        impacts (``None`` otherwise). Pass them as ``quantization=`` to
+        ``compress`` so that another index (segment) decodes impacts
+        exactly like this one.
         """
     def aio_search_wand(self, py_query: dict, top_k: builtins.int) -> typing.Any:
         r"""
@@ -362,6 +410,7 @@ class Index(IndexView):
         block_size: builtins.int = 128,
         nbits: builtins.int = 0,
         in_memory: builtins.bool = True,
+        quantization: typing.Optional[typing.Any] = None,
     ) -> typing.Any:
         r"""
         Compress the index with SIMD bitpacking and quantization.
@@ -376,6 +425,15 @@ class Index(IndexView):
                 lossless integer bitpacking (best for BM25 with integer TF).
                 Set to 8 or 16 for quantized float compression.
             in_memory: Load the compressed index in memory (default: True).
+            quantization: Range of the quantised impacts: ``None`` (default)
+                for this index's min/max, a ``(min, max)`` pair for a fixed
+                range, or the ``QuantizerParams`` of another index
+                (``other.quantizer()``) to decode impacts exactly like it.
+                The last two make scores comparable across indices
+                (segments); values outside the range are clamped, and
+                counted in ``clamped_impacts`` of the returned index. A
+                ``QuantizerParams`` also sets the number of bits, so
+                ``nbits`` may then be left to 0.
         """
     def reorder(
         self,
@@ -506,6 +564,45 @@ class QuantizedBitPackedCompressor(ImpactCompressor):
     ...
 
 @typing.final
+class QuantizerParams:
+    r"""
+    Parameters of a quantised impact codec, from ``Index.quantizer()``.
+
+    Level ``q`` decodes to ``q * step + min + step / 2``; values outside
+    ``[min, max]`` are clamped. Passed as ``quantization=`` to
+    ``Index.compress``, they make the new index decode impacts exactly like
+    the one they come from, so the scores of segments are comparable.
+    """
+    @property
+    def nbits(self) -> builtins.int:
+        r"""
+        Number of bits per quantised value.
+        """
+    @property
+    def min(self) -> builtins.float:
+        r"""
+        Lower bound of the range.
+        """
+    @property
+    def max(self) -> builtins.float:
+        r"""
+        Upper bound of the range.
+        """
+    @property
+    def step(self) -> builtins.float:
+        r"""
+        Quantisation step.
+        """
+    def __new__(
+        cls, nbits: builtins.int, min: builtins.float, max: builtins.float
+    ) -> QuantizerParams:
+        r"""
+        Parameters tiling ``[min, max]`` with ``2**nbits`` levels.
+        """
+    def __eq__(self, other: QuantizerParams) -> builtins.bool: ...
+    def __repr__(self) -> builtins.str: ...
+
+@typing.final
 class ReorderTransform(Transform):
     r"""
     Transform that renumbers document ids by recursive graph bisection
@@ -555,6 +652,102 @@ class ScoredIndex(IndexView):
         r"""
         Search using MaxScore over a structured (matchop-style) query. See
         ``Index.search_wand_query`` for the accepted ``query`` forms.
+        """
+    def search_maxscore_filtered(
+        self,
+        py_query: dict,
+        top_k: builtins.int,
+        deleted: typing.Optional[typing.Any] = None,
+        allowed: typing.Optional[typing.Any] = None,
+    ) -> builtins.list[ScoredDocument]:
+        r"""
+        Search using MaxScore, skipping filtered documents. See
+        ``Index.search_maxscore_filtered``.
+        """
+    def search_wand_filtered(
+        self,
+        py_query: dict,
+        top_k: builtins.int,
+        deleted: typing.Optional[typing.Any] = None,
+        allowed: typing.Optional[typing.Any] = None,
+    ) -> builtins.list[ScoredDocument]:
+        r"""
+        Search using WAND, skipping filtered documents. See
+        ``Index.search_maxscore_filtered``.
+        """
+
+@typing.final
+class SegmentScoredDocument:
+    r"""
+    A document of a ``SegmentedIndex`` search result.
+    """
+    @property
+    def segment(self) -> builtins.int:
+        r"""
+        Position of the segment in the list given to ``SegmentedIndex``.
+        """
+    @property
+    def docid(self) -> builtins.int:
+        r"""
+        Document identifier within that segment.
+        """
+    @property
+    def score(self) -> builtins.float:
+        r"""
+        The relevance score.
+        """
+
+@typing.final
+class SegmentedIndex:
+    r"""
+    Several indices (segments of one collection) searched as one.
+
+    Each segment is searched with its own top-k, skipping its deleted
+    documents, and the results are merged into a global top-k. Scores must
+    be comparable across segments: compress them with a common
+    ``quantization`` range (a fixed ``(min, max)`` or the first segment's
+    ``quantizer()``). Which segments exist, and their tombstones, are the
+    caller's to keep.
+
+    Example:
+
+    ```python,ignore
+    segments = impact_index.SegmentedIndex([seg0, seg1])
+    hits = segments.search({42: 1.5}, top_k=10, deleted=[tomb0, None])
+    for hit in hits:
+        print(hit.segment, hit.docid, hit.score)
+    ```
+    """
+    def __new__(cls, segments: typing.Sequence[typing.Any]) -> SegmentedIndex:
+        r"""
+        Args:
+        segments: ``Index`` or ``ScoredIndex`` objects.
+        """
+    def __len__(self) -> builtins.int: ...
+    def search(
+        self,
+        py_query: dict,
+        top_k: builtins.int,
+        deleted: typing.Optional[typing.Any] = None,
+        allowed: typing.Optional[typing.Any] = None,
+        algorithm: builtins.str = "maxscore",
+        share_threshold: builtins.bool = True,
+    ) -> builtins.list[SegmentScoredDocument]:
+        r"""
+        Top-k documents over all segments, by decreasing score.
+
+        Args:
+            py_query: Map from term index to query weight.
+            top_k: Number of documents to return.
+            deleted: One entry per segment: ``None``, or the segment's
+                deleted documents (numpy boolean mask or sequence of docids).
+            allowed: One entry per segment: ``None``, or the only documents
+                that segment may return (same forms).
+            algorithm: ``"maxscore"`` (default) or ``"wand"``.
+            share_threshold: Pass the global k-th score found so far to the
+                next segment (searched largest first), so that small
+                segments prune harder. Results are the same either way, up
+                to ties at the k-th score.
         """
 
 @typing.final

@@ -8,6 +8,7 @@ use crate::{
     base::{DocId, ImpactValue, Len},
     search::{
         cursor::{as_bm25_compressed, TermCursor},
+        filter::{DocFilter, NoFilter, Remapped},
         ScoredDocument, TopScoredDocuments,
     },
 };
@@ -216,22 +217,64 @@ pub fn search_wand<'a>(
     query: &HashMap<TermIndex, ImpactValue>,
     top_k: usize,
 ) -> Vec<ScoredDocument> {
+    search_wand_with(index, query, top_k, NoFilter, 0.)
+}
+
+/// [`search_wand`] restricted to the documents `filter` accepts (checked
+/// once per candidate, before scoring; see
+/// [`crate::search::maxscore::search_maxscore_filtered`]).
+pub fn search_wand_filtered<'a, F: DocFilter>(
+    index: &'a dyn SparseIndex,
+    query: &HashMap<TermIndex, ImpactValue>,
+    top_k: usize,
+    filter: F,
+) -> Vec<ScoredDocument> {
+    search_wand_with(index, query, top_k, filter, 0.)
+}
+
+/// Shared entry point, `min_score` being an initial threshold (see
+/// [`crate::search::maxscore::search_maxscore_with`]).
+pub(crate) fn search_wand_with<'a, F: DocFilter>(
+    index: &'a dyn SparseIndex,
+    query: &HashMap<TermIndex, ImpactValue>,
+    top_k: usize,
+    filter: F,
+    min_score: ImpactValue,
+) -> Vec<ScoredDocument> {
     let query = &*crate::scoring::adjust_query(index, query);
-    let mut results = if let Some((compressed, bm25)) = as_bm25_compressed(index) {
-        search_wand_bm25_compressed(compressed, bm25, query, top_k)
-    } else {
-        search_wand_dyn(index, query, top_k)
+    let mut results = match index.reorder_map() {
+        Some(map) if !F::ACCEPTS_ALL => {
+            let filter = Remapped { map, inner: filter };
+            search_wand_dispatch(index, query, top_k, filter, min_score)
+        }
+        _ => search_wand_dispatch(index, query, top_k, filter, min_score),
     };
     crate::search::remap_to_original_ids(index, &mut results);
     results
 }
 
-/// Generic (dyn-dispatched) WAND: works for any index/scorer combination
-/// via `Box<dyn BlockTermImpactIterator>`.
-fn search_wand_dyn<'a>(
+fn search_wand_dispatch<'a, F: DocFilter>(
     index: &'a dyn SparseIndex,
     query: &HashMap<TermIndex, ImpactValue>,
     top_k: usize,
+    filter: F,
+    min_score: ImpactValue,
+) -> Vec<ScoredDocument> {
+    if let Some((compressed, bm25)) = as_bm25_compressed(index) {
+        search_wand_bm25_compressed(compressed, bm25, query, top_k, filter, min_score)
+    } else {
+        search_wand_dyn(index, query, top_k, filter, min_score)
+    }
+}
+
+/// Generic (dyn-dispatched) WAND: works for any index/scorer combination
+/// via `Box<dyn BlockTermImpactIterator>`.
+fn search_wand_dyn<'a, F: DocFilter>(
+    index: &'a dyn SparseIndex,
+    query: &HashMap<TermIndex, ImpactValue>,
+    top_k: usize,
+    filter: F,
+    min_score: ImpactValue,
 ) -> Vec<ScoredDocument> {
     let mut iterators = Vec::new();
 
@@ -255,18 +298,20 @@ fn search_wand_dyn<'a>(
         }
     }
 
-    search_wand_core(iterators, top_k)
+    search_wand_core(iterators, top_k, filter, min_score)
 }
 
 /// Monomorphized WAND for `CompressedIndex` + `BM25Scoring` (P3): builds one
 /// `CompressedScoringCursor<BM25TermScorer>` per query term (concrete type,
 /// no `Box<dyn _>`) and runs the same loop, instantiated for that concrete
 /// cursor type instead.
-fn search_wand_bm25_compressed(
+fn search_wand_bm25_compressed<F: DocFilter>(
     index: &crate::compress::CompressedIndex,
     model: &crate::scoring::bm25::BM25Scoring,
     query: &HashMap<TermIndex, ImpactValue>,
     top_k: usize,
+    filter: F,
+    min_score: ImpactValue,
 ) -> Vec<ScoredDocument> {
     let mut iterators = Vec::new();
 
@@ -290,7 +335,7 @@ fn search_wand_bm25_compressed(
         }
     }
 
-    search_wand_core(iterators, top_k)
+    search_wand_core(iterators, top_k, filter, min_score)
 }
 
 /// Runs the WAND core loop over pre-evaluated `(weight, cursor)` pairs --
@@ -321,14 +366,19 @@ pub fn search_wand_cursors<'a>(
             }));
         }
     }
-    search_wand_core(iterators, top_k)
+    search_wand_core(iterators, top_k, NoFilter, 0.)
 }
 
 /// Shared WAND loop, generic over the cursor type `C` (P3): monomorphized
 /// once per (index, scorer) combination that reaches it.
-fn search_wand_core<C: TermCursor>(
+///
+/// `filter` is checked per candidate (a constant `true` for [`NoFilter`]);
+/// `min_score` (`>= 0`) is the initial threshold.
+fn search_wand_core<C: TermCursor, F: DocFilter>(
     iterators: Vec<Box<BlockTermImpactIteratorWrapper<C>>>,
     top_k: usize,
+    filter: F,
+    min_score: ImpactValue,
 ) -> Vec<ScoredDocument> {
     let mut search = WandSearch {
         cur_doc: None,
@@ -343,10 +393,15 @@ fn search_wand_core<C: TermCursor>(
         .sort_by(|a, b| a.cached_docid.cmp(&b.cached_docid));
 
     let mut results = TopScoredDocuments::new(top_k);
-    let mut theta: ImpactValue = 0.;
+    let min_theta = min_score.max(0.);
+    let mut theta: ImpactValue = min_theta;
 
     // Loop until there are no more candidates
     while let Some(candidate) = search.next(theta) {
+        // Filtered out: the next call moves past it (it is `cur_doc`)
+        if !filter.accept(candidate) {
+            continue;
+        }
         // Score the candidate with early termination:
         // Start with the block-max upper bound and tighten it as we score.
         // If the tightened bound drops below theta, stop early (PISA trick).
@@ -381,7 +436,7 @@ fn search_wand_core<C: TermCursor>(
 
         if !dominated {
             // Update the heap
-            theta = results.add(candidate, score as f32).max(0.);
+            theta = results.add(candidate, score as f32).max(min_theta);
         }
     }
 
@@ -409,7 +464,7 @@ mod tests {
         },
         docmeta::DocMetadata,
         scoring::{bm25::BM25Scoring, ScoredIndex},
-        search::wand::search_wand_dyn,
+        search::{filter::NoFilter, wand::search_wand_dyn},
         transforms::IndexTransform,
     };
 
@@ -500,7 +555,7 @@ mod tests {
 
         for (qi, query) in queries.iter().enumerate() {
             for &top_k in &[1usize, 5, 10, 50] {
-                let dyn_results = search_wand_dyn(&scored, query, top_k);
+                let dyn_results = search_wand_dyn(&scored, query, top_k, NoFilter, 0.);
                 // `search_wand` dispatches to the typed fast path since
                 // `scored` is a `ScoredIndex<CompressedIndex, BM25Scoring>`.
                 let typed_results = search_wand(&scored, query, top_k);

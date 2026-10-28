@@ -28,7 +28,7 @@ use crate::{
     utils::buffer::{Buffer, MemoryBuffer, MmapBuffer, Slice},
 };
 use indicatif::{ProgressBar, ProgressIterator, ProgressStyle};
-use log::{debug, info};
+use log::{debug, info, warn};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -241,6 +241,13 @@ pub trait ImpactCompressor: Compressor<ImpactValue> {
     /// index with a codec that doesn't.
     fn lossless(&self) -> bool {
         false
+    }
+
+    /// Quantisation parameters, for the quantising codecs (`None`
+    /// otherwise). Passing them as a [`impact::QuantizationRange::Reference`]
+    /// makes another index decode impacts exactly like this one.
+    fn quantizer(&self) -> Option<impact::QuantizerParams> {
+        None
     }
 }
 
@@ -1862,6 +1869,10 @@ impl SparseIndex for CompressedIndex {
         self.reorder_map.as_ref()
     }
 
+    fn quantizer(&self) -> Option<impact::QuantizerParams> {
+        self.information.values_compressor.quantizer()
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -1930,6 +1941,18 @@ struct CompressedTermResult {
     impact_bytes: Vec<u8>,
     /// Empty when the index has no positions.
     positions_bytes: Vec<u8>,
+    /// Impacts outside the quantizer's range (clamped when encoded).
+    clamped: u64,
+}
+
+/// What [`CompressionTransform::compress`] reports about a build.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompressionReport {
+    /// Number of impacts outside the quantisation range, hence clamped to
+    /// it. Always `0` for a range computed from the index itself
+    /// ([`impact::QuantizationRange::PerIndex`]); with a fixed or reference
+    /// range, a non-zero count suggests starting a new reference.
+    pub clamped_impacts: u64,
 }
 
 /// Chunk size for parallel compression (number of terms per batch).
@@ -1961,11 +1984,23 @@ fn resolve_positions_compressor(
 }
 
 impl IndexTransform for CompressionTransform {
+    /// Compress the impact values using chunked parallel processing (see
+    /// [`CompressionTransform::compress`], which also returns a report).
+    fn process(&self, path: &Path, index: &dyn SparseIndexView) -> Result<(), std::io::Error> {
+        self.compress(path, index).map(|_| ())
+    }
+}
+
+impl CompressionTransform {
     /// Compress the impact values using chunked parallel processing.
     ///
     /// Terms are processed in chunks to limit memory usage: each chunk is
     /// compressed in parallel with rayon, written to disk, then freed.
-    fn process(&self, path: &Path, index: &dyn SparseIndexView) -> Result<(), std::io::Error> {
+    pub fn compress(
+        &self,
+        path: &Path,
+        index: &dyn SparseIndexView,
+    ) -> Result<CompressionReport, std::io::Error> {
         use std::io::BufWriter;
 
         // Create the directory if needed
@@ -1977,7 +2012,9 @@ impl IndexTransform for CompressionTransform {
         let doc_ids_compressor = self.doc_ids_compressor_factory.create(index);
         let values_compressor = self.impacts_compressor_factory.create(index);
         let max_block_size = self.max_block_size;
+        let quantizer_range = values_compressor.quantizer().map(|q| (q.min, q.max));
         let lossless = values_compressor.lossless();
+        let mut clamped_impacts: u64 = 0;
 
         // Positions are opt-in per source index: a query that never calls
         // `positions()` must never read a byte of `positions.dat`, so a
@@ -2081,6 +2118,7 @@ impl IndexTransform for CompressionTransform {
                         min_dl: 0,
                     };
                     let mut max_doc_id = 0;
+                    let mut clamped: u64 = 0;
                     let mut decoded: Vec<ImpactValue> = Vec::new();
                     let mut docid_position: u64 = 0;
                     let mut impact_position: u64 = 0;
@@ -2175,6 +2213,11 @@ impl IndexTransform for CompressionTransform {
 
                         assert!(max_doc_id >= min_doc_id);
 
+                        if let Some((min, max)) = quantizer_range {
+                            clamped +=
+                                impacts.iter().filter(|&&v| v < min || v > max).count() as u64;
+                        }
+
                         doc_ids_compressor.write(&mut docid_buf, &docids, term_index, &block_info);
                         values_compressor.write(&mut impact_buf, &impacts, term_index, &block_info);
 
@@ -2226,6 +2269,7 @@ impl IndexTransform for CompressionTransform {
                         docid_bytes: docid_buf,
                         impact_bytes: impact_buf,
                         positions_bytes: positions_buf,
+                        clamped,
                     }
                 })
                 .collect();
@@ -2250,6 +2294,7 @@ impl IndexTransform for CompressionTransform {
                 docid_offset += result.docid_bytes.len() as u64;
                 impact_offset += result.impact_bytes.len() as u64;
                 positions_offset += result.positions_bytes.len() as u64;
+                clamped_impacts += result.clamped;
 
                 terms_info.push(result.info);
             }
@@ -2319,7 +2364,16 @@ impl IndexTransform for CompressionTransform {
             )?;
         }
 
-        save_index(Box::new(stub), path)
+        save_index(Box::new(stub), path)?;
+
+        if clamped_impacts > 0 {
+            warn!(
+                "{} impacts were outside the quantization range {:?} and clamped",
+                clamped_impacts,
+                quantizer_range.unwrap()
+            );
+        }
+        Ok(CompressionReport { clamped_impacts })
     }
 }
 

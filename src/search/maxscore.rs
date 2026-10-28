@@ -15,6 +15,7 @@ use crate::{
     index::SparseIndex,
     search::{
         cursor::{as_bm25_compressed, TermCursor},
+        filter::{DocFilter, NoFilter, Remapped},
         ScoredDocument, TopScoredDocuments,
     },
 };
@@ -83,7 +84,7 @@ impl<C: TermCursor> MaxScoreTermIterator<C> {
 }
 
 /// Options for the MaxScore search algorithm.
-#[derive(Derivative)]
+#[derive(Derivative, Clone, Copy, Debug)]
 #[derivative(Default)]
 pub struct MaxScoreOptions {
     /// If `true`, orders term iterators by posting list length (increasing),
@@ -116,23 +117,72 @@ pub fn search_maxscore<'a>(
     top_k: usize,
     options: MaxScoreOptions,
 ) -> Vec<ScoredDocument> {
+    search_maxscore_with(index, query, top_k, &options, NoFilter, 0.)
+}
+
+/// [`search_maxscore`] restricted to the documents `filter` accepts.
+///
+/// The filter is checked once per candidate, before scoring its passive
+/// terms and inserting it in the heap; rejected documents never raise the
+/// threshold, so the result is exactly the top-k of the accepted documents.
+/// Doc ids given to the filter are original ids for a reordered index.
+pub fn search_maxscore_filtered<'a, F: DocFilter>(
+    index: &'a dyn SparseIndex,
+    query: &HashMap<TermIndex, ImpactValue>,
+    top_k: usize,
+    options: MaxScoreOptions,
+    filter: F,
+) -> Vec<ScoredDocument> {
+    search_maxscore_with(index, query, top_k, &options, filter, 0.)
+}
+
+/// Shared entry point: `min_score` is an initial threshold (documents
+/// scoring at most `min_score` may be pruned), used by segmented search to
+/// carry the global k-th score into the next segment.
+pub(crate) fn search_maxscore_with<'a, F: DocFilter>(
+    index: &'a dyn SparseIndex,
+    query: &HashMap<TermIndex, ImpactValue>,
+    top_k: usize,
+    options: &MaxScoreOptions,
+    filter: F,
+    min_score: ImpactValue,
+) -> Vec<ScoredDocument> {
     let query = &*crate::scoring::adjust_query(index, query);
-    let mut results = if let Some((compressed, bm25)) = as_bm25_compressed(index) {
-        search_maxscore_bm25_compressed(compressed, bm25, query, top_k, &options)
-    } else {
-        search_maxscore_dyn(index, query, top_k, options)
+    let mut results = match index.reorder_map() {
+        Some(map) if !F::ACCEPTS_ALL => {
+            let filter = Remapped { map, inner: filter };
+            search_maxscore_dispatch(index, query, top_k, options, filter, min_score)
+        }
+        _ => search_maxscore_dispatch(index, query, top_k, options, filter, min_score),
     };
     crate::search::remap_to_original_ids(index, &mut results);
     results
 }
 
-/// Generic (dyn-dispatched) MaxScore: works for any index/scorer
-/// combination via `Box<dyn BlockTermImpactIterator>`.
-fn search_maxscore_dyn<'a>(
+fn search_maxscore_dispatch<'a, F: DocFilter>(
     index: &'a dyn SparseIndex,
     query: &HashMap<TermIndex, ImpactValue>,
     top_k: usize,
-    options: MaxScoreOptions,
+    options: &MaxScoreOptions,
+    filter: F,
+    min_score: ImpactValue,
+) -> Vec<ScoredDocument> {
+    if let Some((compressed, bm25)) = as_bm25_compressed(index) {
+        search_maxscore_bm25_compressed(compressed, bm25, query, top_k, options, filter, min_score)
+    } else {
+        search_maxscore_dyn(index, query, top_k, options, filter, min_score)
+    }
+}
+
+/// Generic (dyn-dispatched) MaxScore: works for any index/scorer
+/// combination via `Box<dyn BlockTermImpactIterator>`.
+fn search_maxscore_dyn<'a, F: DocFilter>(
+    index: &'a dyn SparseIndex,
+    query: &HashMap<TermIndex, ImpactValue>,
+    top_k: usize,
+    options: &MaxScoreOptions,
+    filter: F,
+    min_score: ImpactValue,
 ) -> Vec<ScoredDocument> {
     let mut active = Vec::new();
 
@@ -164,19 +214,27 @@ fn search_maxscore_dyn<'a>(
         }
     }
 
-    search_maxscore_core(active, top_k, options.length_based_ordering)
+    search_maxscore_core(
+        active,
+        top_k,
+        options.length_based_ordering,
+        filter,
+        min_score,
+    )
 }
 
 /// Monomorphized MaxScore for `CompressedIndex` + `BM25Scoring` (P3):
 /// builds one `CompressedScoringCursor<BM25TermScorer>` per query term
 /// (concrete type, no `Box<dyn _>`) and runs the same loop as the generic
 /// path, instantiated for that concrete cursor type instead.
-fn search_maxscore_bm25_compressed(
+fn search_maxscore_bm25_compressed<F: DocFilter>(
     index: &crate::compress::CompressedIndex,
     model: &crate::scoring::bm25::BM25Scoring,
     query: &HashMap<TermIndex, ImpactValue>,
     top_k: usize,
     options: &MaxScoreOptions,
+    filter: F,
+    min_score: ImpactValue,
 ) -> Vec<ScoredDocument> {
     let mut active = Vec::new();
 
@@ -207,7 +265,13 @@ fn search_maxscore_bm25_compressed(
         }
     }
 
-    search_maxscore_core(active, top_k, options.length_based_ordering)
+    search_maxscore_core(
+        active,
+        top_k,
+        options.length_based_ordering,
+        filter,
+        min_score,
+    )
 }
 
 /// Runs the MaxScore core loop over pre-evaluated `(weight, cursor)` pairs
@@ -250,19 +314,25 @@ pub fn search_maxscore_cursors<'a>(
         }
     }
 
-    search_maxscore_core(active, top_k, options.length_based_ordering)
+    search_maxscore_core(active, top_k, options.length_based_ordering, NoFilter, 0.)
 }
 
 /// Shared MaxScore loop, generic over the cursor type `C` (P3): monomorphized
 /// once per (index, scorer) combination that reaches it, so the body below
 /// compiles to a fully statically-dispatched loop for each instantiation.
-fn search_maxscore_core<C: TermCursor>(
+///
+/// `filter` is checked per candidate (a constant `true` for [`NoFilter`]);
+/// `min_score` (`>= 0`) is the initial threshold.
+fn search_maxscore_core<C: TermCursor, F: DocFilter>(
     mut active: Vec<MaxScoreTermIterator<C>>,
     top_k: usize,
     length_based_ordering: bool,
+    filter: F,
+    min_score: ImpactValue,
 ) -> Vec<ScoredDocument> {
     let mut results = TopScoredDocuments::new(top_k);
-    let mut theta: f64 = 0.;
+    let min_theta = min_score.max(0.);
+    let mut theta: f64 = min_theta as f64;
 
     if length_based_ordering {
         // Sort by posting list length (increasing, so that the longest will be passive first)
@@ -321,6 +391,9 @@ fn search_maxscore_core<C: TermCursor>(
                     true
                 }
             });
+        } else if !filter.accept(candidate) {
+            // Filtered out: move past it without scoring
+            active.retain_mut(|t| t.impact.docid != candidate || t.next());
         } else {
             // Score active terms first (they contribute the most)
             let mut score = 0f64;
@@ -361,7 +434,7 @@ fn search_maxscore_core<C: TermCursor>(
             }
 
             // check against heap, update if needed
-            theta = results.add(candidate, score as f32).max(0.) as f64;
+            theta = results.add(candidate, score as f32).max(min_theta) as f64;
         }
 
         // try to expand passive set
@@ -399,6 +472,7 @@ mod tests {
         },
         docmeta::DocMetadata,
         scoring::{bm25::BM25Scoring, ScoredIndex},
+        search::filter::NoFilter,
         search::maxscore::{search_maxscore_dyn, MaxScoreOptions},
         transforms::IndexTransform,
     };
@@ -494,8 +568,14 @@ mod tests {
 
         for (qi, query) in queries.iter().enumerate() {
             for &top_k in &[1usize, 5, 10, 50] {
-                let dyn_results =
-                    search_maxscore_dyn(&scored, query, top_k, MaxScoreOptions::default());
+                let dyn_results = search_maxscore_dyn(
+                    &scored,
+                    query,
+                    top_k,
+                    &MaxScoreOptions::default(),
+                    NoFilter,
+                    0.,
+                );
                 // `search_maxscore` dispatches to the typed fast path since
                 // `scored` is a `ScoredIndex<CompressedIndex, BM25Scoring>`.
                 let typed_results =

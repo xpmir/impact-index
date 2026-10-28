@@ -2,6 +2,9 @@
 //!
 //! - [`Quantizer`]: Fixed-range uniform quantization to N bits
 //! - [`GlobalQuantizerFactory`]: Auto-ranging quantizer using global min/max
+//! - [`RangedQuantizerFactory`]: Quantizer with an explicit
+//!   [`QuantizationRange`] (per index, fixed, or copied from a reference
+//!   index), for segments whose scores must be comparable
 //! - [`Identity`]: No compression (stores raw f32 values)
 
 use core::f32;
@@ -33,6 +36,101 @@ fn quantization_step(min: ImpactValue, max: ImpactValue, levels: u32) -> ImpactV
     (max - min) / (levels as f32)
 }
 
+/// Parameters shared by the quantising codecs ([`Quantizer`],
+/// [`QuantizedBitPackedCompressor`]): level `q` decodes to
+/// `q * step + min + step / 2`, and values outside `[min, max]` are clamped
+/// to the first / last level.
+///
+/// Two indices built with the same parameters decode the same raw weight to
+/// the same value, whichever of the two codecs each uses.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub struct QuantizerParams {
+    /// Number of bits per quantized value.
+    pub nbits: u32,
+    /// Minimum value of the quantization range.
+    pub min: ImpactValue,
+    /// Maximum value of the quantization range.
+    pub max: ImpactValue,
+    /// Quantization step size.
+    pub step: ImpactValue,
+}
+
+impl QuantizerParams {
+    /// Parameters tiling `[min, max]` with `2^nbits` levels.
+    pub fn new(nbits: u32, min: ImpactValue, max: ImpactValue) -> Self {
+        Self {
+            nbits,
+            min,
+            max,
+            step: quantization_step(min, max, 1u32 << nbits),
+        }
+    }
+}
+
+/// How a quantising codec chooses its value range.
+///
+/// With [`QuantizationRange::PerIndex`], each index uses its own min/max, so
+/// the same weight decodes to slightly different values in different indices
+/// (at most one quantisation step, `(max - min) / 2^nbits`, per posting:
+/// negligible at 16 bits, visible at 8). The two other modes give every
+/// index the same parameters, hence exactly comparable scores.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum QuantizationRange {
+    /// Min/max of the index being compressed.
+    #[default]
+    PerIndex,
+    /// A range given by the caller (e.g. `[0, 3]` for SPLADE); values
+    /// outside it are clamped.
+    Fixed { min: ImpactValue, max: ImpactValue },
+    /// The parameters of an existing index (see
+    /// [`crate::index::SparseIndex::quantizer`]), typically the first
+    /// segment; values outside its range are clamped. Its `nbits` wins
+    /// over the factory's.
+    Reference(QuantizerParams),
+}
+
+impl QuantizationRange {
+    /// The parameters to compress `index` with, at `nbits` bits.
+    pub fn resolve(&self, nbits: u32, index: &dyn SparseIndexView) -> QuantizerParams {
+        match *self {
+            QuantizationRange::PerIndex => {
+                let (min, max) = index_value_range(index);
+                log::info!("Quantizer bounds: {}-{}", min, max);
+                QuantizerParams::new(nbits, min, max)
+            }
+            QuantizationRange::Fixed { min, max } => {
+                assert!(
+                    min < max,
+                    "quantization range: min ({min}) must be below max ({max})"
+                );
+                QuantizerParams::new(nbits, min, max)
+            }
+            QuantizationRange::Reference(params) => {
+                if params.nbits != nbits {
+                    log::warn!(
+                        "Reference quantizer has {} bits, using it instead of {}",
+                        params.nbits,
+                        nbits
+                    );
+                }
+                params
+            }
+        }
+    }
+}
+
+/// Global (min, max) impact over all terms.
+fn index_value_range(index: &dyn SparseIndexView) -> (ImpactValue, ImpactValue) {
+    let mut min = ImpactValue::INFINITY;
+    let mut max = -ImpactValue::INFINITY;
+    for term_ix in 0..index.len() {
+        let (term_min, term_max) = index.value_range(term_ix);
+        min = min.min(term_min);
+        max = max.max(term_max);
+    }
+    (min, max)
+}
+
 /// Uniform quantizer that maps floating-point impact values to N-bit integers.
 ///
 /// Values are linearly mapped from `[min, max]` into `2^nbits` levels.
@@ -62,6 +160,17 @@ impl Quantizer {
             step: quantization_step(min, max, levels),
         }
     }
+
+    /// A quantizer with the given parameters.
+    pub fn from_params(params: QuantizerParams) -> Self {
+        Self {
+            nbits: params.nbits,
+            levels: 1 << params.nbits,
+            step: params.step,
+            min: params.min,
+            max: params.max,
+        }
+    }
 }
 
 /// Factory that creates a [`Quantizer`] with min/max determined from the index.
@@ -77,15 +186,7 @@ impl ImpactCompressorFactory for GlobalQuantizerFactory {
             "Computing global minimum and maximum impact (quantizer) over {} terms",
             index.len()
         );
-        let mut min = ImpactValue::INFINITY;
-        let mut max = -ImpactValue::INFINITY;
-
-        // Compute the maximum over all terms
-        for term_ix in 0..index.len() {
-            let (term_min, term_max) = index.value_range(term_ix);
-            min = min.min(term_min);
-            max = max.max(term_max);
-        }
+        let (min, max) = index_value_range(index);
         log::info!("Quantizer bounds: {}-{}", min, max);
         Box::new(Quantizer::new(self.nbits, min, max))
     }
@@ -96,7 +197,16 @@ impl ImpactCompressorFactory for GlobalQuantizerFactory {
 }
 
 #[typetag::serde]
-impl ImpactCompressor for Quantizer {}
+impl ImpactCompressor for Quantizer {
+    fn quantizer(&self) -> Option<QuantizerParams> {
+        Some(QuantizerParams {
+            nbits: self.nbits,
+            min: self.min,
+            max: self.max,
+            step: self.step,
+        })
+    }
+}
 
 impl ImpactCompressorFactory for Quantizer {
     fn create(&self, _index: &dyn crate::index::SparseIndexView) -> Box<dyn ImpactCompressor> {
@@ -418,7 +528,28 @@ pub struct QuantizedBitPackedCompressor {
 }
 
 #[typetag::serde]
-impl ImpactCompressor for QuantizedBitPackedCompressor {}
+impl ImpactCompressor for QuantizedBitPackedCompressor {
+    fn quantizer(&self) -> Option<QuantizerParams> {
+        Some(QuantizerParams {
+            nbits: self.nbits,
+            min: self.min,
+            max: self.max,
+            step: self.step,
+        })
+    }
+}
+
+impl QuantizedBitPackedCompressor {
+    /// A compressor with the given parameters.
+    pub fn from_params(params: QuantizerParams) -> Self {
+        Self {
+            nbits: params.nbits,
+            step: params.step,
+            min: params.min,
+            max: params.max,
+        }
+    }
+}
 
 /// Factory that creates a [`QuantizedBitPackedCompressor`] with min/max from the index.
 #[derive(Clone)]
@@ -428,13 +559,7 @@ pub struct QuantizedBitPackedFactory {
 
 impl ImpactCompressorFactory for QuantizedBitPackedFactory {
     fn create(&self, index: &dyn SparseIndexView) -> Box<dyn ImpactCompressor> {
-        let mut min = ImpactValue::INFINITY;
-        let mut max = -ImpactValue::INFINITY;
-        for term_ix in 0..index.len() {
-            let (term_min, term_max) = index.value_range(term_ix);
-            min = min.min(term_min);
-            max = max.max(term_max);
-        }
+        let (min, max) = index_value_range(index);
         let step = quantization_step(min, max, 1u32 << self.nbits);
         Box::new(QuantizedBitPackedCompressor {
             nbits: self.nbits,
@@ -442,6 +567,45 @@ impl ImpactCompressorFactory for QuantizedBitPackedFactory {
             min,
             max,
         })
+    }
+
+    fn clone(&self) -> Box<dyn ImpactCompressorFactory> {
+        Box::new(Clone::clone(self))
+    }
+}
+
+/// Which quantising codec a [`RangedQuantizerFactory`] produces.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QuantizerCodec {
+    /// [`Quantizer`]: fixed `nbits` per value.
+    Plain,
+    /// [`QuantizedBitPackedCompressor`]: adaptive bit-packing of the levels.
+    #[default]
+    BitPacked,
+}
+
+/// Quantizer factory with an explicit [`QuantizationRange`];
+/// [`QuantizationRange::PerIndex`] makes it equivalent to
+/// [`GlobalQuantizerFactory`] / [`QuantizedBitPackedFactory`].
+#[derive(Clone, Debug)]
+pub struct RangedQuantizerFactory {
+    /// Number of bits for quantization (overridden by a `Reference` range).
+    pub nbits: u32,
+    /// How the range is chosen.
+    pub range: QuantizationRange,
+    /// Which codec to produce.
+    pub codec: QuantizerCodec,
+}
+
+impl ImpactCompressorFactory for RangedQuantizerFactory {
+    fn create(&self, index: &dyn SparseIndexView) -> Box<dyn ImpactCompressor> {
+        let params = self.range.resolve(self.nbits, index);
+        match self.codec {
+            QuantizerCodec::Plain => Box::new(Quantizer::from_params(params)),
+            QuantizerCodec::BitPacked => {
+                Box::new(QuantizedBitPackedCompressor::from_params(params))
+            }
+        }
     }
 
     fn clone(&self) -> Box<dyn ImpactCompressorFactory> {
