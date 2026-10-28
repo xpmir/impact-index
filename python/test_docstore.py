@@ -189,3 +189,50 @@ class TestAsyncDocumentStore:
         docs = await store.aio_get_by_key("id", ["k1"])
         assert len(docs) == 1
         assert docs[0] is not None
+
+
+class TestKeys:
+    """Document number <-> key lookups, key-only stores, given numbers."""
+
+    @pytest.mark.parametrize("content", [True, False])
+    def test_keys_both_ways(self, tmp_path, content):
+        store_dir = str(tmp_path / "store")
+        builder = impact_index.DocumentStoreBuilder(store_dir, content=content)
+        # Document numbers = index document ids, with gaps
+        builder.add({"docno": "D-a"}, b"first", docid=0)
+        builder.add(
+            {"docno": "D-b", "url": "https://example.org/b"}, b"second", docid=4
+        )
+        builder.add({"docno": "D-c"}, docid=9)
+        builder.build()
+
+        store = impact_index.DocumentStore.load(store_dir)
+        assert store.has_content() == content
+        assert store.num_documents() == 10
+        assert store.get_keys("docno", [0, 1, 4, 9, 10]) == [
+            "D-a",
+            None,
+            "D-b",
+            "D-c",
+            None,
+        ]
+        assert store.get_keys("url", [0, 4]) == [None, "https://example.org/b"]
+        assert store.get_numbers("docno", ["D-c", "D-x"]) == [9, None]
+
+        doc = store.get_by_key("docno", ["D-b"])[0]
+        assert doc.internal_id == 4
+        assert doc.keys["url"] == "https://example.org/b"
+        assert doc.content == (b"second" if content else b"")
+
+    def test_numbers_must_increase(self, tmp_path):
+        builder = impact_index.DocumentStoreBuilder(
+            str(tmp_path / "store"), content=False
+        )
+        builder.add({"docno": "D-a"}, docid=5)
+        with pytest.raises(RuntimeError):
+            builder.add({"docno": "D-b"}, docid=5)
+        # Without docid: the next number
+        builder.add({"docno": "D-b"})
+        builder.build()
+        store = impact_index.DocumentStore.load(str(tmp_path / "store"))
+        assert store.get_numbers("docno", ["D-b"]) == [6]

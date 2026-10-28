@@ -1759,27 +1759,35 @@ impl PyDocumentStoreBuilder {
     ///           automatically checkpoint every ``N`` added documents.
     ///         - ``None``: recover from any existing checkpoint, but never
     ///           auto-checkpoint — call ``checkpoint()`` manually.
+    ///     content: If ``False``, a key-only store: only the keys are
+    ///         stored (and can be looked up both ways), not the documents'
+    ///         content.
     #[new]
-    #[pyo3(signature = (folder, block_size=4096, zstd_level=3, checkpoint_frequency=Some(0)))]
+    #[pyo3(signature = (folder, block_size=4096, zstd_level=3, checkpoint_frequency=Some(0), content=true))]
     fn new(
         folder: &str,
         block_size: usize,
         zstd_level: i32,
         checkpoint_frequency: Option<u64>,
+        content: bool,
     ) -> PyResult<Self> {
         let opts = docstore::builder::BuilderOptions {
             block_size,
             zstd_level,
             checkpoint_frequency,
         };
-        let builder =
-            docstore::builder::DocumentStoreBuilder::new_with_options(Path::new(folder), &opts)
-                .map_err(|e| {
-                    pyo3::exceptions::PyIOError::new_err(format!(
-                        "Failed to create DocumentStoreBuilder: {}",
-                        e
-                    ))
-                })?;
+        let path = Path::new(folder);
+        let builder = if content {
+            docstore::builder::DocumentStoreBuilder::new_with_options(path, &opts)
+        } else {
+            docstore::builder::DocumentStoreBuilder::new_keys_only(path, &opts)
+        };
+        let builder = builder.map_err(|e| {
+            pyo3::exceptions::PyIOError::new_err(format!(
+                "Failed to create DocumentStoreBuilder: {}",
+                e
+            ))
+        })?;
         Ok(Self {
             builder: Some(builder),
         })
@@ -1788,22 +1796,32 @@ impl PyDocumentStoreBuilder {
     /// Add a document. Returns ``True`` if this call triggered an automatic
     /// checkpoint (only possible when ``checkpoint_frequency`` is a positive
     /// integer).
+    ///
+    /// Args:
+    ///     keys: Key values of the document (e.g. ``{"docno": "D1"}``).
+    ///     content: Document content (ignored by key-only stores).
+    ///     docid: Document number, e.g. the document's id in an index; must
+    ///         be larger than the previous ones, and skipped numbers have no
+    ///         document. By default, the next number.
+    #[pyo3(signature = (keys, content=None, docid=None))]
     fn add(
         &mut self,
         keys: HashMap<String, String>,
-        content: &Bound<'_, PyBytes>,
+        content: Option<&Bound<'_, PyBytes>>,
+        docid: Option<u64>,
     ) -> PyResult<bool> {
         let doc = docstore::DocumentData {
             keys,
-            content: content.as_bytes().to_vec(),
+            content: content.map_or_else(Vec::new, |c| c.as_bytes().to_vec()),
         };
-        self.builder
-            .as_mut()
-            .ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("Builder already consumed by build()")
-            })?
-            .add(&doc)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{}", e)))
+        let builder = self.builder.as_mut().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Builder already consumed by build()")
+        })?;
+        match docid {
+            Some(docid) => builder.add_with_docid(docid, &doc),
+            None => builder.add(&doc),
+        }
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{}", e)))
     }
 
     /// Number of documents added so far (including any restored from a checkpoint).
@@ -1875,6 +1893,29 @@ impl PyDocumentStore {
 
     fn key_names(&self) -> Vec<String> {
         self.store.key_names().to_vec()
+    }
+
+    /// Whether the store holds the documents' content (``False`` for
+    /// key-only stores).
+    fn has_content(&self) -> bool {
+        self.store.has_content()
+    }
+
+    /// Values of the key ``key_name`` for the given document numbers
+    /// (``None`` if there is no such document, or it has no such key).
+    fn get_keys(&self, key_name: &str, doc_numbers: Vec<u64>) -> PyResult<Vec<Option<String>>> {
+        self.store
+            .get_keys(key_name, &doc_numbers)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{}", e)))
+    }
+
+    /// Document numbers of the given values of the key ``key_name``
+    /// (``None`` if not found).
+    fn get_numbers(&self, key_name: &str, key_values: Vec<String>) -> PyResult<Vec<Option<u64>>> {
+        let refs: Vec<&str> = key_values.iter().map(|s| s.as_str()).collect();
+        self.store
+            .get_numbers(key_name, &refs)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{}", e)))
     }
 
     fn get_by_number(&self, doc_numbers: Vec<u64>) -> PyResult<Vec<PyDocument>> {

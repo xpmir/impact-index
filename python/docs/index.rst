@@ -31,7 +31,8 @@ Features
   one-step migration (``Index.update(path)``)
 - **Approximate search** over learned impacts with
   :ref:`BMP (Block-Max Pruning) <bmp>` and :ref:`Seismic <seismic>`
-- **Document store** with zstd compression and key-based retrieval
+- **Document store** with zstd compression, key-based retrieval and
+  document id ↔ key (e.g. ``docno``) mapping, or key-only
 - **Async support** for non-blocking search and document retrieval
 
 Performance

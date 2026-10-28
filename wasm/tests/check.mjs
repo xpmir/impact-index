@@ -12,7 +12,7 @@ import { createRequire } from "node:module";
 
 const [pkgDir, fixtureDir] = process.argv.slice(2);
 const require = createRequire(import.meta.url);
-const { Builder, Index, DocSet, SegmentedIndex, memoryBytes } = require(join(pkgDir, "impact_index_wasm.js"));
+const { Builder, Index, DocSet, SegmentedIndex, KeyStoreBuilder, DocumentStore, memoryBytes } = require(join(pkgDir, "impact_index_wasm.js"));
 
 /** Map from paths relative to `dir` to their contents */
 function readIndex(dir) {
@@ -136,6 +136,54 @@ if (fixture.docs) {
     builder.add(0, new Uint32Array([1]), new Float32Array([1]));
     failures++;
   } catch (e) {}
+}
+
+// Key-only document store: built natively, loaded in WASM, and rebuilt in
+// WASM byte for byte
+{
+  const native = readIndex(join(fixtureDir, "docstore"));
+  const store = DocumentStore.load(native);
+  const hits = compressed.search(...queries[0], 10);
+  const docnos = store.getKeys("docno", hits.docids);
+  hits.docids.forEach((d, i) => {
+    const expected = d % 2 === 0 ? `D${d}` : undefined;
+    if (docnos[i] !== expected) {
+      failures++;
+      console.error(`docno of ${d}: ${docnos[i]}`);
+    }
+  });
+  const ids = store.getDocids("docno", ["D0", "D10", "D11", "nope"]);
+  if (!(ids[0] === 0 && ids[1] === 10 && ids[2] === undefined && ids[3] === undefined)) {
+    failures++;
+    console.error("getDocids", ids);
+  }
+  if (store.hasContent || store.numDocuments !== fixture.num_docs - 1 || !store.contains(4) || store.contains(5)) {
+    failures++;
+    console.error("store properties", store.hasContent, store.numDocuments);
+  }
+
+  const builder = new KeyStoreBuilder();
+  for (let d = 0; d < fixture.num_docs; d += 2) builder.add({ docno: `D${d}` }, d);
+  const built = builder.finish();
+  for (const [name, bytes] of native) {
+    const other = built.get(name);
+    if (!other || other.length !== bytes.length || other.some((b, i) => b !== bytes[i])) {
+      failures++;
+      console.error(`docstore ${name} differs between the WASM and native builds`);
+    }
+  }
+  try {
+    builder.add({ docno: "late" });
+    failures++;
+  } catch (e) {}
+  const seq = new KeyStoreBuilder();
+  if (seq.add({ docno: "a" }) !== 0 || seq.add({ docno: "b", url: "u" }) !== 1) failures++;
+  const s2 = DocumentStore.load(seq.finish());
+  if (s2.getKeys("url", new Uint32Array([0, 1])).join() !== ",u") {
+    failures++;
+    console.error("sequential store", s2.getKeys("url", new Uint32Array([0, 1])));
+  }
+  console.log(`docstore: ${store.numDocuments} document ids, keys ${store.keyNames}`);
 }
 
 // Errors surface as exceptions, and the instance keeps working

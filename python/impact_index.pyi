@@ -187,6 +187,25 @@ class DocumentStore:
     ) -> DocumentStore: ...
     def num_documents(self) -> builtins.int: ...
     def key_names(self) -> builtins.list[builtins.str]: ...
+    def has_content(self) -> builtins.bool:
+        r"""
+        Whether the store holds the documents' content (``False`` for
+        key-only stores).
+        """
+    def get_keys(
+        self, key_name: builtins.str, doc_numbers: typing.Sequence[builtins.int]
+    ) -> builtins.list[typing.Optional[builtins.str]]:
+        r"""
+        Values of the key ``key_name`` for the given document numbers
+        (``None`` if there is no such document, or it has no such key).
+        """
+    def get_numbers(
+        self, key_name: builtins.str, key_values: typing.Sequence[builtins.str]
+    ) -> builtins.list[typing.Optional[builtins.int]]:
+        r"""
+        Document numbers of the given values of the key ``key_name``
+        (``None`` if not found).
+        """
     def get_by_number(
         self, doc_numbers: typing.Sequence[builtins.int]
     ) -> builtins.list[Document]: ...
@@ -208,6 +227,7 @@ class DocumentStoreBuilder:
         block_size: builtins.int = 4096,
         zstd_level: builtins.int = 3,
         checkpoint_frequency: typing.Optional[builtins.int] = 0,
+        content: builtins.bool = True,
     ) -> DocumentStoreBuilder:
         r"""
         Create a new DocumentStoreBuilder.
@@ -224,14 +244,27 @@ class DocumentStoreBuilder:
                   automatically checkpoint every ``N`` added documents.
                 - ``None``: recover from any existing checkpoint, but never
                   auto-checkpoint — call ``checkpoint()`` manually.
+            content: If ``False``, a key-only store: only the keys are
+                stored (and can be looked up both ways), not the documents'
+                content.
         """
     def add(
-        self, keys: typing.Mapping[builtins.str, builtins.str], content: bytes
+        self,
+        keys: typing.Mapping[builtins.str, builtins.str],
+        content: typing.Optional[bytes] = None,
+        docid: typing.Optional[builtins.int] = None,
     ) -> builtins.bool:
         r"""
         Add a document. Returns ``True`` if this call triggered an automatic
         checkpoint (only possible when ``checkpoint_frequency`` is a positive
         integer).
+
+        Args:
+            keys: Key values of the document (e.g. ``{"docno": "D1"}``).
+            content: Document content (ignored by key-only stores).
+            docid: Document number, e.g. the document's id in an index; must
+                be larger than the previous ones, and skipped numbers have no
+                document. By default, the next number.
         """
     def num_documents(self) -> builtins.int:
         r"""

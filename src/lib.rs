@@ -46,7 +46,6 @@ pub mod bow;
 pub mod builder;
 pub mod compress;
 pub mod docmeta;
-#[cfg(all(feature = "zstd", feature = "mmap"))]
 pub mod docstore;
 pub mod index;
 pub mod manifest;

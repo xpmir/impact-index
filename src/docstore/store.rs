@@ -4,93 +4,121 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Mutex;
 
-use memmap2::{Mmap, MmapOptions};
-
 use crate::base::BoxResult;
+use crate::storage::{DirFiles, IndexFiles};
+use crate::utils::buffer::Buffer;
 
+use super::keys::KeyTable;
 use super::{
-    key_fst_file, BlockMeta, Document, DocumentStoreMeta, BLOCKS_FILE, CONTENT_FILE, META_FILE,
-    OFFSETS_FILE,
+    key_fst_file, BlockMeta, Document, DocumentStoreMeta, ABSENT_BLOCK, BLOCKS_FILE, CONTENT_FILE,
+    DOCSTORE_VERSION, META_FILE, OFFSETS_FILE,
 };
 
-/// How content.dat is accessed.
+/// How content.dat (and the key tables) are accessed.
 #[derive(Debug, Clone, Copy)]
 pub enum ContentAccess {
     /// Load entire file into RAM (fastest, high RAM).
     Memory,
     /// Memory-mapped (OS manages paging, low RAM).
     Mmap,
-    /// Read blocks from disk on demand via seek+read (lowest RAM).
+    /// Read blocks from disk on demand via seek+read (lowest RAM); the key
+    /// tables are memory-mapped.
     Disk,
 }
 
 enum ContentBackend {
-    Memory(Vec<u8>),
-    Mmap(Mmap),
+    Buffer(Box<dyn Buffer>),
     Disk(Mutex<File>),
+}
+
+/// Compressed documents (absent from key-only stores)
+struct Content {
+    backend: ContentBackend,
+    blocks_data: Vec<u8>,
+    offsets_data: Vec<u8>,
 }
 
 /// Read-only document store with block-based zstd compression.
 pub struct DocumentStore {
     meta: DocumentStoreMeta,
-    content: ContentBackend,
-    blocks_data: Vec<u8>,
-    offsets_data: Vec<u8>,
+    content: Option<Content>,
     key_fsts: HashMap<String, fst::Map<Vec<u8>>>,
+    /// Document number → key value (format version 2)
+    key_tables: HashMap<String, KeyTable>,
+}
+
+#[cfg(feature = "zstd")]
+fn decompress(data: &[u8]) -> BoxResult<Vec<u8>> {
+    Ok(zstd::decode_all(data)?)
+}
+
+#[cfg(not(feature = "zstd"))]
+fn decompress(_data: &[u8]) -> BoxResult<Vec<u8>> {
+    Err("Reading document contents requires the `zstd` feature".into())
 }
 
 impl DocumentStore {
     /// Load a document store from disk.
     pub fn load(dir: &Path, access: ContentAccess) -> BoxResult<Self> {
-        let meta_file = File::open(dir.join(META_FILE))?;
-        let meta: DocumentStoreMeta = ciborium::de::from_reader(meta_file)
-            .map_err(|e| format!("Failed to read metadata: {}", e))?;
+        Self::load_from(&DirFiles::new(dir), access)
+    }
 
-        let content_path = dir.join(CONTENT_FILE);
-        let content = match access {
-            ContentAccess::Memory => {
-                let mut f = File::open(&content_path)?;
-                let mut data = Vec::new();
-                f.read_to_end(&mut data)?;
-                ContentBackend::Memory(data)
-            }
-            ContentAccess::Mmap => {
-                let f = File::open(&content_path)?;
-                let mmap = unsafe { MmapOptions::new().map(&f)? };
-                ContentBackend::Mmap(mmap)
-            }
-            ContentAccess::Disk => {
-                let f = File::open(&content_path)?;
-                ContentBackend::Disk(Mutex::new(f))
-            }
+    /// Load a document store from its files (e.g. in memory, see
+    /// [`crate::storage::MemoryFiles`]); `Disk` access needs files from a
+    /// directory, and falls back to `Memory` otherwise.
+    pub fn load_from(files: &dyn IndexFiles, access: ContentAccess) -> BoxResult<Self> {
+        let meta: DocumentStoreMeta = ciborium::de::from_reader(files.open(META_FILE)?)
+            .map_err(|e| format!("Failed to read metadata: {}", e))?;
+        if meta.version > DOCSTORE_VERSION {
+            return Err(format!(
+                "{} has format version {}, but this version of impact-index reads up to \
+                 version {}: upgrade impact-index",
+                files.describe(META_FILE),
+                meta.version,
+                DOCSTORE_VERSION
+            )
+            .into());
+        }
+        let in_memory = matches!(access, ContentAccess::Memory);
+
+        let content = if meta.content {
+            let backend = match (access, files.dir()) {
+                (ContentAccess::Disk, Some(dir)) => {
+                    ContentBackend::Disk(Mutex::new(File::open(dir.join(CONTENT_FILE))?))
+                }
+                _ => ContentBackend::Buffer(files.buffer(CONTENT_FILE, in_memory)?),
+            };
+            Some(Content {
+                backend,
+                blocks_data: files.read_all(BLOCKS_FILE)?,
+                offsets_data: files.read_all(OFFSETS_FILE)?,
+            })
+        } else {
+            None
         };
 
-        let mut blocks_data = Vec::new();
-        File::open(dir.join(BLOCKS_FILE))?.read_to_end(&mut blocks_data)?;
-
-        let mut offsets_data = Vec::new();
-        File::open(dir.join(OFFSETS_FILE))?.read_to_end(&mut offsets_data)?;
-
         let mut key_fsts = HashMap::new();
+        let mut key_tables = HashMap::new();
         for key_name in &meta.key_names {
-            let fst_path = dir.join(key_fst_file(key_name));
-            let mut fst_data = Vec::new();
-            File::open(&fst_path)?.read_to_end(&mut fst_data)?;
+            let fst_data = files.read_all(&key_fst_file(key_name))?;
             let map = fst::Map::new(fst_data)
                 .map_err(|e| format!("Failed to load FST for key '{}': {}", key_name, e))?;
             key_fsts.insert(key_name.clone(), map);
+            if meta.version >= 2 {
+                let table = KeyTable::load(files, key_name, meta.num_documents, in_memory)?;
+                key_tables.insert(key_name.clone(), table);
+            }
         }
 
         Ok(Self {
             meta,
             content,
-            blocks_data,
-            offsets_data,
             key_fsts,
+            key_tables,
         })
     }
 
-    /// Number of documents in the store.
+    /// Number of document numbers (largest + 1)
     pub fn num_documents(&self) -> u64 {
         self.meta.num_documents
     }
@@ -100,32 +128,40 @@ impl DocumentStore {
         &self.meta.key_names
     }
 
-    #[inline]
-    fn get_block_index(&self, doc_number: u64) -> u32 {
-        let offset = (doc_number as usize) * 4;
-        u32::from_le_bytes(self.offsets_data[offset..offset + 4].try_into().unwrap())
+    /// Whether the store holds document contents (`false` for key-only
+    /// stores)
+    pub fn has_content(&self) -> bool {
+        self.content.is_some()
     }
 
     #[inline]
-    fn get_intra_offset(&self, doc_number: u64) -> u32 {
+    fn get_block_index(content: &Content, doc_number: u64) -> u32 {
+        let offset = (doc_number as usize) * 4;
+        u32::from_le_bytes(content.offsets_data[offset..offset + 4].try_into().unwrap())
+    }
+
+    #[inline]
+    fn get_intra_offset(&self, content: &Content, doc_number: u64) -> u32 {
         let n = self.meta.num_documents as usize;
         let offset = n * 4 + (doc_number as usize) * 4;
-        u32::from_le_bytes(self.offsets_data[offset..offset + 4].try_into().unwrap())
+        u32::from_le_bytes(content.offsets_data[offset..offset + 4].try_into().unwrap())
     }
 
     #[inline]
-    fn get_block_meta(&self, block_index: u32) -> BlockMeta {
+    fn get_block_meta(content: &Content, block_index: u32) -> BlockMeta {
         let offset = (block_index as usize) * BlockMeta::SIZE;
-        BlockMeta::from_bytes(&self.blocks_data[offset..])
+        BlockMeta::from_bytes(&content.blocks_data[offset..])
     }
 
-    fn decompress_block(&self, block_meta: &BlockMeta) -> BoxResult<Vec<u8>> {
+    fn decompress_block(content: &Content, block_meta: &BlockMeta) -> BoxResult<Vec<u8>> {
         let offset = block_meta.offset as usize;
         let size = block_meta.compressed_size as usize;
 
-        match &self.content {
-            ContentBackend::Memory(data) => Ok(zstd::decode_all(&data[offset..offset + size])?),
-            ContentBackend::Mmap(mmap) => Ok(zstd::decode_all(&mmap[offset..offset + size])?),
+        match &content.backend {
+            ContentBackend::Buffer(buffer) => {
+                let data = buffer.as_bytes().expect("buffers expose their bytes");
+                decompress(&data[offset..offset + size])
+            }
             ContentBackend::Disk(file_mutex) => {
                 let mut file = file_mutex
                     .lock()
@@ -133,7 +169,7 @@ impl DocumentStore {
                 let mut buf = vec![0u8; size];
                 file.seek(SeekFrom::Start(block_meta.offset))?;
                 file.read_exact(&mut buf)?;
-                Ok(zstd::decode_all(&buf[..])?)
+                decompress(&buf[..])
             }
         }
     }
@@ -161,25 +197,60 @@ impl DocumentStore {
         Ok((keys, content))
     }
 
-    /// Retrieve documents by their sequential numbers (0-based).
+    /// Whether a document has the number `doc_number`
+    pub fn contains(&self, doc_number: u64) -> bool {
+        if doc_number >= self.meta.num_documents {
+            return false;
+        }
+        match &self.content {
+            Some(content) => Self::get_block_index(content, doc_number) != ABSENT_BLOCK,
+            // Key-only: documents are known by their keys
+            None => self
+                .key_tables
+                .values()
+                .any(|t| t.get(doc_number).is_some()),
+        }
+    }
+
+    /// Keys of a document from the key tables
+    fn keys_from_tables(&self, doc_number: u64) -> HashMap<String, String> {
+        self.key_tables
+            .iter()
+            .filter_map(|(name, table)| table.get(doc_number).map(|v| (name.clone(), v.into())))
+            .collect()
+    }
+
+    /// Retrieve documents by their numbers (0-based); key-only stores
+    /// return documents with an empty content.
     pub fn get_by_number(&self, doc_numbers: &[u64]) -> BoxResult<Vec<Document>> {
         for &num in doc_numbers {
-            if num >= self.meta.num_documents {
+            if !self.contains(num) {
                 return Err(format!(
-                    "Document number {} out of range (num_documents={})",
+                    "No document with number {} (num_documents={})",
                     num, self.meta.num_documents
                 )
                 .into());
             }
         }
 
+        let Some(content) = &self.content else {
+            return Ok(doc_numbers
+                .iter()
+                .map(|&n| Document {
+                    internal_id: n,
+                    keys: self.keys_from_tables(n),
+                    content: Vec::new(),
+                })
+                .collect());
+        };
+
         // Fast path for single document retrieval (avoids HashMap overhead)
         if doc_numbers.len() == 1 {
             let doc_num = doc_numbers[0];
-            let block_index = self.get_block_index(doc_num);
-            let intra_offset = self.get_intra_offset(doc_num);
-            let block_meta = self.get_block_meta(block_index);
-            let decompressed = self.decompress_block(&block_meta)?;
+            let block_index = Self::get_block_index(content, doc_num);
+            let intra_offset = self.get_intra_offset(content, doc_num);
+            let block_meta = Self::get_block_meta(content, block_index);
+            let decompressed = Self::decompress_block(content, &block_meta)?;
             let (keys, content) = Self::decode_document_at(&decompressed, intra_offset)?;
             return Ok(vec![Document {
                 internal_id: doc_num,
@@ -191,8 +262,8 @@ impl DocumentStore {
         // Group by block index to minimize decompression
         let mut block_groups: HashMap<u32, Vec<(usize, u64, u32)>> = HashMap::new();
         for (result_idx, &doc_num) in doc_numbers.iter().enumerate() {
-            let block_index = self.get_block_index(doc_num);
-            let intra_offset = self.get_intra_offset(doc_num);
+            let block_index = Self::get_block_index(content, doc_num);
+            let intra_offset = self.get_intra_offset(content, doc_num);
             block_groups
                 .entry(block_index)
                 .or_default()
@@ -202,8 +273,8 @@ impl DocumentStore {
         let mut results: Vec<Option<Document>> = vec![None; doc_numbers.len()];
 
         for (block_index, docs_in_block) in &block_groups {
-            let block_meta = self.get_block_meta(*block_index);
-            let decompressed = self.decompress_block(&block_meta)?;
+            let block_meta = Self::get_block_meta(content, *block_index);
+            let decompressed = Self::decompress_block(content, &block_meta)?;
 
             for &(result_idx, doc_num, intra_offset) in docs_in_block {
                 let (keys, content) = Self::decode_document_at(&decompressed, intra_offset)?;
@@ -216,6 +287,52 @@ impl DocumentStore {
         }
 
         Ok(results.into_iter().map(|d| d.unwrap()).collect())
+    }
+
+    /// Document numbers of the given key values (`None` if not found)
+    pub fn get_numbers(&self, key_name: &str, key_values: &[&str]) -> BoxResult<Vec<Option<u64>>> {
+        let fst = self
+            .key_fsts
+            .get(key_name)
+            .ok_or_else(|| format!("Unknown key name '{}'", key_name))?;
+        Ok(key_values.iter().map(|v| fst.get(v)).collect())
+    }
+
+    /// Values of the key `key_name` for the given document numbers (`None`
+    /// if there is no such document, or it has no value for the key).
+    ///
+    /// Reads the key tables; for stores written before format version 2,
+    /// which have none, decompresses the documents instead.
+    pub fn get_keys(&self, key_name: &str, doc_numbers: &[u64]) -> BoxResult<Vec<Option<String>>> {
+        if !self.key_fsts.contains_key(key_name) {
+            return Err(format!("Unknown key name '{}'", key_name).into());
+        }
+        if let Some(table) = self.key_tables.get(key_name) {
+            return Ok(doc_numbers
+                .iter()
+                .map(|&n| {
+                    (n < self.meta.num_documents)
+                        .then(|| table.get(n).map(String::from))
+                        .flatten()
+                })
+                .collect());
+        }
+        let present: Vec<u64> = doc_numbers
+            .iter()
+            .copied()
+            .filter(|&n| self.contains(n))
+            .collect();
+        let mut docs = self.get_by_number(&present)?.into_iter();
+        Ok(doc_numbers
+            .iter()
+            .map(|&n| {
+                if self.contains(n) {
+                    docs.next().and_then(|mut d| d.keys.remove(key_name))
+                } else {
+                    None
+                }
+            })
+            .collect())
     }
 
     /// Retrieve documents by key name and values.

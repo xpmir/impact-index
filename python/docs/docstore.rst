@@ -5,7 +5,9 @@ Document store
 
 The document store provides compressed storage for document content and
 metadata, using zstd block compression. Documents can be retrieved by
-sequential number or by key fields.
+number or by key fields, and key values looked up from document numbers
+(e.g. the ``docno`` of a search result). Key-only stores keep just these
+mappings.
 
 Building a store
 ----------------
@@ -125,65 +127,79 @@ Async retrieval
 Internal DocId vs external identifiers
 --------------------------------------
 
-The index and the document store each keep their own, independent
-numbering, and impact-index does not maintain a mapping between them:
-
-- The index only ever knows the internal ``DocId`` (``u64``) you pass to
-  ``add``/``add_text`` — a plain sequential counter with no notion of a
-  corpus's own document identifier (e.g. a TREC ``docno``). Postings and
-  search results are all expressed in terms of this id.
-- :class:`~impact_index.DocumentStoreBuilder` assigns its own sequential
-  ``internal_id`` purely from call order: ``builder.add(keys, content)``
-  takes no doc id argument at all — the first call gets internal id 0,
-  the second 1, and so on. Its *only* id-based lookup is
-  :meth:`~impact_index.DocumentStore.get_by_key`, which maps a key field
-  you chose (e.g. ``"docno"``) to that internal sequential number via an
-  FST. There is no lookup from an index ``DocId`` to a store key, or vice
-  versa, anywhere in the library.
-
-In practice, the way to tie the two together is to build both structures
-in lockstep — feeding them the same documents in the same order, with
-contiguous ids starting at 0 — and to keep the corpus's own identifier as
-a key field in the store:
+The index only knows the integer ``DocId`` you pass to ``add`` /
+``add_text``, not the corpus's own identifiers (e.g. a TREC ``docno``).
+The document store maps between the two: give each document its index
+``DocId`` with ``docid=``, and keep the external identifier as a key.
 
 .. code-block:: python
 
     index_builder = impact_index.BOWIndexBuilder("/path/to/index", stemmer="porter")
     store_builder = impact_index.DocumentStoreBuilder("/path/to/store")
 
-    for docid, doc in enumerate(documents):        # docid: 0, 1, 2, ...
+    for docid, doc in documents:                    # any increasing ids
         index_builder.add_text(docid, doc.text)
-        store_builder.add({"docno": doc.external_id}, doc.text.encode())
+        store_builder.add({"docno": doc.external_id}, doc.text.encode(), docid=docid)
 
     index = index_builder.build(in_memory=True)
     store_builder.build()
 
-Because both were fed the same documents in the same order, the store's
-sequential number *is* the index's ``DocId`` — so after search,
-``store.get_by_number(docid)`` retrieves the exact document that was
-scored:
+Document numbers given with ``docid=`` must increase, and may have gaps
+(numbers without document); without ``docid=``, documents get the next
+number (0, 1, 2... when it is never given). Then, in both directions:
 
 .. code-block:: python
 
     store = impact_index.DocumentStore.load("/path/to/store")
-    scored = index.with_scoring(impact_index.BM25Scoring())
-    results = scored.search_maxscore(query, top_k=10)
+    results = index.with_scoring(impact_index.BM25Scoring()).search_maxscore(query, top_k=10)
 
-    for hit in results:
-        doc = store.get_by_number([hit.docid])[0]
-        print(doc.keys["docno"], hit.score, doc.content)
+    # DocId -> docno, without decompressing the documents
+    docnos = store.get_keys("docno", [hit.docid for hit in results])
+    # docno -> DocId
+    store.get_numbers("docno", ["W1234"])          # [1234] (None if unknown)
+    # DocId -> full document
+    doc = store.get_by_number([results[0].docid])[0]
 
-    # Going the other way -- external id to content, no search involved:
-    doc = store.get_by_key("docno", ["W1234"])[0]
+This survives :meth:`~impact_index.Index.reorder`: reordering renumbers
+ids internally for storage locality, but search results are always
+translated back to the *original* ``DocId``, which is what the store was
+built against.
 
-This convention breaks silently if the two are ever built out of lockstep
-(e.g. documents filtered/skipped on one side but not the other, or
-non-contiguous ``DocId`` values) — nothing validates the correspondence,
-so it is entirely the caller's responsibility. It does survive
-:meth:`~impact_index.Index.reorder`: reordering renumbers ids internally
-for storage locality, but search results are always translated back to
-the *original* ``DocId`` automatically, which is what the store was built
-against.
+Key-only stores
+---------------
+
+To map identifiers without storing the documents, build a key-only store
+with ``content=False``: the content passed to ``add`` (optional) is
+ignored, no zstd-compressed blocks are written, and
+:meth:`~impact_index.DocumentStore.get_by_number` returns documents with
+their keys and an empty content.
+
+.. code-block:: python
+
+    builder = impact_index.DocumentStoreBuilder("/path/to/docnos", content=False)
+    for docid, docno in docnos:
+        builder.add({"docno": docno}, docid=docid)
+    builder.build()
+
+    store = impact_index.DocumentStore.load("/path/to/docnos")
+    store.has_content()                            # False
+
+Key-only stores can also be built and read in WebAssembly (see
+:doc:`wasm`); with segments (:doc:`incremental`), use one store per
+segment, numbered like the segment.
+
+Format versions
+---------------
+
+Stores are written in format version 2, which adds the document number →
+key tables (``key_<name>.idx`` / ``key_<name>.dat``), key-only stores and
+document numbers with gaps. Stores written by earlier versions (format 1)
+still load and work as before; on them,
+:meth:`~impact_index.DocumentStore.get_keys` decompresses the documents
+instead of reading a table, so it is slower — rebuild the store to get the
+tables. Earlier versions of impact-index cannot read key-only stores nor
+stores with gaps, and a store from a later format version fails to load
+with an error asking to upgrade.
 
 API reference
 -------------

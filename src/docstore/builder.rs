@@ -6,12 +6,48 @@ use std::path::{Path, PathBuf};
 use log::info;
 use serde::{Deserialize, Serialize};
 
-use crate::base::BoxResult;
+use crate::base::{BoxResult, DocId};
+use crate::storage::DirOutput;
 
+use super::keys::{write_key, write_meta};
 use super::{
-    BlockMeta, DocumentData, DocumentStoreMeta, BLOCKS_FILE, CHECKPOINT_FILE, CONTENT_FILE,
-    META_FILE, OFFSETS_FILE,
+    BlockMeta, DocumentData, DocumentStoreMeta, ABSENT_BLOCK, BLOCKS_FILE, CHECKPOINT_FILE,
+    CONTENT_FILE, DOCSTORE_VERSION, OFFSETS_FILE,
 };
+
+#[cfg(feature = "zstd")]
+fn compress(data: &[u8], level: i32) -> BoxResult<Vec<u8>> {
+    Ok(zstd::encode_all(data, level)?)
+}
+
+#[cfg(not(feature = "zstd"))]
+fn compress(_data: &[u8], _level: i32) -> BoxResult<Vec<u8>> {
+    Err("Storing document contents requires the `zstd` feature (use a key-only store)".into())
+}
+
+#[cfg(feature = "zstd")]
+fn checkpoint_reader(file: File) -> BoxResult<impl std::io::Read> {
+    Ok(zstd::stream::Decoder::new(BufReader::new(file))?)
+}
+
+#[cfg(feature = "zstd")]
+fn checkpoint_writer(file: File) -> BoxResult<impl Write> {
+    Ok(zstd::stream::Encoder::new(BufWriter::new(file), 3)?.auto_finish())
+}
+
+#[cfg(not(feature = "zstd"))]
+fn checkpoint_reader(_file: File) -> BoxResult<File> {
+    Err("Document store checkpoints require the `zstd` feature".into())
+}
+
+#[cfg(not(feature = "zstd"))]
+fn checkpoint_writer(_file: File) -> BoxResult<File> {
+    Err("Document store checkpoints require the `zstd` feature".into())
+}
+
+fn default_true() -> bool {
+    true
+}
 
 /// Configuration options for the [`DocumentStoreBuilder`].
 ///
@@ -57,13 +93,23 @@ struct CheckpointState {
     /// Ordered list of key names and the temp-file length at checkpoint time
     /// (used to truncate any bytes written after the last checkpoint on resume).
     key_file_lengths: Vec<(String, u64)>,
+    /// `false` for a key-only store (absent from older checkpoints)
+    #[serde(default = "default_true")]
+    content: bool,
 }
 
 fn tmp_key_path(dir: &Path, key_name: &str) -> PathBuf {
     dir.join(format!(".tmp_key_{}", key_name))
 }
 
-/// Builds a DocumentStore on disk with block-based zstd compression.
+/// Content files of a store being built
+struct ContentFiles {
+    data_file: BufWriter<File>,
+    blocks_file: BufWriter<File>,
+}
+
+/// Builds a DocumentStore on disk with block-based zstd compression, or a
+/// key-only store (see [`DocumentStoreBuilder::new_keys_only`]).
 pub struct DocumentStoreBuilder {
     dir: PathBuf,
     options: BuilderOptions,
@@ -74,8 +120,8 @@ pub struct DocumentStoreBuilder {
     /// Temp files for each key: lines of "key_value\tdoc_num\n"
     key_files: HashMap<String, BufWriter<File>>,
     key_names: Vec<String>,
-    data_file: BufWriter<File>,
-    blocks_file: BufWriter<File>,
+    /// `None` for key-only stores
+    content: Option<ContentFiles>,
     num_blocks: u64,
     num_documents: u64,
     content_offset: u64,
@@ -100,6 +146,17 @@ impl DocumentStoreBuilder {
     /// or `Some(N)` for `N > 0`). Otherwise the builder starts fresh and
     /// truncates any existing output files.
     pub fn new_with_options(dir: &Path, options: &BuilderOptions) -> BoxResult<Self> {
+        Self::open(dir, options, true)
+    }
+
+    /// Create a builder for a key-only store: keys are stored (and can be
+    /// looked up both ways), but not the documents' content, which
+    /// [`Self::add`] ignores. `block_size` and `zstd_level` are unused.
+    pub fn new_keys_only(dir: &Path, options: &BuilderOptions) -> BoxResult<Self> {
+        Self::open(dir, options, false)
+    }
+
+    fn open(dir: &Path, options: &BuilderOptions, content: bool) -> BoxResult<Self> {
         fs::create_dir_all(dir)?;
 
         let checkpoint_path = dir.join(CHECKPOINT_FILE);
@@ -107,27 +164,33 @@ impl DocumentStoreBuilder {
         let resuming = recovery_enabled && checkpoint_path.exists();
 
         if resuming {
-            Self::resume(dir, options, &checkpoint_path)
+            Self::resume(dir, options, &checkpoint_path, content)
         } else {
-            Self::fresh(dir, options)
+            Self::fresh(dir, options, content)
         }
     }
 
-    fn fresh(dir: &Path, options: &BuilderOptions) -> BoxResult<Self> {
-        let data_file = BufWriter::new(
-            File::options()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(dir.join(CONTENT_FILE))?,
-        );
-        let blocks_file = BufWriter::new(
-            File::options()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(dir.join(BLOCKS_FILE))?,
-        );
+    fn fresh(dir: &Path, options: &BuilderOptions, content: bool) -> BoxResult<Self> {
+        let content = if content {
+            Some(ContentFiles {
+                data_file: BufWriter::new(
+                    File::options()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(dir.join(CONTENT_FILE))?,
+                ),
+                blocks_file: BufWriter::new(
+                    File::options()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(dir.join(BLOCKS_FILE))?,
+                ),
+            })
+        } else {
+            None
+        };
 
         // Clean up any stale checkpoint artifacts left over from an aborted
         // run whose checkpointing was disabled on retry.
@@ -147,8 +210,7 @@ impl DocumentStoreBuilder {
             doc_intra_offsets: Vec::new(),
             key_files: HashMap::new(),
             key_names: Vec::new(),
-            data_file,
-            blocks_file,
+            content,
             num_blocks: 0,
             num_documents: 0,
             content_offset: 0,
@@ -156,11 +218,24 @@ impl DocumentStoreBuilder {
         })
     }
 
-    fn resume(dir: &Path, options: &BuilderOptions, checkpoint_path: &Path) -> BoxResult<Self> {
+    fn resume(
+        dir: &Path,
+        options: &BuilderOptions,
+        checkpoint_path: &Path,
+        content: bool,
+    ) -> BoxResult<Self> {
         let ckpt_file = File::open(checkpoint_path)?;
-        let decoder = zstd::stream::Decoder::new(BufReader::new(ckpt_file))?;
+        let decoder = checkpoint_reader(ckpt_file)?;
         let state: CheckpointState = ciborium::de::from_reader(decoder)
             .map_err(|e| format!("Failed to read checkpoint: {}", e))?;
+
+        if state.content != content {
+            return Err(format!(
+                "Checkpoint is for a {} store",
+                if state.content { "full" } else { "key-only" }
+            )
+            .into());
+        }
 
         if state.block_size != options.block_size {
             return Err(format!(
@@ -172,29 +247,37 @@ impl DocumentStoreBuilder {
 
         // Truncate output files back to the checkpointed state, dropping any
         // bytes that may have been written after the last successful checkpoint.
-        let content_path = dir.join(CONTENT_FILE);
-        let blocks_path = dir.join(BLOCKS_FILE);
+        let content = if content {
+            let content_path = dir.join(CONTENT_FILE);
+            let blocks_path = dir.join(BLOCKS_FILE);
 
-        let content_file = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&content_path)?;
-        content_file.set_len(state.content_offset)?;
-        let mut data_file = BufWriter::new(content_file);
-        data_file.seek(SeekFrom::Start(state.content_offset))?;
+            let content_file = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&content_path)?;
+            content_file.set_len(state.content_offset)?;
+            let mut data_file = BufWriter::new(content_file);
+            data_file.seek(SeekFrom::Start(state.content_offset))?;
 
-        let blocks_len = state.num_blocks * BlockMeta::SIZE as u64;
-        let blocks_raw = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&blocks_path)?;
-        blocks_raw.set_len(blocks_len)?;
-        let mut blocks_file = BufWriter::new(blocks_raw);
-        blocks_file.seek(SeekFrom::Start(blocks_len))?;
+            let blocks_len = state.num_blocks * BlockMeta::SIZE as u64;
+            let blocks_raw = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&blocks_path)?;
+            blocks_raw.set_len(blocks_len)?;
+            let mut blocks_file = BufWriter::new(blocks_raw);
+            blocks_file.seek(SeekFrom::Start(blocks_len))?;
+            Some(ContentFiles {
+                data_file,
+                blocks_file,
+            })
+        } else {
+            None
+        };
 
         // Reopen key temp files, truncating to the length captured at checkpoint.
         let mut key_files: HashMap<String, BufWriter<File>> = HashMap::new();
@@ -228,8 +311,7 @@ impl DocumentStoreBuilder {
             doc_intra_offsets: state.doc_intra_offsets,
             key_files,
             key_names,
-            data_file,
-            blocks_file,
+            content,
             num_blocks: state.num_blocks,
             num_documents: state.num_documents,
             content_offset: state.content_offset,
@@ -237,37 +319,60 @@ impl DocumentStoreBuilder {
         })
     }
 
-    /// Number of documents successfully added so far.
+    /// Number of document numbers used so far (largest + 1).
     pub fn num_documents(&self) -> u64 {
         self.num_documents
     }
 
-    /// Add a document to the store.
+    /// Add a document to the store, with the next document number.
     ///
     /// Returns `true` if this `add` triggered an automatic checkpoint
     /// (only possible when `checkpoint_frequency = Some(N)` for `N > 0`).
     pub fn add(&mut self, doc: &DocumentData) -> BoxResult<bool> {
-        let block_index = self.num_blocks as u32;
-        let intra_offset = self.current_block_buf.len() as u32;
+        self.add_with_docid(self.num_documents, doc)
+    }
 
-        self.doc_block_indices.push(block_index);
-        self.doc_intra_offsets.push(intra_offset);
+    /// Add a document with a given document number (e.g. its document id
+    /// in an index), not smaller than [`Self::num_documents`]; skipped
+    /// numbers have no document.
+    pub fn add_with_docid(&mut self, docid: DocId, doc: &DocumentData) -> BoxResult<bool> {
+        if docid < self.num_documents {
+            return Err(format!(
+                "Document numbers must be increasing ({} after {})",
+                docid,
+                self.num_documents - 1
+            )
+            .into());
+        }
+        if self.content.is_some() {
+            // Skipped document numbers
+            for _ in self.num_documents..docid {
+                self.doc_block_indices.push(ABSENT_BLOCK);
+                self.doc_intra_offsets.push(0);
+            }
+            let block_index = self.num_blocks as u32;
+            let intra_offset = self.current_block_buf.len() as u32;
 
-        // Serialize into current_block_buf:
-        // keys (bincode) + content_len (u64 LE) + content bytes
-        let keys_bytes = bincode::serialize(&doc.keys)?;
-        let keys_len = keys_bytes.len() as u64;
-        self.current_block_buf
-            .extend_from_slice(&keys_len.to_le_bytes());
-        self.current_block_buf.extend_from_slice(&keys_bytes);
+            self.doc_block_indices.push(block_index);
+            self.doc_intra_offsets.push(intra_offset);
 
-        let content_len = doc.content.len() as u64;
-        self.current_block_buf
-            .extend_from_slice(&content_len.to_le_bytes());
-        self.current_block_buf.extend_from_slice(&doc.content);
+            // Serialize into current_block_buf:
+            // keys (bincode) + content_len (u64 LE) + content bytes
+            let keys_bytes = bincode::serialize(&doc.keys)?;
+            let keys_len = keys_bytes.len() as u64;
+            self.current_block_buf
+                .extend_from_slice(&keys_len.to_le_bytes());
+            self.current_block_buf.extend_from_slice(&keys_bytes);
+
+            let content_len = doc.content.len() as u64;
+            self.current_block_buf
+                .extend_from_slice(&content_len.to_le_bytes());
+            self.current_block_buf.extend_from_slice(&doc.content);
+            self.current_block_doc_count += 1;
+        }
 
         // Write key entries to temp files
-        let doc_num = self.num_documents;
+        let doc_num = docid;
         for (key_name, key_value) in &doc.keys {
             if !self.key_files.contains_key(key_name) {
                 let temp_path = tmp_key_path(&self.dir, key_name);
@@ -285,10 +390,9 @@ impl DocumentStoreBuilder {
             writeln!(writer, "{}\t{}", key_value, doc_num)?;
         }
 
-        self.num_documents += 1;
-        self.current_block_doc_count += 1;
+        self.num_documents = docid + 1;
 
-        if self.current_block_buf.len() >= self.options.block_size {
+        if self.content.is_some() && self.current_block_buf.len() >= self.options.block_size {
             self.flush_block()?;
         }
 
@@ -304,20 +408,23 @@ impl DocumentStoreBuilder {
     }
 
     fn flush_block(&mut self) -> BoxResult<()> {
+        let Some(files) = self.content.as_mut() else {
+            return Ok(());
+        };
         if self.current_block_buf.is_empty() {
             return Ok(());
         }
 
-        let compressed = zstd::encode_all(&self.current_block_buf[..], self.options.zstd_level)?;
+        let compressed = compress(&self.current_block_buf[..], self.options.zstd_level)?;
 
-        self.data_file.write_all(&compressed)?;
+        files.data_file.write_all(&compressed)?;
 
         let block_meta = BlockMeta {
             offset: self.content_offset,
             compressed_size: compressed.len() as u64,
             num_docs: self.current_block_doc_count,
         };
-        self.blocks_file.write_all(&block_meta.to_bytes())?;
+        files.blocks_file.write_all(&block_meta.to_bytes())?;
 
         self.content_offset += compressed.len() as u64;
         self.num_blocks += 1;
@@ -336,8 +443,10 @@ impl DocumentStoreBuilder {
         );
 
         // Flush buffered writes so what's on disk matches our tracked offsets.
-        self.data_file.flush()?;
-        self.blocks_file.flush()?;
+        if let Some(files) = self.content.as_mut() {
+            files.data_file.flush()?;
+            files.blocks_file.flush()?;
+        }
 
         // Capture key temp-file lengths (after flushing their BufWriters).
         let mut key_file_lengths: Vec<(String, u64)> = Vec::with_capacity(self.key_names.len());
@@ -359,6 +468,7 @@ impl DocumentStoreBuilder {
             current_block_buf: self.current_block_buf.clone(),
             current_block_doc_count: self.current_block_doc_count,
             key_file_lengths,
+            content: self.content.is_some(),
         };
 
         let final_path = self.dir.join(CHECKPOINT_FILE);
@@ -370,8 +480,7 @@ impl DocumentStoreBuilder {
                 .create(true)
                 .truncate(true)
                 .open(&tmp_path)?;
-            let encoder = zstd::stream::Encoder::new(BufWriter::new(tmp_file), 3)?;
-            let mut encoder = encoder.auto_finish();
+            let mut encoder = checkpoint_writer(tmp_file)?;
             ciborium::ser::into_writer(&state, &mut encoder)
                 .map_err(|e| format!("Failed to serialize checkpoint: {}", e))?;
         }
@@ -386,12 +495,12 @@ impl DocumentStoreBuilder {
         // Flush remaining block
         self.flush_block()?;
 
-        // Flush data and blocks files
-        self.data_file.flush()?;
-        self.blocks_file.flush()?;
+        if let Some(files) = self.content.as_mut() {
+            // Flush data and blocks files
+            files.data_file.flush()?;
+            files.blocks_file.flush()?;
 
-        // Write offsets.dat: block_indices then intra_offsets as contiguous u32 LE arrays
-        {
+            // Write offsets.dat: block_indices then intra_offsets as contiguous u32 LE arrays
             let mut offsets_file = BufWriter::new(
                 File::options()
                     .write(true)
@@ -408,77 +517,46 @@ impl DocumentStoreBuilder {
             offsets_file.flush()?;
         }
 
-        // Build FSTs for each key
+        // Build FSTs and document number -> value tables for each key
         // Close temp files first
         let key_names = self.key_names.clone();
         for name in &key_names {
             self.key_files.remove(name); // drops and closes
         }
 
+        let out = DirOutput::new(&self.dir);
         for key_name in &key_names {
             let temp_path = tmp_key_path(&self.dir, key_name);
 
-            // Read all entries
+            // Read all entries ("value\tdoc_num", by increasing doc_num); the
+            // number follows the last tab, values may contain tabs
             let reader = BufReader::new(File::open(&temp_path)?);
             let mut entries: Vec<(String, u64)> = Vec::new();
             for line in reader.lines() {
                 let line = line?;
-                let mut parts = line.splitn(2, '\t');
-                let key_value = parts
-                    .next()
-                    .ok_or("invalid temp key file format")?
-                    .to_string();
-                let doc_num: u64 = parts
-                    .next()
-                    .ok_or("invalid temp key file format")?
-                    .parse()?;
-                entries.push((key_value, doc_num));
+                let (key_value, doc_num) = line
+                    .rsplit_once('\t')
+                    .ok_or("invalid temp key file format")?;
+                entries.push((key_value.to_string(), doc_num.parse()?));
             }
-
-            // Sort by key value
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-            // Check for duplicates and build FST
-            let fst_path = self.dir.join(super::key_fst_file(key_name));
-            let fst_file = BufWriter::new(
-                File::options()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&fst_path)?,
-            );
-            let mut fst_builder = fst::MapBuilder::new(fst_file)?;
-
-            for i in 0..entries.len() {
-                if i > 0 && entries[i].0 == entries[i - 1].0 {
-                    return Err(format!(
-                        "Duplicate key value '{}' for key '{}'",
-                        entries[i].0, key_name
-                    )
-                    .into());
-                }
-                fst_builder.insert(&entries[i].0, entries[i].1)?;
-            }
-            fst_builder.finish()?;
+            write_key(&out, key_name, entries, self.num_documents)?;
 
             // Clean up temp file
             fs::remove_file(&temp_path)?;
         }
 
         // Write metadata
-        let meta = DocumentStoreMeta {
-            num_documents: self.num_documents,
-            block_size: self.options.block_size,
-            num_blocks: self.num_blocks as usize,
-            key_names,
-        };
-        let meta_file = File::options()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(self.dir.join(META_FILE))?;
-        ciborium::ser::into_writer(&meta, meta_file)
-            .map_err(|e| format!("Failed to write metadata: {}", e))?;
+        write_meta(
+            &out,
+            &DocumentStoreMeta {
+                num_documents: self.num_documents,
+                block_size: self.options.block_size,
+                num_blocks: self.num_blocks as usize,
+                key_names,
+                version: DOCSTORE_VERSION,
+                content: self.content.is_some(),
+            },
+        )?;
 
         // Remove checkpoint artifacts now that the build is durable.
         for name in [CHECKPOINT_FILE, &format!("{}.tmp", CHECKPOINT_FILE)] {

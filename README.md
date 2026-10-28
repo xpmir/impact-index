@@ -19,7 +19,7 @@ Supports both neural IR models with floating-point impact scores and traditional
 - **Index versioning**: per-index `manifest.json` with format version checks and one-step migration (`Index.update(path)`)
 - **BMP (Block-Max Pruning)** for fast approximate search ([SIGIR 2024](https://github.com/pisa-engine/BMP))
 - **Seismic** for very fast approximate search over learned impacts ([SIGIR 2024](https://github.com/TusKANNy/seismic)) — see [Approximate search with Seismic](#approximate-search-with-seismic)
-- **Document store** with zstd compression and key-based retrieval
+- **Document store** with zstd compression, key-based retrieval and document id ↔ key (e.g. `docno`) mapping, or key-only (`content=False`)
 - **Async support** for non-blocking search and document retrieval
 - **Parallel index compression** with rayon
 - **Structured queries**: matchop-style `#combine`/`#syn`/`#band`/`#1` (phrase)/`#uwN` (window) operators, evaluated directly by WAND/MaxScore (`search_wand_query`/`search_maxscore_query`); the positional ones (`#1`, `#uwN`) need an index built with `positions=True`
@@ -325,10 +325,12 @@ const { docids, scores } = index.search(
 ```
 
 `DocSet` (tombstones) and `SegmentedIndex` bring the
-[incremental pattern](#incremental-indexing) to WASM. Search is
+[incremental pattern](#incremental-indexing) to WASM, and key-only document
+stores (`KeyStoreBuilder`, `DocumentStore`) map document ids to keys such as
+a `docno` and back. Search is
 single-threaded MaxScore; on 200k synthetic documents (45 MB index), a
 top-100 search takes 1-3 ms in Node.js. BM25 / text indexing, positions,
-document stores, BMP and Seismic are not available in WASM. See the
+document contents, BMP and Seismic are not available in WASM. See the
 [WebAssembly guide](https://impact-index.readthedocs.io/en/latest/wasm.html)
 for the API and the Rust features.
 

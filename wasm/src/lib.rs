@@ -26,6 +26,8 @@ use impact_index::compress::impact::{
 use impact_index::compress::{
     CompressionTransform, DocIdCompressorFactory, ImpactCompressorFactory,
 };
+use impact_index::docstore::keys::KeyStoreBuilder as KeyStoreBuilderInner;
+use impact_index::docstore::store::{ContentAccess, DocumentStore as StoreInner};
 use impact_index::index::SparseIndex;
 use impact_index::search::filter::{DocBitSet, Exclude};
 use impact_index::search::maxscore::{search_maxscore_filtered, MaxScoreOptions};
@@ -67,24 +69,8 @@ fn js_error(e: impl std::fmt::Display) -> JsError {
 
 /// `{name: bytes}` from a `Map` or a plain object
 fn memory_files(files: &JsValue) -> Result<MemoryFiles, JsError> {
-    let entries: Vec<(JsValue, JsValue)> = if let Some(map) = files.dyn_ref::<Map>() {
-        let mut entries = Vec::new();
-        map.for_each(&mut |value, key| entries.push((key, value)));
-        entries
-    } else if files.is_object() {
-        Object::entries(files.unchecked_ref())
-            .iter()
-            .map(|entry| {
-                let entry: Array = entry.unchecked_into();
-                (entry.get(0), entry.get(1))
-            })
-            .collect()
-    } else {
-        return Err(JsError::new(
-            "index files must be a Map or an object of Uint8Array",
-        ));
-    };
-
+    let entries = js_entries(files)
+        .ok_or_else(|| JsError::new("index files must be a Map or an object of Uint8Array"))?;
     let mut result = MemoryFiles::new();
     for (name, bytes) in entries {
         let name = name
@@ -96,6 +82,37 @@ fn memory_files(files: &JsValue) -> Result<MemoryFiles, JsError> {
         result.insert(name, bytes.to_vec());
     }
     Ok(result)
+}
+
+/// Entries of a `Map` or of a plain object
+fn js_entries(value: &JsValue) -> Option<Vec<(JsValue, JsValue)>> {
+    if let Some(map) = value.dyn_ref::<Map>() {
+        let mut entries = Vec::new();
+        map.for_each(&mut |value, key| entries.push((key, value)));
+        Some(entries)
+    } else if value.is_object() {
+        Some(
+            Object::entries(value.unchecked_ref())
+                .iter()
+                .map(|entry| {
+                    let entry: Array = entry.unchecked_into();
+                    (entry.get(0), entry.get(1))
+                })
+                .collect(),
+        )
+    } else {
+        None
+    }
+}
+
+/// Files as a `Map` from file name to `Uint8Array`
+fn files_map(files: &MemoryFiles) -> Map {
+    let map = Map::new();
+    for name in files.names() {
+        let bytes = files.get_bytes(name).expect("listed file");
+        map.set(&JsValue::from_str(name), &Uint8Array::from(bytes).into());
+    }
+    map
 }
 
 /// Query as a term → weight map; repeated terms add up
@@ -510,13 +527,7 @@ impl Builder {
             .map_err(js_error)?;
         self.clamped = Some(report.clamped_impacts);
 
-        let files = out.into_files();
-        let map = Map::new();
-        for name in files.names() {
-            let bytes = files.get_bytes(name).expect("listed file");
-            map.set(&JsValue::from_str(name), &Uint8Array::from(bytes).into());
-        }
-        Ok(map)
+        Ok(files_map(&out.into_files()))
     }
 
     /// Number of impacts clamped to the quantisation range by `finish`
@@ -524,5 +535,144 @@ impl Builder {
     #[wasm_bindgen(getter, js_name = clampedImpacts)]
     pub fn clamped_impacts(&self) -> Option<f64> {
         self.clamped.map(|n| n as f64)
+    }
+}
+
+/// Key values of a document: `{name: value}` (or a `Map`) of strings
+fn document_keys(keys: &JsValue) -> Result<HashMap<String, String>, JsError> {
+    let entries =
+        js_entries(keys).ok_or_else(|| JsError::new("keys must be an object of strings"))?;
+    entries
+        .into_iter()
+        .map(
+            |(name, value)| match (name.as_string(), value.as_string()) {
+                (Some(name), Some(value)) => Ok((name, value)),
+                _ => Err(JsError::new("key names and values must be strings")),
+            },
+        )
+        .collect()
+}
+
+/// Builds a key-only document store: maps document keys (e.g. a `docno`)
+/// to document ids (e.g. those given to `Builder.add`) and back
+#[wasm_bindgen]
+pub struct KeyStoreBuilder {
+    inner: Option<KeyStoreBuilderInner>,
+}
+
+#[wasm_bindgen]
+impl KeyStoreBuilder {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> KeyStoreBuilder {
+        KeyStoreBuilder {
+            inner: Some(KeyStoreBuilderInner::new()),
+        }
+    }
+
+    /// Adds a document with its keys (e.g. `{docno: "D1"}`); with `docid`
+    /// (larger than the previous ones), at that document id, otherwise at
+    /// the next one. Returns the document id.
+    pub fn add(&mut self, keys: JsValue, docid: Option<u32>) -> Result<u32, JsError> {
+        let keys = document_keys(&keys)?;
+        let builder = self
+            .inner
+            .as_mut()
+            .ok_or_else(|| JsError::new("finish() was already called"))?;
+        let docid = match docid {
+            Some(docid) => builder
+                .add_with_docid(docid as u64, &keys)
+                .map(|_| docid as u64),
+            None => builder.add(&keys),
+        }
+        .map_err(js_error)?;
+        docid32(docid)
+    }
+
+    /// Number of document ids used so far (largest + 1)
+    #[wasm_bindgen(getter, js_name = numDocuments)]
+    pub fn num_documents(&self) -> f64 {
+        self.inner.as_ref().map_or(0, |b| b.num_documents()) as f64
+    }
+
+    /// The store files (a `Map` from file name to `Uint8Array`), to be
+    /// stored by the caller and given to `DocumentStore.load`
+    pub fn finish(&mut self) -> Result<Map, JsError> {
+        let builder = self
+            .inner
+            .take()
+            .ok_or_else(|| JsError::new("finish() was already called"))?;
+        let out = MemoryOutput::new();
+        builder.build_to(&out).map_err(js_error)?;
+        Ok(files_map(&out.into_files()))
+    }
+}
+
+/// A document store: key lookups both ways. Stores built natively with
+/// content also load, but their content cannot be read in WASM (no zstd).
+#[wasm_bindgen]
+pub struct DocumentStore {
+    inner: StoreInner,
+}
+
+#[wasm_bindgen]
+impl DocumentStore {
+    /// Loads a store from its files (a `Map` or an object, from file name
+    /// to `Uint8Array`)
+    pub fn load(files: JsValue) -> Result<DocumentStore, JsError> {
+        let files = memory_files(&files)?;
+        let inner = StoreInner::load_from(&files, ContentAccess::Memory)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(DocumentStore { inner })
+    }
+
+    /// Number of document ids (largest + 1)
+    #[wasm_bindgen(getter, js_name = numDocuments)]
+    pub fn num_documents(&self) -> f64 {
+        self.inner.num_documents() as f64
+    }
+
+    #[wasm_bindgen(getter, js_name = keyNames)]
+    pub fn key_names(&self) -> Vec<String> {
+        self.inner.key_names().to_vec()
+    }
+
+    #[wasm_bindgen(getter, js_name = hasContent)]
+    pub fn has_content(&self) -> bool {
+        self.inner.has_content()
+    }
+
+    /// Whether there is a document with this id
+    pub fn contains(&self, docid: u32) -> bool {
+        self.inner.contains(docid as u64)
+    }
+
+    /// Values of the key `keyName` for the given document ids (`undefined`
+    /// if there is no such document, or it has no such key)
+    #[wasm_bindgen(js_name = getKeys)]
+    pub fn get_keys(&self, key_name: &str, docids: &[u32]) -> Result<Vec<JsValue>, JsError> {
+        let docids: Vec<u64> = docids.iter().map(|&d| d as u64).collect();
+        let keys = self
+            .inner
+            .get_keys(key_name, &docids)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(keys
+            .into_iter()
+            .map(|k| k.map_or(JsValue::UNDEFINED, |k| JsValue::from_str(&k)))
+            .collect())
+    }
+
+    /// Document ids of the given values of the key `keyName` (`undefined`
+    /// if not found)
+    #[wasm_bindgen(js_name = getDocids)]
+    pub fn get_docids(&self, key_name: &str, values: Vec<String>) -> Result<Vec<JsValue>, JsError> {
+        let refs: Vec<&str> = values.iter().map(|s| s.as_str()).collect();
+        let numbers = self
+            .inner
+            .get_numbers(key_name, &refs)
+            .map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(numbers
+            .into_iter()
+            .map(|n| n.map_or(JsValue::UNDEFINED, |n| JsValue::from_f64(n as f64)))
+            .collect())
     }
 }

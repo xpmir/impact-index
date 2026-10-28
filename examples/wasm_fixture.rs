@@ -9,6 +9,8 @@
 //! - `compressed/`: Elias-Fano docids, 8-bit quantised impacts (fixed range)
 //! - `split/`: the same postings, split by impact quantiles (PFOR docids)
 //! - `seg0/`, `seg1/`: two segments (halves of the collection)
+//! - `docstore/`: key-only document store, `docno` = `D{docid}` for the
+//!   even document ids
 //! - `fixture.json`: queries, deleted documents per segment, the native
 //!   top-k for each index and for the segmented search, and (up to 50k
 //!   documents) the documents, so that the WASM build can rebuild
@@ -25,6 +27,7 @@ use impact_index::builder::{BuilderOptions, Indexer};
 use impact_index::compress::docid::{EliasFanoCompressor, PForCompressor};
 use impact_index::compress::impact::{QuantizationRange, QuantizerCodec, RangedQuantizerFactory};
 use impact_index::compress::{CompressionTransform, DocIdCompressorFactory};
+use impact_index::docstore::keys::KeyStoreBuilder;
 use impact_index::search::filter::{DocBitSet, Exclude};
 use impact_index::search::maxscore::{search_maxscore, MaxScoreOptions};
 use impact_index::search::segments::{Segment, SegmentedSearch};
@@ -138,6 +141,13 @@ fn main() {
             .unwrap();
     }
     std::fs::remove_dir_all(&tmp).unwrap();
+
+    let mut store = KeyStoreBuilder::new();
+    for docid in (0..num_docs as DocId).step_by(2) {
+        let keys = HashMap::from([("docno".to_string(), format!("D{docid}"))]);
+        store.add_with_docid(docid, &keys).unwrap();
+    }
+    store.build(&out.join("docstore")).unwrap();
 
     let compressed = load_index(&out.join("compressed"), true);
     let split = load_index(&out.join("split"), true);

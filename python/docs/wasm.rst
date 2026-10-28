@@ -93,6 +93,28 @@ segments as one.
 
     segments.setDeleted(1, DocSet.fromDocids(new Uint32Array([5])));
 
+Document ids and keys
+---------------------
+
+Search results are document ids; a key-only :doc:`document store
+<docstore>` maps them to keys such as a ``docno`` and back. Build it in
+WASM with ``KeyStoreBuilder``, or natively (``content=False``):
+
+.. code-block:: javascript
+
+    import { KeyStoreBuilder, DocumentStore } from "./pkg/impact_index_wasm.js";
+
+    const keys = new KeyStoreBuilder();
+    keys.add({ docno: "D-17" }, 0);       // document id 0 (as in Builder.add)
+    keys.add({ docno: "D-42" });          // without an id: the next one (1)
+    const store = DocumentStore.load(keys.finish());
+
+    store.getKeys("docno", docids);       // docno of each hit (or undefined)
+    store.getDocids("docno", ["D-42"]);   // [1]
+
+Stores built natively with content also load: their keys can be looked up
+(format version 2), but not their content, which needs zstd.
+
 Errors (corrupt or incomplete index files, invalid documents...) are thrown
 as JavaScript exceptions, and the module stays usable.
 
@@ -105,7 +127,8 @@ Limits
   index files plus some 30 MB. On 200k synthetic documents (45 MB index),
   a top-100 search takes 1-3 ms in Node.js.
 - Not available in WASM: BM25 / text indexing, positions and structured
-  queries, document stores, BMP and Seismic, and builder checkpoints.
+  queries, document contents (key-only stores work), BMP and Seismic, and
+  builder checkpoints.
 - Licence: GPL-2.0-or-later, like the rest of the library; a WASM bundle
   that includes it must be distributed under the GPL.
 
@@ -124,6 +147,7 @@ They can also be disabled in other Rust projects:
 ``progress``
     progress bars
 ``zstd``
-    document store and builder checkpoints (zstd is a C library)
+    document contents in document stores, and builder checkpoints (zstd
+    is a C library); key-only stores do not need it
 ``bmp``
     conversion to BMP indexes and CIFF export
