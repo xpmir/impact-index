@@ -48,6 +48,11 @@ The default settings are optimized for BM25:
   (~2-3 bits per value). Use ``nbits=8`` or ``nbits=16`` for quantized
   float compression (neural IR like SPLADE).
 
+By default the quantisation range is the min/max of the compressed index.
+``quantization=(min, max)`` fixes it, and ``quantization=other.quantizer()``
+reuses another index's, so that scores of several indices are exactly
+comparable (see :ref:`incremental`).
+
 Advanced compression
 ~~~~~~~~~~~~~~~~~~~~
 

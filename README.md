@@ -14,6 +14,7 @@ Supports both neural IR models with floating-point impact scores and traditional
 - **One-liner compression**: `index.compress("/path/to/output")`
 - **Document reordering** by recursive graph bisection (`index.reorder(...)`) for smaller indices and stronger block-max pruning
 - **Posting list splitting** by quantile for term impact decomposition
+- **Incremental indexing**: filtered search (tombstones, allow-lists), comparable quantisation across indices and multi-segment search, for collections that change continuously — see [Incremental Indexing](#incremental-indexing)
 - **Index versioning**: per-index `manifest.json` with format version checks and one-step migration (`Index.update(path)`)
 - **BMP (Block-Max Pruning)** for fast approximate search ([SIGIR 2024](https://github.com/pisa-engine/BMP))
 - **Seismic** for very fast approximate search over learned impacts ([SIGIR 2024](https://github.com/TusKANNy/seismic)) — see [Approximate search with Seismic](#approximate-search-with-seismic)
@@ -251,6 +252,52 @@ migrated across Seismic versions: rebuild it with `to_seismic`.
 
 See [Performance](#performance) for SPLADE-v3 speed and accuracy
 against exact search and BMP.
+
+## Incremental Indexing
+
+Indices are immutable, but a collection that changes (documents added,
+modified, deleted) can be kept as a set of **segments**. The library provides
+what this needs; the caller keeps the policy (when to flush, when to merge,
+where tombstones are stored):
+
+```python
+# First segment: quantised with its own range
+seg0 = raw0.compress("/path/seg0", nbits=8)
+# Later segments reuse its quantiser, so scores are exactly comparable
+seg1 = raw1.compress("/path/seg1", quantization=seg0.quantizer())
+seg1.clamped_impacts   # impacts outside seg0's range (clamped)
+
+# Search all segments as one, skipping deleted / re-indexed documents
+segments = impact_index.SegmentedIndex([seg0, seg1])
+for hit in segments.search(query, top_k=10, deleted=[[3, 17], None]):
+    print(hit.segment, hit.docid, hit.score)
+
+# Filtered search on a single index (numpy bool mask or list of docids)
+index.search_maxscore_filtered(query, top_k=10, deleted=mask, allowed=subset)
+```
+
+The pattern (see [`examples/incremental.py`](examples/incremental.py)):
+
+- Keep the raw sparse vectors as the source of truth, so any segment can be
+  rebuilt without re-encoding.
+- Put new documents in a small buffer, searched exhaustively; when it fills,
+  build it into a new immutable segment.
+- Tombstone deleted / modified documents in their segment; filters are
+  applied before heap insertion, so the top-k stays exact.
+- Search segments together with `SegmentedIndex` (largest first, each passing
+  the global k-th score to the next as an initial threshold).
+- Merge in the background (tiered, or when a segment is mostly deleted) by
+  rebuilding from the stored vectors.
+- List live segments in a manifest swapped atomically, for crash safety.
+
+**Comparable scores.** With a per-index range (`quantization=None`, the
+default), the same weight decodes to slightly different values in different
+segments: at most one quantisation step (`range / 2^nbits`) per posting —
+negligible with `nbits=16`, visible with `nbits=8`. A fixed range
+(`quantization=(0.0, 3.0)`) or a reference (`quantization=seg0.quantizer()`)
+makes scores exactly comparable. This holds for learned impacts (SPLADE-style
+scores do not depend on collection statistics); BM25 segments would need
+global statistics and are not supported yet.
 
 ## Stop Words
 

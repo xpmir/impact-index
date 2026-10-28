@@ -22,6 +22,9 @@ Features
 - **Document reordering** by recursive graph bisection
   (``index.reorder(...)``) for smaller indices and stronger pruning
 - **Posting list splitting** by quantile for term impact decomposition
+- **Incremental indexing**: filtered search (tombstones, allow-lists),
+  comparable quantisation across indices and multi-segment search
+  (:class:`~impact_index.SegmentedIndex`)
 - **Index versioning**: per-index ``manifest.json`` with format checks and
   one-step migration (``Index.update(path)``)
 - **Approximate search** over learned impacts with
@@ -62,6 +65,8 @@ Documentation
   positions and structured queries
 - :doc:`compression`: compressed, split and reordered indices, and
   approximate search with BMP and Seismic
+- :doc:`incremental`: collections that change continuously (segments,
+  tombstones, comparable scores)
 - :doc:`docstore`: compressed storage for the documents themselves
 - :doc:`versioning`: on-disk format versions and migrating old indices
 
@@ -74,5 +79,6 @@ Each page ends with the API reference of the classes it covers.
    first-index
    bow
    compression
+   incremental
    docstore
    versioning
