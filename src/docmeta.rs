@@ -4,7 +4,7 @@
 //! Currently supports document lengths as `u32` values.
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -94,15 +94,17 @@ impl DocMetadata {
 
     /// Load document metadata from a directory.
     pub fn load(dir: &Path) -> std::io::Result<Self> {
+        Self::load_from(&crate::storage::DirFiles::new(dir))
+    }
+
+    /// Load document metadata from an index's files.
+    pub fn load_from(files: &dyn crate::storage::IndexFiles) -> std::io::Result<Self> {
         // Read metadata info
-        let cbor_path = dir.join("docmeta.cbor");
-        let cbor_file = File::open(&cbor_path)?;
-        let info: DocMetadataInfo = ciborium::de::from_reader(cbor_file)
+        let info: DocMetadataInfo = ciborium::de::from_reader(files.open("docmeta.cbor")?)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
         // Read raw doc lengths
-        let dat_path = dir.join("docmeta.dat");
-        let mut reader = BufReader::new(File::open(&dat_path)?);
+        let mut reader = files.open("docmeta.dat")?;
         let mut doc_lengths = Vec::with_capacity(info.num_docs as usize);
         for _ in 0..info.num_docs {
             doc_lengths.push(reader.read_u32::<LittleEndian>()?);

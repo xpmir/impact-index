@@ -9,9 +9,10 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use half::{bf16, f16};
 use serde::{Deserialize, Serialize};
 
-use crate::builder::load_forward_index_dynamic;
+use crate::builder::{load_forward_index_dynamic, load_forward_index_from};
 use crate::index::{BlockTermImpactIterator, SparseIndex};
 use crate::search::ScoredDocument;
+use crate::storage::{DirFiles, IndexFiles};
 
 /// Index identifying a term in the vocabulary (0-based).
 pub type TermIndex = usize;
@@ -267,8 +268,19 @@ pub type SearchFn = fn(
 /// so the correct loader is automatically selected when loading.
 #[typetag::serde(tag = "type")]
 pub trait IndexLoader {
+    /// Consumes the loader and returns a ready-to-query index, reading the
+    /// other files of the index from `files`.
+    fn load_from(
+        self: Box<Self>,
+        files: &dyn IndexFiles,
+        in_memory: bool,
+    ) -> std::io::Result<Box<dyn SparseIndex>>;
+
     /// Consumes the loader and returns a ready-to-query index.
-    fn into_index(self: Box<Self>, path: &Path, in_memory: bool) -> Box<dyn SparseIndex>;
+    fn into_index(self: Box<Self>, path: &Path, in_memory: bool) -> Box<dyn SparseIndex> {
+        self.load_from(&DirFiles::new(path), in_memory)
+            .unwrap_or_else(|e| panic!("{}", e))
+    }
 }
 
 /// Loads a sparse index from the given directory.
@@ -324,26 +336,61 @@ pub fn load_index(path: &Path, in_memory: bool) -> Box<dyn SparseIndex> {
     index
 }
 
+/// Loads a sparse index from its files, e.g. byte buffers handed over by
+/// the caller ([`crate::storage::MemoryFiles`]) when there is no file
+/// system (WASM).
+///
+/// Unlike [`load_index`], problems (missing file, format version mismatch,
+/// corrupt metadata) are returned as errors, and nothing is written back:
+/// a legacy index without manifest is not stamped, and an index needing a
+/// migration must be migrated natively first.
+pub fn load_index_from_files(
+    files: &dyn IndexFiles,
+    in_memory: bool,
+) -> std::io::Result<Box<dyn SparseIndex>> {
+    if let Some(m) = crate::manifest::check_index_manifest_from(files)? {
+        if m.index_kind == crate::manifest::IndexKind::Seismic {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Seismic indexes cannot be loaded with load_index",
+            ));
+        }
+    }
+
+    if files.exists(BUILDER_INDEX_CBOR) {
+        return load_forward_index_from(files, in_memory);
+    }
+    let loader: Box<dyn IndexLoader> =
+        ciborium::de::from_reader(files.open(INDEX_CBOR)?).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Error reading {}: {}", files.describe(INDEX_CBOR), e),
+            )
+        })?;
+    loader.load_from(files, in_memory)
+}
+
 /// Saves an index loader to disk so the index can be loaded later.
 ///
 /// Serializes the loader as CBOR into `index.cbor` within the given directory.
 pub fn save_index(loader: Box<dyn IndexLoader>, path: &Path) -> Result<(), std::io::Error> {
-    use std::io::BufWriter;
+    save_index_to(loader, &crate::storage::DirOutput::new(path))
+}
 
-    let info_path = path.join(INDEX_CBOR);
-    let info_path_s = info_path.display().to_string();
-
-    let info_file = File::options()
-        .write(true)
-        .truncate(true)
-        .create(true)
-        .open(info_path)
+/// Saves an index loader into `index.cbor` of an index output.
+pub fn save_index_to<O: crate::storage::IndexOutput>(
+    loader: Box<dyn IndexLoader>,
+    out: &O,
+) -> Result<(), std::io::Error> {
+    let info_path_s = out.describe(INDEX_CBOR);
+    let mut writer = out
+        .create(INDEX_CBOR)
         .expect(&format!("Error while creating file {}", info_path_s));
 
     eprintln!("Writing index metadata to {}...", info_path_s);
-    let writer = BufWriter::new(info_file);
-    ciborium::ser::into_writer(&loader, writer)
+    ciborium::ser::into_writer(&loader, &mut writer)
         .expect("Error saving compressed term index information");
+    out.close(INDEX_CBOR, writer)?;
     eprintln!("Done writing index metadata.");
 
     Ok(())

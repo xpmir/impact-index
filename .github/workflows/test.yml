@@ -21,6 +21,29 @@ jobs:
     - run: rustup toolchain install nightly-2026-09-20 --profile minimal
     - run: cargo test --features seismic
 
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        submodules: 'true'
+    - run: rustup toolchain install nightly-2026-09-20 --profile minimal --target wasm32-unknown-unknown
+    - uses: actions/setup-node@v5
+      with:
+        node-version: '22'
+    - name: Install wasm-bindgen (version from Cargo.lock)
+      run: |
+        version=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')
+        cargo install wasm-bindgen-cli --locked --version "$version"
+    - name: Core library without native features
+      run: cargo build --target wasm32-unknown-unknown --no-default-features
+    - name: Tests inside WASM
+      run: cargo test -p impact-index-wasm --target wasm32-unknown-unknown
+      env:
+        CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+    - name: WASM against native
+      run: wasm/tests/check.sh
+
   python:
     runs-on: ubuntu-latest
     steps:

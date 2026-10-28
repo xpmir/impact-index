@@ -40,11 +40,13 @@
 //! ```
 
 pub mod base;
+#[cfg(feature = "bmp")]
 pub mod bmp;
 pub mod bow;
 pub mod builder;
 pub mod compress;
 pub mod docmeta;
+#[cfg(all(feature = "zstd", feature = "mmap"))]
 pub mod docstore;
 pub mod index;
 pub mod manifest;
@@ -53,10 +55,11 @@ pub mod scoring;
 pub mod search;
 #[cfg(feature = "seismic")]
 pub mod seismic;
+pub mod storage;
 pub mod transforms;
 pub mod vocab;
 
 // Docstrings here are Python (RST) docs, not rustdoc: keep them out of doctests.
-#[cfg(not(doctest))]
+#[cfg(all(feature = "python", not(doctest)))]
 pub mod py;
 mod utils;

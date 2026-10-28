@@ -39,9 +39,9 @@
 //!    an un-migrated directory should fail with the actionable error from
 //!    [`check_format_version`], pointing the user at `update_index`.
 
-use std::fs::File;
-use std::io::{self, BufReader, BufWriter};
+use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -177,13 +177,28 @@ impl Manifest {
     }
 }
 
+/// `SystemTime::now()` panics on `wasm32-unknown-unknown`, which has no
+/// clock: the embedder sets the time with [`set_unix_time`] instead.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+static UNIX_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Sets the current time (seconds since the Unix epoch) for manifests
+/// written from now on (`wasm32-unknown-unknown` only, which has no clock).
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+pub fn set_unix_time(secs: u64) {
+    UNIX_TIME.store(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Returns the current UTC time as an ISO-8601 string, without pulling in
 /// a datetime dependency (the crate has none).
 fn current_iso_date() -> String {
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    let secs = UNIX_TIME.load(std::sync::atomic::Ordering::Relaxed);
     let days = (secs / 86_400) as i64;
     let time_of_day = secs % 86_400;
     let (y, m, d) = civil_from_days(days);
@@ -253,17 +268,25 @@ pub fn check_format_version(found: u32, supported: u32) -> io::Result<()> {
 /// Returns `Ok(None)` when there is no manifest at all (a legacy index
 /// directory). Returns `Err` only for I/O errors or a malformed file.
 pub fn read_manifest(path: &Path) -> io::Result<Option<Manifest>> {
-    let manifest_path = path.join(MANIFEST_FILENAME);
-    if !manifest_path.exists() {
+    read_manifest_from(&crate::storage::DirFiles::new(path))
+}
+
+/// Reads an index's `manifest.json` from its files, like [`read_manifest`].
+pub fn read_manifest_from(files: &dyn crate::storage::IndexFiles) -> io::Result<Option<Manifest>> {
+    if !files.exists(MANIFEST_FILENAME) {
         return Ok(None);
     }
-    let file = File::open(&manifest_path)?;
-    let manifest: Manifest = serde_json::from_reader(BufReader::new(file)).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("Malformed manifest at {}: {}", manifest_path.display(), e),
-        )
-    })?;
+    let manifest: Manifest =
+        serde_json::from_reader(files.open(MANIFEST_FILENAME)?).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Malformed manifest at {}: {}",
+                    files.describe(MANIFEST_FILENAME),
+                    e
+                ),
+            )
+        })?;
     Ok(Some(manifest))
 }
 
@@ -292,10 +315,18 @@ pub fn write_manifest_with_features(
 /// [`write_manifest`] builds on; it is also useful for tests that need to
 /// simulate a manifest written by a different library version.
 pub fn write_manifest_raw(path: &Path, manifest: &Manifest) -> io::Result<()> {
-    let manifest_path = path.join(MANIFEST_FILENAME);
-    let file = File::create(&manifest_path)?;
-    serde_json::to_writer_pretty(BufWriter::new(file), manifest)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    write_manifest_raw_to(&crate::storage::DirOutput::new(path), manifest)
+}
+
+/// Writes a [`Manifest`] verbatim into an index output.
+pub fn write_manifest_raw_to<O: crate::storage::IndexOutput>(
+    out: &O,
+    manifest: &Manifest,
+) -> io::Result<()> {
+    let mut writer = out.create(MANIFEST_FILENAME)?;
+    serde_json::to_writer_pretty(&mut writer, manifest)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    out.close(MANIFEST_FILENAME, writer)
 }
 
 /// Verifies that an index directory's manifest (if present) is compatible
@@ -310,7 +341,14 @@ pub fn write_manifest_raw(path: &Path, manifest: &Manifest) -> io::Result<()> {
 ///   -- the error message is actionable (upgrade the library, or run the
 ///   migration).
 pub fn check_index_manifest(path: &Path) -> io::Result<Option<Manifest>> {
-    match read_manifest(path)? {
+    check_index_manifest_from(&crate::storage::DirFiles::new(path))
+}
+
+/// Verifies an index's manifest from its files, like [`check_index_manifest`].
+pub fn check_index_manifest_from(
+    files: &dyn crate::storage::IndexFiles,
+) -> io::Result<Option<Manifest>> {
+    match read_manifest_from(files)? {
         None => Ok(None),
         Some(manifest) => {
             check_format_version(manifest.format_version, CURRENT_FORMAT_VERSION)?;

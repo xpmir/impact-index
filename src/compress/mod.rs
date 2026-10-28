@@ -20,19 +20,22 @@ use super::{
     index::{BlockTermImpactIterator, SparseIndex, SparseIndexView},
     transforms::IndexTransform,
 };
+use crate::utils::par::*;
 use crate::{
-    base::{save_index, DocId, ImpactValue, IndexLoader, Len, TermImpact, TermIndex},
+    base::{save_index_to, DocId, ImpactValue, IndexLoader, Len, TermImpact, TermIndex},
     index::SparseIndexInformation,
     scoring::ScoringFunction,
     search::cursor::TermCursor,
-    utils::buffer::{Buffer, MemoryBuffer, MmapBuffer, Slice},
+    storage::{DirOutput, IndexFiles, IndexOutput},
+    utils::buffer::{Buffer, MmapBuffer, Slice},
 };
-use indicatif::{ProgressBar, ProgressIterator, ProgressStyle};
+#[cfg(feature = "progress")]
+use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, info, warn};
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 pub mod docid;
+pub mod elias_fano;
 pub mod impact;
 pub mod positions;
 
@@ -2001,14 +2004,21 @@ impl CompressionTransform {
         path: &Path,
         index: &dyn SparseIndexView,
     ) -> Result<CompressionReport, std::io::Error> {
-        use std::io::BufWriter;
-
         // Create the directory if needed
         if !path.is_dir() {
             info!("Creating path {}", path.display());
             create_dir(path)?;
         }
+        self.compress_to(&DirOutput::new(path), index)
+    }
 
+    /// Like [`Self::compress`], writing the index files into `out` (e.g.
+    /// [`crate::storage::MemoryOutput`] when there is no file system).
+    pub fn compress_to<O: IndexOutput>(
+        &self,
+        out: &O,
+        index: &dyn SparseIndexView,
+    ) -> Result<CompressionReport, std::io::Error> {
         let doc_ids_compressor = self.doc_ids_compressor_factory.create(index);
         let values_compressor = self.impacts_compressor_factory.create(index);
         let max_block_size = self.max_block_size;
@@ -2042,7 +2052,9 @@ impl CompressionTransform {
         // `min_dl == 0` fallback -- still correct, just not tighter.
         let doc_meta = index.doc_meta();
 
+        #[cfg(feature = "progress")]
         let pb = ProgressBar::new(index.len() as u64);
+        #[cfg(feature = "progress")]
         pb.set_style(
             ProgressStyle::default_bar()
                 .template(
@@ -2051,35 +2063,19 @@ impl CompressionTransform {
                 .progress_chars("=> "),
         );
 
-        let mut impact_writer = BufWriter::new(
-            File::options()
-                .write(true)
-                .truncate(true)
-                .create(true)
-                .open(path.join("impacts.dat"))
-                .expect("Could not create the values file"),
-        );
+        let mut impact_writer = out
+            .create("impacts.dat")
+            .expect("Could not create the values file");
 
-        let mut docid_writer = BufWriter::new(
-            File::options()
-                .write(true)
-                .truncate(true)
-                .create(true)
-                .open(path.join("docids.dat"))
-                .expect("Could not create the document IDs file"),
-        );
+        let mut docid_writer = out
+            .create("docids.dat")
+            .expect("Could not create the document IDs file");
 
         // Only created when the source has positions -- an index without
         // positions never gets a `positions.dat` at all.
-        let mut positions_writer: Option<BufWriter<File>> = has_positions.then(|| {
-            BufWriter::new(
-                File::options()
-                    .write(true)
-                    .truncate(true)
-                    .create(true)
-                    .open(path.join("positions.dat"))
-                    .expect("Could not create the positions file"),
-            )
+        let mut positions_writer: Option<O::Writer> = has_positions.then(|| {
+            out.create("positions.dat")
+                .expect("Could not create the positions file")
         });
 
         let mut terms_info = Vec::with_capacity(index.len());
@@ -2262,6 +2258,7 @@ impl CompressionTransform {
                         .min()
                         .unwrap_or(0);
 
+                    #[cfg(feature = "progress")]
                     pb.inc(1);
 
                     CompressedTermResult {
@@ -2300,9 +2297,12 @@ impl CompressionTransform {
             }
         }
 
+        #[cfg(feature = "progress")]
         pb.finish();
-        if let Some(w) = positions_writer.as_mut() {
-            w.flush()?;
+        out.close("impacts.dat", impact_writer)?;
+        out.close("docids.dat", docid_writer)?;
+        if let Some(w) = positions_writer {
+            out.close("positions.dat", w)?;
         }
 
         let information = CompressedIndexInformation {
@@ -2313,16 +2313,13 @@ impl CompressionTransform {
         };
 
         // Write compact binary metadata
-        let meta_path = path.join("index.bin");
-        eprintln!("Writing binary metadata to {}...", meta_path.display());
-        let meta_file = std::io::BufWriter::new(
-            File::options()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&meta_path)?,
+        eprintln!(
+            "Writing binary metadata to {}...",
+            out.describe("index.bin")
         );
-        information.write_binary(&mut std::io::BufWriter::new(meta_file))?;
+        let mut meta_writer = out.create("index.bin")?;
+        information.write_binary(&mut meta_writer)?;
+        out.close("index.bin", meta_writer)?;
 
         // Write a minimal CBOR stub (just type tag + compressors, no term data)
         // so load_index dispatches to CompressedIndexLoader which reads index.bin
@@ -2349,22 +2346,18 @@ impl CompressionTransform {
         let builder_info = crate::manifest::BuilderInfo::new()
             .with_block_size(max_block_size)
             .with_codecs(codecs);
-        if has_positions {
-            crate::manifest::write_manifest_with_features(
-                path,
-                crate::manifest::IndexKind::Compressed,
-                builder_info,
-                vec!["positions".to_string()],
-            )?;
+        let features = if has_positions {
+            vec!["positions".to_string()]
         } else {
-            crate::manifest::write_manifest(
-                path,
-                crate::manifest::IndexKind::Compressed,
-                builder_info,
-            )?;
-        }
+            Vec::new()
+        };
+        crate::manifest::write_manifest_raw_to(
+            out,
+            &crate::manifest::Manifest::new(crate::manifest::IndexKind::Compressed, builder_info)
+                .with_features(features),
+        )?;
 
-        save_index(Box::new(stub), path)?;
+        save_index_to(Box::new(stub), out)?;
 
         if clamped_impacts > 0 {
             warn!(
@@ -2385,24 +2378,22 @@ struct CompressedIndexLoader {
 #[typetag::serde]
 impl IndexLoader for CompressedIndexLoader {
     /// Loads a block-based index. Prefers binary metadata (index.bin) if available.
-    fn into_index(self: Box<Self>, path: &Path, in_memory: bool) -> Box<dyn SparseIndex> {
+    fn load_from(
+        self: Box<Self>,
+        files: &dyn IndexFiles,
+        in_memory: bool,
+    ) -> std::io::Result<Box<dyn SparseIndex>> {
         // Try loading binary metadata (compact), fall back to CBOR (from self)
-        let bin_path = path.join("index.bin");
-        let information = if bin_path.exists() {
-            let mut reader =
-                std::io::BufReader::new(File::open(&bin_path).expect("Failed to open index.bin"));
-            CompressedIndexInformation::read_binary(&mut reader)
-                .expect("Failed to read binary metadata")
+        let information = if files.exists("index.bin") {
+            CompressedIndexInformation::read_binary(&mut files.open("index.bin")?)?
         } else {
             self.information
         };
 
-        let docid_path = path.join("docids.dat");
-        let impact_path = path.join("impacts.dat");
         // Auto-detect auxiliary components
-        let doc_meta = crate::docmeta::DocMetadata::load(path).ok();
+        let doc_meta = crate::docmeta::DocMetadata::load_from(files).ok();
         let analyzer_config = {
-            let cfg = crate::vocab::analyzer::TextAnalyzer::load_config(path);
+            let cfg = crate::vocab::analyzer::TextAnalyzer::load_config_from(files);
             if cfg.stemmer == "none" && !cfg.stop_words {
                 None
             } else {
@@ -2410,40 +2401,27 @@ impl IndexLoader for CompressedIndexLoader {
             }
         };
 
-        let reorder_map = crate::transforms::reorder::ReorderMap::load(path).ok();
+        let reorder_map = crate::transforms::reorder::ReorderMap::load_from(files).ok();
 
         // `positions.dat` is only opened (mmap'd or loaded into memory) if
         // it exists; a non-positional index never even has this file, and
         // this is the ONLY place its bytes are touched during loading --
         // it's not decoded until a caller actually asks for positions.
-        let positions_path = path.join("positions.dat");
-        let positions_buffer: Option<Box<dyn Buffer>> = if positions_path.exists() {
-            Some(if in_memory {
-                Box::new(MemoryBuffer::new(&positions_path))
-            } else {
-                Box::new(MmapBuffer::new(&positions_path))
-            })
+        let positions_buffer = if files.exists("positions.dat") {
+            Some(files.buffer("positions.dat", in_memory)?)
         } else {
             None
         };
 
-        Box::new(CompressedIndex {
+        Ok(Box::new(CompressedIndex {
             information,
-            docid_buffer: if in_memory {
-                Box::new(MemoryBuffer::new(&docid_path))
-            } else {
-                Box::new(MmapBuffer::new(&docid_path))
-            },
-            impact_buffer: if in_memory {
-                Box::new(MemoryBuffer::new(&impact_path))
-            } else {
-                Box::new(MmapBuffer::new(&impact_path))
-            },
+            docid_buffer: files.buffer("docids.dat", in_memory)?,
+            impact_buffer: files.buffer("impacts.dat", in_memory)?,
             positions_buffer,
-            source_dir: Some(path.to_path_buf()),
+            source_dir: files.dir().map(Path::to_path_buf),
             doc_meta,
             analyzer_config,
             reorder_map,
-        })
+        }))
     }
 }

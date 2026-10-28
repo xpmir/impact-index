@@ -7,15 +7,24 @@
 //! - [`SparseIndexInformation`]: Access to per-term statistics
 
 use std::fmt;
-use std::fs::File;
-use std::io::{BufWriter, Result, Write};
+use std::io::Result;
 use std::path::Path;
+#[cfg(feature = "bmp")]
+use std::{
+    fs::File,
+    io::{BufWriter, Write},
+};
 
 use crate::base::{DocId, ImpactValue, Len, TermIndex};
+#[cfg(feature = "bmp")]
 use bmp::index::forward_index::ForwardIndexBuilder;
+#[cfg(feature = "bmp")]
 use bmp::index::inverted_index::IndexBuilder;
+#[cfg(feature = "bmp")]
 use bmp::proto::{DocRecord, Header, Posting, PostingsList};
+#[cfg(feature = "bmp")]
 use indicatif::{ProgressBar, ProgressStyle};
+#[cfg(feature = "bmp")]
 use protobuf::CodedOutputStream;
 use serde::{Deserialize, Serialize};
 
@@ -350,6 +359,7 @@ pub trait AsSparseIndexView {
     fn as_view(&self) -> &dyn SparseIndexView;
 }
 
+#[cfg(feature = "bmp")]
 fn pb_style() -> ProgressStyle {
     const DEFAULT_PROGRESS_TEMPLATE: &str =
         "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {count}/{total} ({eta})";
@@ -479,6 +489,7 @@ pub trait SparseIndex: Send + Sync + SparseIndexView + AsSparseIndexView {
     }
 
     /// Convert to BMP file format
+    #[cfg(feature = "bmp")]
     fn convert_to_bmp(&self, output: &Path, bsize: usize, compress_range: bool) -> Result<()> {
         let mut builder: IndexBuilder;
         let index = self.as_view();
@@ -586,6 +597,7 @@ pub trait SparseIndex: Send + Sync + SparseIndexView + AsSparseIndexView {
     /// * `output` - Output path for the BMP index file
     /// * `bsize` - Block size for BMP partitioning
     /// * `compress_range` - Whether to compress block max scores
+    #[cfg(feature = "bmp")]
     fn convert_to_bmp_streaming(
         &self,
         output: &Path,
@@ -606,6 +618,8 @@ pub trait SparseIndex: Send + Sync + SparseIndexView + AsSparseIndexView {
         crate::seismic::convert_to_seismic(self.as_view(), output, config)
     }
 
+    /// Export in CIFF (protobuf types come from the BMP crate)
+    #[cfg(feature = "bmp")]
     fn to_ciff(&self, writer: &mut dyn Write, quantization: u128) {
         let mut output = CodedOutputStream::new(writer);
         let index_view = self.as_view();

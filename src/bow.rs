@@ -5,8 +5,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::utils::par::*;
 use ndarray::Array1;
-use rayon::prelude::*;
 
 use crate::base::{BoxResult, DocId, PostingValue, TermIndex};
 use crate::builder::{BuilderOptions, Indexer, SparseBuilderIndex};

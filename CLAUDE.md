@@ -45,6 +45,20 @@ When bumping the pinned `seismic` rev, also bump `SEISMIC_FORMAT` in
 When bumping the nightly, update `rust-toolchain.toml` and the
 `rust-toolchain`/`rustup` lines in `.github/workflows/*.yml` together.
 
+### WASM (`wasm/`, crate `impact-index-wasm`)
+Depends on the root crate with `--no-default-features` (features `python`,
+`mmap`, `parallel`, `progress`, `zstd`, `bmp` are the native-only parts; all
+on by default). `sucds` is 64-bit only: `src/compress/elias_fano.rs` is a
+byte-compatible Elias-Fano codec used on 32-bit targets.
+```bash
+rustup target add wasm32-unknown-unknown
+cargo build --target wasm32-unknown-unknown --no-default-features  # core
+CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+    cargo test -p impact-index-wasm --target wasm32-unknown-unknown
+wasm/tests/check.sh   # WASM vs native results and builds (needs node)
+```
+`wasm-bindgen-cli` must match the `wasm-bindgen` version in `Cargo.lock`.
+
 ### Python Bindings (BMP)
 ```bash
 # Build and install (from BMP/python directory)

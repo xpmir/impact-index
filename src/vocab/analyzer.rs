@@ -841,9 +841,13 @@ impl TextAnalyzer {
 
     /// Load analyzer config if available, otherwise return default.
     pub fn load_config(dir: &Path) -> AnalyzerConfig {
-        let config_path = dir.join("analyzer.cbor");
-        if config_path.exists() {
-            if let Ok(file) = std::fs::File::open(&config_path) {
+        Self::load_config_from(&crate::storage::DirFiles::new(dir))
+    }
+
+    /// Load analyzer config from an index's files, or return default.
+    pub fn load_config_from(files: &dyn crate::storage::IndexFiles) -> AnalyzerConfig {
+        if files.exists("analyzer.cbor") {
+            if let Ok(file) = files.open("analyzer.cbor") {
                 if let Ok(config) = ciborium::de::from_reader(file) {
                     return config;
                 }

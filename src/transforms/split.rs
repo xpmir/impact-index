@@ -12,9 +12,11 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use crate::base::{
-    load_index, save_index, DocId, ImpactValue, IndexLoader, Len, TermImpact, TermIndex,
+    load_index, load_index_from_files, save_index, DocId, ImpactValue, IndexLoader, Len,
+    TermImpact, TermIndex,
 };
 use crate::index::{SparseIndexInformation, SparseIndexView};
+use crate::storage::{DirFiles, IndexFiles};
 use crate::{
     index::{BlockTermImpactIterator, SparseIndex},
     transforms::IndexTransform,
@@ -96,15 +98,15 @@ struct SplitIndexLoader {
 /// Warns when loading a split index built before per-split value ranges
 /// were fixed, with a quantizing impact compressor: its highest impacts
 /// were clamped at build time, so search results are degraded.
-fn warn_if_clamped_split_index(path: &Path) {
-    let has_feature = match crate::manifest::read_manifest(path) {
+fn warn_if_clamped_split_index(files: &dyn IndexFiles) {
+    let has_feature = match crate::manifest::read_manifest_from(files) {
         Ok(Some(m)) => m.features.iter().any(|f| f == SPLIT_VALUE_RANGE_FEATURE),
         _ => false,
     };
     if has_feature {
         return;
     }
-    let quantized = match crate::manifest::read_manifest(&path.join("inner")) {
+    let quantized = match crate::manifest::read_manifest_from(&*files.sub("inner")) {
         Ok(Some(m)) => m.builder.codecs.map_or(false, |c| c.contains("Quantize")),
         _ => false,
     };
@@ -113,7 +115,7 @@ fn warn_if_clamped_split_index(path: &Path) {
             "Split index at {} was built with a quantizing impact compressor by a \
              version with a bug that clamped the highest impacts: search results \
              are degraded. Please rebuild the index (SplitIndexTransform.process).",
-            path.display()
+            files.describe("")
         );
     }
 }
@@ -121,12 +123,27 @@ fn warn_if_clamped_split_index(path: &Path) {
 #[typetag::serde]
 impl IndexLoader for SplitIndexLoader {
     fn into_index(self: Box<Self>, path: &Path, in_memory: bool) -> Box<dyn SparseIndex> {
-        warn_if_clamped_split_index(path);
+        // Through `load_index`, which also handles the inner index's
+        // manifest (stamping, version check)
+        warn_if_clamped_split_index(&DirFiles::new(path));
         let inner = load_index(&path.join("inner"), in_memory);
         Box::new(SplitIndex {
             inner,
             splits: self.splits,
         })
+    }
+
+    fn load_from(
+        self: Box<Self>,
+        files: &dyn IndexFiles,
+        in_memory: bool,
+    ) -> std::io::Result<Box<dyn SparseIndex>> {
+        warn_if_clamped_split_index(files);
+        let inner = load_index_from_files(&*files.sub("inner"), in_memory)?;
+        Ok(Box::new(SplitIndex {
+            inner,
+            splits: self.splits,
+        }))
     }
 }
 

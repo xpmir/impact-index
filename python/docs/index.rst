@@ -25,6 +25,8 @@ Features
 - **Incremental indexing**: filtered search (tombstones, allow-lists),
   comparable quantisation across indices and multi-segment search
   (:class:`~impact_index.SegmentedIndex`)
+- **WebAssembly build** (:doc:`wasm`): index and search in a browser or a
+  web worker, with the same index format as the native library
 - **Index versioning**: per-index ``manifest.json`` with format checks and
   one-step migration (``Index.update(path)``)
 - **Approximate search** over learned impacts with
@@ -67,6 +69,7 @@ Documentation
   approximate search with BMP and Seismic
 - :doc:`incremental`: collections that change continuously (segments,
   tombstones, comparable scores)
+- :doc:`wasm`: indexing and search in WebAssembly (browsers, web workers)
 - :doc:`docstore`: compressed storage for the documents themselves
 - :doc:`versioning`: on-disk format versions and migrating old indices
 
@@ -80,5 +83,6 @@ Each page ends with the API reference of the classes it covers.
    bow
    compression
    incremental
+   wasm
    docstore
    versioning

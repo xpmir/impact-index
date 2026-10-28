@@ -59,8 +59,8 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::utils::par::*;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use rayon::prelude::*;
 
 use crate::base::{DocId, ImpactValue, Len, TermImpact, TermIndex};
 use crate::docmeta::DocMetadata;
@@ -344,7 +344,7 @@ fn bisect(ctx: &BpContext, order: &mut [u32]) {
         }
     });
 
-    rayon::join(|| bisect(ctx, left), || bisect(ctx, right));
+    join(|| bisect(ctx, left), || bisect(ctx, right));
 }
 
 /// Computes the BP permutation for `index`: `result[new_docid] =
@@ -430,7 +430,12 @@ impl ReorderMap {
 
     /// Loads a previously-saved `new_to_old` map, if `dir` has one.
     pub fn load(dir: &Path) -> std::io::Result<Vec<DocId>> {
-        let mut r = std::io::BufReader::new(std::fs::File::open(dir.join(Self::FILENAME))?);
+        Self::load_from(&crate::storage::DirFiles::new(dir))
+    }
+
+    /// Reads the permutation from an index's files.
+    pub fn load_from(files: &dyn crate::storage::IndexFiles) -> std::io::Result<Vec<DocId>> {
+        let mut r = files.open(Self::FILENAME)?;
         let n = r.read_u64::<LittleEndian>()? as usize;
         let mut v = Vec::with_capacity(n);
         for _ in 0..n {

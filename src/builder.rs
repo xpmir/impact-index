@@ -8,7 +8,7 @@
 use std::{
     cell::{Cell, RefCell},
     fs::{self, File},
-    io::{BufReader, BufWriter, Seek, Write},
+    io::{Seek, Write},
     path::{Path, PathBuf},
 };
 
@@ -28,8 +28,32 @@ use crate::{
 };
 use crate::{
     base::{Len, TermImpact},
-    utils::buffer::{Buffer, MemoryBuffer, MmapBuffer, Slice},
+    storage::{DirFiles, IndexFiles},
+    utils::buffer::{Buffer, Slice},
 };
+
+/// Checkpoints are zstd-compressed
+#[cfg(feature = "zstd")]
+fn checkpoint_reader(file: File) -> impl std::io::Read {
+    zstd::stream::Decoder::new(std::io::BufReader::new(file)).expect("Error creating zstd decoder")
+}
+
+#[cfg(feature = "zstd")]
+fn checkpoint_writer(file: File) -> impl Write {
+    zstd::stream::Encoder::new(std::io::BufWriter::new(file), 3)
+        .expect("Error creating zstd encoder")
+        .auto_finish()
+}
+
+#[cfg(not(feature = "zstd"))]
+fn checkpoint_reader(_file: File) -> File {
+    panic!("Checkpoints require the `zstd` feature")
+}
+
+#[cfg(not(feature = "zstd"))]
+fn checkpoint_writer(_file: File) -> File {
+    panic!("Checkpoints require the `zstd` feature")
+}
 
 /*
 * ---- First phase data structure
@@ -179,9 +203,7 @@ impl<V: PostingValue> TermsImpacts<V> {
                     .open(info_path)
                     .expect("Error while opening checkpoint file");
 
-                // Use zstd decompression
-                let mut decoder = zstd::stream::Decoder::new(BufReader::new(ckpt_file))
-                    .expect("Error creating zstd decoder");
+                let mut decoder = checkpoint_reader(ckpt_file);
 
                 // Read binary IndexInformation first, then CBOR for the rest
                 let pos: u64;
@@ -269,10 +291,7 @@ impl<V: PostingValue> TermsImpacts<V> {
             .open(&tmp_info_path)
             .expect("Error while creating checkpoint file");
 
-        // Use zstd compression
-        let encoder = zstd::stream::Encoder::new(BufWriter::new(info_file), 3)
-            .expect("Error creating zstd encoder");
-        let mut encoder = encoder.auto_finish();
+        let mut encoder = checkpoint_writer(info_file);
 
         let pos = self.postings_file_position;
 
@@ -745,41 +764,58 @@ pub struct SparseBuilderIndex<V: PostingValue = f32> {
 }
 
 impl<V: PostingValue> SparseBuilderIndex<V> {
-    fn new(terms: Vec<TermIndexInformation>, path: &PathBuf, in_memory: bool) -> Self {
+    fn from_files(
+        terms: Vec<TermIndexInformation>,
+        files: &dyn IndexFiles,
+        in_memory: bool,
+    ) -> std::io::Result<Self> {
         // Auto-detect auxiliary files
-        let dir = path.parent().unwrap_or(path);
-        let doc_meta = crate::docmeta::DocMetadata::load(dir).ok();
-        let analyzer_config = crate::vocab::analyzer::TextAnalyzer::load_config(dir);
+        let doc_meta = crate::docmeta::DocMetadata::load_from(files).ok();
+        let analyzer_config = crate::vocab::analyzer::TextAnalyzer::load_config_from(files);
         let analyzer_config = if analyzer_config.stemmer == "none" && !analyzer_config.stop_words {
             None // default config = no analyzer was configured
         } else {
             Some(analyzer_config)
         };
 
-        let positions_path = dir.join("positions.dat");
-        let positions_buffer: Option<Box<dyn Buffer>> = if positions_path.exists() {
-            Some(if in_memory {
-                Box::new(MemoryBuffer::new(&positions_path))
-            } else {
-                Box::new(MmapBuffer::new(&positions_path))
-            })
+        let positions_buffer = if files.exists("positions.dat") {
+            Some(files.buffer("positions.dat", in_memory)?)
         } else {
             None
         };
 
-        Self {
+        Ok(Self {
             terms: terms,
-            source_dir: Some(dir.to_path_buf()),
+            source_dir: files.dir().map(Path::to_path_buf),
             doc_meta,
             analyzer_config,
-            buffer: if in_memory {
-                Box::new(MemoryBuffer::new(path))
-            } else {
-                Box::new(MmapBuffer::new(path))
-            },
+            buffer: files.buffer("postings.dat", in_memory)?,
             positions_buffer,
             _phantom: std::marker::PhantomData,
-        }
+        })
+    }
+}
+
+/// Reads a forward index's value type and term information: binary
+/// format (compact) if present, CBOR otherwise
+fn read_forward_information(
+    files: &dyn IndexFiles,
+) -> std::io::Result<(ValueType, IndexInformation)> {
+    if files.exists("information.bin") {
+        return IndexInformation::read_binary(&mut files.open("information.bin")?);
+    }
+    let buf = files.read_all("information.cbor")?;
+    if let Ok(r) = ciborium::de::from_reader::<(ValueType, IndexInformation), _>(&buf[..]) {
+        Ok(r)
+    } else {
+        // Oldest format: no value type, f32 values
+        let info = ciborium::de::from_reader(&buf[..]).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Error loading term index information: {e}"),
+            )
+        })?;
+        Ok((ValueType::F32, info))
     }
 }
 
@@ -790,34 +826,10 @@ impl<V: PostingValue> SparseBuilderIndex<V> {
 /// * `path` - Directory containing `information.cbor` and `postings.dat`
 /// * `in_memory` - If `true`, loads postings into memory; otherwise uses mmap
 pub fn load_forward_index<V: PostingValue>(path: &Path, in_memory: bool) -> SparseBuilderIndex<V> {
-    // Prefer binary format (compact), fall back to CBOR
-    let bin_path = path.join("information.bin");
-    let ti: IndexInformation = if bin_path.exists() {
-        let mut reader =
-            std::io::BufReader::new(File::open(&bin_path).expect("Error opening information.bin"));
-        let (_vtype, info) =
-            IndexInformation::read_binary(&mut reader).expect("Error reading binary metadata");
-        info
-    } else {
-        // Fall back to CBOR
-        let mut buf = Vec::new();
-        let mut file = File::options()
-            .read(true)
-            .open(path.join("information.cbor"))
-            .expect("Error reading info");
-        std::io::Read::read_to_end(&mut file, &mut buf).expect("Error reading info");
-
-        if let Ok((_vtype, info)) =
-            ciborium::de::from_reader::<(ValueType, IndexInformation), _>(&buf[..])
-        {
-            info
-        } else {
-            ciborium::de::from_reader(&buf[..]).expect("Error loading term index information")
-        }
-    };
-
-    let postings_path = path.join("postings.dat");
-    SparseBuilderIndex::new(ti.terms, &postings_path, in_memory)
+    let files = DirFiles::new(path);
+    let (_vtype, ti) = read_forward_information(&files).expect("Error reading index information");
+    SparseBuilderIndex::from_files(ti.terms, &files, in_memory)
+        .expect("Error while reading posting file")
 }
 
 /// Loads a forward index from disk with type-erased value type.
@@ -825,38 +837,32 @@ pub fn load_forward_index<V: PostingValue>(path: &Path, in_memory: bool) -> Spar
 /// Reads the `ValueType` tag from metadata and dispatches to the correct
 /// typed `SparseBuilderIndex<V>`, returning a `Box<dyn SparseIndex>`.
 pub fn load_forward_index_dynamic(path: &Path, in_memory: bool) -> Box<dyn SparseIndex> {
-    // Get value type: prefer binary, fall back to CBOR
-    let bin_path = path.join("information.bin");
-    let vtype = if bin_path.exists() {
-        let mut reader =
-            std::io::BufReader::new(File::open(&bin_path).expect("Error opening information.bin"));
-        let (vtype, _info) =
-            IndexInformation::read_binary(&mut reader).expect("Error reading binary metadata");
-        vtype
-    } else {
-        let mut buf = Vec::new();
-        let mut file = File::options()
-            .read(true)
-            .open(path.join("information.cbor"))
-            .expect("Error reading info");
-        std::io::Read::read_to_end(&mut file, &mut buf).expect("Error reading info");
+    load_forward_index_from(&DirFiles::new(path), in_memory)
+        .unwrap_or_else(|e| panic!("Error loading forward index: {e}"))
+}
 
-        if let Ok((vtype, _info)) =
-            ciborium::de::from_reader::<(ValueType, IndexInformation), _>(&buf[..])
-        {
-            vtype
-        } else {
-            ValueType::F32
-        }
-    };
-
+/// Loads a forward index from its files, with type-erased value type.
+pub fn load_forward_index_from(
+    files: &dyn IndexFiles,
+    in_memory: bool,
+) -> std::io::Result<Box<dyn SparseIndex>> {
+    let (vtype, ti) = read_forward_information(files)?;
+    fn load<V: PostingValue + 'static>(
+        ti: IndexInformation,
+        files: &dyn IndexFiles,
+        in_memory: bool,
+    ) -> std::io::Result<Box<dyn SparseIndex>> {
+        Ok(Box::new(SparseBuilderIndex::<V>::from_files(
+            ti.terms, files, in_memory,
+        )?))
+    }
     match vtype {
-        ValueType::F32 => Box::new(load_forward_index::<f32>(path, in_memory)),
-        ValueType::F64 => Box::new(load_forward_index::<f64>(path, in_memory)),
-        ValueType::F16 => Box::new(load_forward_index::<half::f16>(path, in_memory)),
-        ValueType::BF16 => Box::new(load_forward_index::<half::bf16>(path, in_memory)),
-        ValueType::I32 => Box::new(load_forward_index::<i32>(path, in_memory)),
-        ValueType::I64 => Box::new(load_forward_index::<i64>(path, in_memory)),
+        ValueType::F32 => load::<f32>(ti, files, in_memory),
+        ValueType::F64 => load::<f64>(ti, files, in_memory),
+        ValueType::F16 => load::<half::f16>(ti, files, in_memory),
+        ValueType::BF16 => load::<half::bf16>(ti, files, in_memory),
+        ValueType::I32 => load::<i32>(ti, files, in_memory),
+        ValueType::I64 => load::<i64>(ti, files, in_memory),
     }
 }
 
@@ -1349,5 +1355,107 @@ impl<V: PostingValue> SparseIndexInformation for SparseBuilderIndex<V> {
 impl<V: PostingValue> Len for SparseBuilderIndex<V> {
     fn len(&self) -> usize {
         return self.terms.len();
+    }
+}
+
+/*
+* ---- In-memory forward index
+*
+*/
+
+/// A forward index built in memory, for collections that fit in RAM and
+/// targets without a file system (WASM). Compress it into an index with
+/// [`crate::compress::CompressionTransform::compress_to`].
+#[derive(Default)]
+pub struct MemoryIndexer {
+    /// Postings of each term, by increasing document id
+    postings: Vec<Vec<TermImpact>>,
+    /// Maximum impact of each term
+    max_values: Vec<ImpactValue>,
+    last_docid: Option<DocId>,
+    /// Largest document id with postings
+    max_doc_id: DocId,
+}
+
+impl MemoryIndexer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a document; document ids must be strictly increasing, and terms
+    /// unique within a document.
+    pub fn add(
+        &mut self,
+        docid: DocId,
+        terms: &[TermIndex],
+        values: &[ImpactValue],
+    ) -> std::io::Result<()> {
+        let invalid = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, msg);
+        if terms.len() != values.len() {
+            return Err(invalid(
+                "Value and term lists should have the same length".into(),
+            ));
+        }
+        if self.last_docid.is_some_and(|last| docid <= last) {
+            return Err(invalid(format!(
+                "Document ids must be increasing ({docid} after {})",
+                self.last_docid.unwrap()
+            )));
+        }
+        // Validate everything before adding anything
+        let mut sorted = terms.to_vec();
+        sorted.sort_unstable();
+        if sorted.windows(2).any(|w| w[0] == w[1]) {
+            return Err(invalid(format!("Repeated term in document {docid}")));
+        }
+        if let Some(v) = values.iter().find(|v| !(**v > 0.)) {
+            return Err(invalid(format!(
+                "Impact values must be positive ({v} in document {docid})"
+            )));
+        }
+
+        if let Some(&max_term) = sorted.last() {
+            if max_term >= self.postings.len() {
+                self.postings.resize_with(max_term + 1, Vec::new);
+                self.max_values.resize(max_term + 1, 0.);
+            }
+        }
+        for (&term, &value) in terms.iter().zip(values) {
+            self.postings[term].push(TermImpact { docid, value });
+            self.max_values[term] = self.max_values[term].max(value);
+        }
+        if !terms.is_empty() {
+            self.max_doc_id = docid;
+        }
+        self.last_docid = Some(docid);
+        Ok(())
+    }
+
+    /// Number of postings
+    pub fn num_postings(&self) -> usize {
+        self.postings.iter().map(Vec::len).sum()
+    }
+}
+
+impl Len for MemoryIndexer {
+    fn len(&self) -> usize {
+        self.postings.len()
+    }
+}
+
+impl SparseIndexInformation for MemoryIndexer {
+    fn value_range(&self, term_ix: TermIndex) -> (ImpactValue, ImpactValue) {
+        // Same as `SparseBuilderIndex`, so both compress identically
+        (0., self.max_values[term_ix])
+    }
+}
+
+impl crate::index::SparseIndexView for MemoryIndexer {
+    fn iterator<'a>(&'a self, term_ix: TermIndex) -> Box<dyn Iterator<Item = TermImpact> + 'a> {
+        Box::new(self.postings[term_ix].iter().copied())
+    }
+
+    fn max_doc_id(&self) -> DocId {
+        self.max_doc_id
     }
 }

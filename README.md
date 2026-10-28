@@ -15,6 +15,7 @@ Supports both neural IR models with floating-point impact scores and traditional
 - **Document reordering** by recursive graph bisection (`index.reorder(...)`) for smaller indices and stronger block-max pruning
 - **Posting list splitting** by quantile for term impact decomposition
 - **Incremental indexing**: filtered search (tombstones, allow-lists), comparable quantisation across indices and multi-segment search, for collections that change continuously — see [Incremental Indexing](#incremental-indexing)
+- **WebAssembly build**: index and search in a browser or a web worker, with the same index format as the native library — see [WebAssembly](#webassembly)
 - **Index versioning**: per-index `manifest.json` with format version checks and one-step migration (`Index.update(path)`)
 - **BMP (Block-Max Pruning)** for fast approximate search ([SIGIR 2024](https://github.com/pisa-engine/BMP))
 - **Seismic** for very fast approximate search over learned impacts ([SIGIR 2024](https://github.com/TusKANNy/seismic)) — see [Approximate search with Seismic](#approximate-search-with-seismic)
@@ -298,6 +299,38 @@ negligible with `nbits=16`, visible with `nbits=8`. A fixed range
 makes scores exactly comparable. This holds for learned impacts (SPLADE-style
 scores do not depend on collection statistics); BM25 segments would need
 global statistics and are not supported yet.
+
+## WebAssembly
+
+The `impact-index-wasm` crate (`wasm/`) builds the library for
+`wasm32-unknown-unknown`, to index and search in a browser, a web worker or
+Node.js. Indexes are exchanged as bytes (maps from file name to
+`Uint8Array`): the application does the storage. Indexes built natively load
+in WASM and vice versa (the files are byte-identical).
+
+```sh
+rustup target add wasm32-unknown-unknown
+wasm-pack build --release --target web wasm
+```
+
+```javascript
+import init, { Builder, Index } from "./pkg/impact_index_wasm.js";
+await init();
+
+const builder = new Builder({ range: { min: 0, max: 3 } });
+builder.add(0, new Uint32Array([12, 40]), new Float32Array([0.8, 1.5]));
+const index = Index.load(builder.finish());   // or files read natively
+const { docids, scores } = index.search(
+    new Uint32Array([12, 40]), new Float32Array([1.2, 0.4]), 10);
+```
+
+`DocSet` (tombstones) and `SegmentedIndex` bring the
+[incremental pattern](#incremental-indexing) to WASM. Search is
+single-threaded MaxScore; on 200k synthetic documents (45 MB index), a
+top-100 search takes 1-3 ms in Node.js. BM25 / text indexing, positions,
+document stores, BMP and Seismic are not available in WASM. See the
+[WebAssembly guide](https://impact-index.readthedocs.io/en/latest/wasm.html)
+for the API and the Rust features.
 
 ## Stop Words
 

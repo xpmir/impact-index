@@ -1,6 +1,7 @@
 //! Document ID compression schemes.
 //!
-//! - [`EliasFanoCompressor`]: Elias-Fano encoding via the `sucds` crate
+//! - [`EliasFanoCompressor`]: Elias-Fano encoding via the `sucds` crate (or
+//!   the byte-compatible [`super::elias_fano`] on 32-bit targets such as WASM)
 //! - [`BitPackingCompressor`]: SIMD bitpacking via the `bitpacking` crate (faster)
 
 use std::io::Write;
@@ -12,8 +13,10 @@ use crate::{
     utils::buffer::Slice,
 };
 use bitpacking::{BitPacker, BitPacker4x};
+#[cfg(target_pointer_width = "64")]
 use ouroboros::self_referencing;
 use serde::{Deserialize, Serialize};
+#[cfg(target_pointer_width = "64")]
 use sucds::{EliasFano, EliasFanoBuilder, Searial};
 
 /// Compresses document IDs using Elias-Fano encoding.
@@ -34,9 +37,17 @@ impl DocIdCompressor for EliasFanoCompressor {
             info.max_doc_id - info.min_doc_id <= u32::MAX as DocId,
             "block span exceeds u32 range"
         );
-        let ef = EliasFano::deserialize_from(data).expect("Error while reading");
         buffer.clear();
-        buffer.extend(ef.iter(0).map(|v| v as u32));
+        #[cfg(target_pointer_width = "64")]
+        {
+            let ef = EliasFano::deserialize_from(data).expect("Error while reading");
+            buffer.extend(ef.iter(0).map(|v| v as u32));
+        }
+        #[cfg(not(target_pointer_width = "64"))]
+        {
+            let ef = super::elias_fano::EliasFano::read(data).expect("Error while reading");
+            buffer.extend(ef.iter().map(|v| v as u32));
+        }
     }
 }
 
@@ -50,6 +61,7 @@ impl DocIdCompressorFactory for EliasFanoCompressor {
     }
 }
 
+#[cfg(target_pointer_width = "64")]
 #[self_referencing]
 struct EliasFanoIterator {
     data: EliasFano,
@@ -59,8 +71,10 @@ struct EliasFanoIterator {
     pub iterator: sucds::elias_fano::iter::Iter<'this>,
 }
 
+#[cfg(target_pointer_width = "64")]
 unsafe impl<'a> Send for EliasFanoIterator {}
 
+#[cfg(target_pointer_width = "64")]
 impl<'a> Iterator for EliasFanoIterator {
     type Item = DocId;
 
@@ -75,6 +89,7 @@ impl<'a> Iterator for EliasFanoIterator {
     }
 }
 
+#[cfg(target_pointer_width = "64")]
 impl Compressor<DocId> for EliasFanoCompressor {
     fn write(
         &self,
@@ -113,6 +128,36 @@ impl Compressor<DocId> for EliasFanoCompressor {
             }
             .build(),
         )
+    }
+}
+
+/// 32-bit targets: same bytes as above, through [`super::elias_fano`]
+#[cfg(not(target_pointer_width = "64"))]
+impl Compressor<DocId> for EliasFanoCompressor {
+    fn write(
+        &self,
+        writer: &mut dyn Write,
+        values: &[DocId],
+        _term_index: TermIndex,
+        info: &TermBlockInformation,
+    ) {
+        let offsets: Vec<u64> = values.iter().map(|&x| x - info.min_doc_id).collect();
+        super::elias_fano::write(writer, &offsets, info.max_doc_id - info.min_doc_id + 1)
+            .expect("Error while serializing");
+    }
+
+    fn read<'a>(
+        &self,
+        slice: Box<dyn Slice + 'a>,
+        _term_index: TermIndex,
+        info: &TermBlockInformation,
+    ) -> Box<dyn Iterator<Item = DocId> + Send + 'a> {
+        // Blocks are small: decode eagerly rather than keep a
+        // self-referential (data, iterator) pair
+        let ef = super::elias_fano::EliasFano::read(slice.data()).expect("Error while reading");
+        let min_doc_id = info.min_doc_id;
+        let docids: Vec<DocId> = ef.iter().map(|x| x + min_doc_id).collect();
+        Box::new(docids.into_iter())
     }
 }
 

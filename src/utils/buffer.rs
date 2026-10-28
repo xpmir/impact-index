@@ -1,7 +1,9 @@
+#[cfg(feature = "mmap")]
 use memmap2::{Mmap, MmapOptions};
 use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 pub trait Slice: Send + Sync {
     fn data(&'_ self) -> &'_ [u8];
@@ -64,16 +66,38 @@ pub struct MemoryBuffer {
 
 impl MemoryBuffer {
     pub fn new(path: &PathBuf) -> Self {
-        let mut file = File::options()
-            .read(true)
-            .open(path)
-            .expect("Error while reading posting file");
+        Self::open(path).expect("Error while reading posting file")
+    }
 
+    pub fn open(path: &PathBuf) -> std::io::Result<Self> {
+        let mut file = File::options().read(true).open(path)?;
         let mut data = Vec::new();
-        file.read_to_end(&mut data)
-            .expect("Error while reading file");
+        file.read_to_end(&mut data)?;
+        Ok(Self { data })
+    }
+}
 
-        Self { data: data }
+/// In-memory bytes shared with their owner (e.g. files handed over by a
+/// WASM embedder), so loading does not copy them
+pub struct SharedBuffer {
+    data: Arc<Vec<u8>>,
+}
+
+impl SharedBuffer {
+    pub fn new(data: Arc<Vec<u8>>) -> Self {
+        Self { data }
+    }
+}
+
+impl Buffer for SharedBuffer {
+    fn slice(&'_ self, start: usize, end: usize) -> Box<dyn Slice + '_> {
+        Box::new(MemorySlice {
+            _data: &self.data[start..end],
+        })
+    }
+
+    fn as_bytes(&self) -> Option<&[u8]> {
+        Some(&self.data)
     }
 }
 
@@ -89,11 +113,17 @@ impl Buffer for MemoryBuffer {
     }
 }
 
+/// Without the `mmap` feature (WASM), "mapped" files are read into memory
+#[cfg(not(feature = "mmap"))]
+pub type MmapBuffer = MemoryBuffer;
+
 /// Uses a memory map
+#[cfg(feature = "mmap")]
 pub struct MmapBuffer {
     mmap: Mmap,
 }
 
+#[cfg(feature = "mmap")]
 impl MmapBuffer {
     pub fn new(path: &PathBuf) -> Self {
         let file = File::options()
@@ -107,12 +137,20 @@ impl MmapBuffer {
         };
         Self { mmap: mmap }
     }
+
+    pub fn open(path: &PathBuf) -> std::io::Result<Self> {
+        let file = File::options().read(true).open(path)?;
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
+        Ok(Self { mmap })
+    }
 }
 
+#[cfg(feature = "mmap")]
 struct MmapSlice {
     vector: Vec<u8>,
 }
 
+#[cfg(feature = "mmap")]
 impl Slice for MmapSlice {
     fn data(&'_ self) -> &'_ [u8] {
         &self.vector
@@ -124,6 +162,7 @@ impl Slice for MmapSlice {
     }
 }
 
+#[cfg(feature = "mmap")]
 impl Buffer for MmapBuffer {
     fn slice(&'_ self, start: usize, end: usize) -> Box<dyn Slice> {
         let vector = Vec::from_iter(self.mmap[start..end].iter().map(|t| *t));
