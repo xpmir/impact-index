@@ -58,3 +58,50 @@ fn test_compressed_index(#[case] step: f64, #[case] transform: CompressionTransf
         step,
     );
 }
+
+/// Block (and term) maxima must bound the *decoded* impacts: a quantised
+/// value decodes to its bin centre, up to half a step above the raw value,
+/// so maxima computed from raw values let block-max pruning drop top-k
+/// documents.
+#[test]
+fn test_block_max_bounds_decoded_values() {
+    use std::collections::HashSet;
+
+    use impact_index::{base::DocId, builder::BuilderOptions};
+
+    let mut data = TestIndex::new(
+        50,
+        2000,
+        5.,
+        10,
+        Some(7),
+        BuilderOptions {
+            checkpoint_frequency: 0,
+            in_memory_threshold: 100,
+            checkpoint_flush_ratio: 0.5,
+            positions: false,
+        },
+        &HashSet::<DocId>::from([]),
+    );
+    let index = data.indexer.to_index(true);
+    let dir = TempDir::new().expect("Could not create temporary directory");
+    CompressionTransform {
+        max_block_size: 16,
+        doc_ids_compressor_factory: Box::new(EliasFanoCompressor {}),
+        impacts_compressor_factory: Box::new(Quantizer::new(4, 0., 5.)),
+        positions_codec: None,
+    }
+    .process(dir.path(), &index)
+    .expect("An error occurred");
+    let c_index = load_index(dir.path(), true);
+
+    for term in 0..c_index.len() {
+        let mut it = c_index.block_iterator(term);
+        let term_max = it.max_value();
+        while it.next_min_doc_id(0).is_some() {
+            let value = it.current().value;
+            assert!(value <= it.max_block_value(), "term {term}: block max");
+            assert!(value <= term_max, "term {term}: term max");
+        }
+    }
+}

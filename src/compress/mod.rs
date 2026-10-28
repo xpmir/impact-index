@@ -1977,6 +1977,7 @@ impl IndexTransform for CompressionTransform {
         let doc_ids_compressor = self.doc_ids_compressor_factory.create(index);
         let values_compressor = self.impacts_compressor_factory.create(index);
         let max_block_size = self.max_block_size;
+        let lossless = values_compressor.lossless();
 
         // Positions are opt-in per source index: a query that never calls
         // `positions()` must never read a byte of `positions.dat`, so a
@@ -2080,6 +2081,7 @@ impl IndexTransform for CompressionTransform {
                         min_dl: 0,
                     };
                     let mut max_doc_id = 0;
+                    let mut decoded: Vec<ImpactValue> = Vec::new();
                     let mut docid_position: u64 = 0;
                     let mut impact_position: u64 = 0;
                     let mut positions_position: u64 = 0;
@@ -2175,6 +2177,20 @@ impl IndexTransform for CompressionTransform {
 
                         doc_ids_compressor.write(&mut docid_buf, &docids, term_index, &block_info);
                         values_compressor.write(&mut impact_buf, &impacts, term_index, &block_info);
+
+                        // A lossy codec may decode a value above the raw one
+                        // (a quantised value decodes to its bin centre): the
+                        // block max must bound the *decoded* values, or
+                        // block-max pruning can drop a top-k document.
+                        if !lossless {
+                            values_compressor.decode_into_bytes(
+                                &impact_buf[impact_position as usize..],
+                                term_index,
+                                &block_info,
+                                &mut decoded,
+                            );
+                            block_info.max_value = decoded.iter().fold(0f32, |cur, x| cur.max(*x));
+                        }
 
                         docid_position = docid_buf.len() as u64;
                         block_info.docid_position_range.1 = docid_position;
