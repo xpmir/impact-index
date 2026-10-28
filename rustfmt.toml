@@ -1,0 +1,3 @@
+# The BMP submodule is vendored: `cargo fmt` reaches it (path dependency)
+# but must leave it as upstream has it.
+ignore = ["BMP"]
