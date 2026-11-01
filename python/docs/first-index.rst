@@ -100,6 +100,28 @@ For non-blocking retrieval (e.g., in a web server):
     results = await index.aio_search_wand(query, top_k=10)
     results = await index.aio_search_maxscore(query, top_k=10)
 
+Batch and multi-threaded search
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+All search methods (``search_wand``, ``search_maxscore``, their
+``_filtered`` variants, on both :class:`~impact_index.Index` and
+:class:`~impact_index.ScoredIndex`) release the GIL while searching, so
+calls from several Python threads run in parallel.
+
+To search many queries at once, the ``_many`` variants take a list of
+queries and run them on a Rust thread pool (one Python call, no thread
+pool on the Python side). They return one result list per query, in order:
+
+.. code-block:: python
+
+    queries = [{5: 1.0}, {10: 0.5, 42: 1.5}]
+    batch = index.search_maxscore_many(queries, top_k=10)
+    for query, results in zip(queries, batch):
+        ...
+
+The thread pool is rayon's global pool; set ``RAYON_NUM_THREADS`` to bound
+its size.
+
 Iterating over postings
 ~~~~~~~~~~~~~~~~~~~~~~~
 

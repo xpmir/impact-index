@@ -238,6 +238,35 @@ class TestBOWIndexBuilder:
         results_ms = scored.search_maxscore({0: 1.0}, 10)
         assert len(results_ms) <= 10
 
+        # Batch search: one list per query, same results as one-by-one calls
+        queries = [{0: 1.0}, {1: 0.5, 2: 1.0}, {}, {3: 2.0}]
+        key = lambda rs: [(r.docid, round(r.score, 5)) for r in rs]  # noqa: E731
+        for many, single in [
+            (scored.search_maxscore_many, scored.search_maxscore),
+            (scored.search_wand_many, scored.search_wand),
+        ]:
+            batch = many(queries, 10)
+            assert len(batch) == len(queries)
+            for q, rs in zip(queries, batch):
+                assert key(rs) == key(single(q, 10))
+
+    @pytest.mark.asyncio
+    async def test_scored_aio_search(self, rng, tmp_path):
+        d = str(tmp_path / "bow")
+        builder = impact_index.BOWIndexBuilder(d, dtype="int32")
+        for doc_id in range(50):
+            n = rng.randint(3, 10)
+            terms = rng.choice(20, n, replace=False).astype(np.uint64)
+            values = rng.randint(1, 5, n).astype(np.float32)
+            builder.add(doc_id, terms, values)
+        scored = builder.build(True).with_scoring(impact_index.BM25Scoring())
+
+        expected = [(r.docid, r.score) for r in scored.search_maxscore({0: 1.0}, 10)]
+        got = await scored.aio_search_maxscore({0: 1.0}, 10)
+        assert [(r.docid, r.score) for r in got] == expected
+        got = await scored.aio_search_wand({0: 1.0}, 10)
+        assert {r.docid for r in got} == {d for d, _ in expected}
+
     def test_add_text_with_stemmer(self, tmp_path):
         d = str(tmp_path / "bow")
         import os

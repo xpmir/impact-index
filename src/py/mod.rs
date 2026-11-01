@@ -8,8 +8,8 @@ use pyo3::{
     Bound, Py, PyAny, PyRef, PyResult, Python,
 };
 
+use rayon::prelude::*;
 use std::collections::HashMap;
-use std::future::IntoFuture;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -523,54 +523,74 @@ pub struct PySparseIndex {
     clamped_impacts: Option<u64>,
 }
 
-impl PySparseIndex {
-    fn _search(
-        &self,
-        py: Python<'_>,
-        py_query: &Bound<'_, PyDict>,
-        top_k: usize,
-        search_fn: SearchFn,
-    ) -> PyResult<Py<PyAny>> {
-        let query: HashMap<usize, ImpactValue> = py_query.extract()?;
-        let results = search_fn(&**self.index, &query, top_k);
+/// Search shared by `Index` and `ScoredIndex` (GIL released during the
+/// search, so concurrent Python threads run in parallel).
+fn search_py(
+    py: Python<'_>,
+    index: &dyn SparseIndex,
+    py_query: &Bound<'_, PyDict>,
+    top_k: usize,
+    search_fn: SearchFn,
+) -> PyResult<Vec<PyScoredDocument>> {
+    let query: HashMap<usize, ImpactValue> = py_query.extract()?;
+    let results = py.detach(|| search_fn(index, &query, top_k));
+    Ok(to_py_scored(results))
+}
 
-        let v: Vec<PyScoredDocument> = results
-            .iter()
-            .map(|r| PyScoredDocument {
-                docid: r.docid,
-                score: r.score,
-            })
-            .collect();
-        Ok(pyo3::IntoPyObject::into_pyobject(v, py)?.into())
-    }
+/// Batch search shared by `Index` and `ScoredIndex`: the queries run on the
+/// rayon thread pool with the GIL released; results keep the query order.
+fn search_many_py(
+    py: Python<'_>,
+    index: &dyn SparseIndex,
+    queries: Vec<HashMap<usize, ImpactValue>>,
+    top_k: usize,
+    search_fn: SearchFn,
+) -> PyResult<Vec<Vec<PyScoredDocument>>> {
+    let results: Vec<_> = py.detach(|| {
+        queries
+            .par_iter()
+            .map(|query| search_fn(index, query, top_k))
+            .collect()
+    });
+    Ok(results.into_iter().map(to_py_scored).collect())
+}
 
-    fn _aio_search<'a>(
-        &self,
-        py: Python<'a>,
-        py_query: &Bound<'_, PyDict>,
-        top_k: usize,
-        search_fn: SearchFn,
-    ) -> PyResult<Bound<'a, PyAny>> {
-        let index = self.index.clone();
+/// Async search shared by `Index` and `ScoredIndex` (runs on tokio's
+/// blocking pool so the search does not stall the async workers).
+fn aio_search_py<'a>(
+    py: Python<'a>,
+    index: Arc<Box<dyn SparseIndex>>,
+    py_query: &Bound<'_, PyDict>,
+    top_k: usize,
+    search_fn: SearchFn,
+) -> PyResult<Bound<'a, PyAny>> {
+    let query: HashMap<usize, ImpactValue> = py_query.extract()?;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let results = task::spawn_blocking(move || search_fn(&**index, &query, top_k))
+            .await
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("search task failed: {e}"))
+            })?;
+        Ok(to_py_scored(results))
+    })
+}
 
-        let query: HashMap<usize, ImpactValue> = py_query.extract()?;
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let results = task::spawn(async move { search_fn(&**index, &query, top_k) })
-                .into_future()
-                .await
-                .expect("Error while searching");
-
-            let v: Vec<PyScoredDocument> = results
-                .iter()
-                .map(|r| PyScoredDocument {
-                    docid: r.docid,
-                    score: r.score,
-                })
-                .collect();
-            Ok(v)
+fn to_py_scored(results: Vec<crate::search::ScoredDocument>) -> Vec<PyScoredDocument> {
+    results
+        .into_iter()
+        .map(|r| PyScoredDocument {
+            docid: r.docid,
+            score: r.score,
         })
-    }
+        .collect()
+}
+
+fn maxscore_default(
+    index: &dyn SparseIndex,
+    query: &HashMap<TermIndex, ImpactValue>,
+    top_k: usize,
+) -> Vec<crate::search::ScoredDocument> {
+    search_maxscore(index, query, top_k, MaxScoreOptions::default())
 }
 
 #[cfg_attr(feature = "stub-gen", gen_stub_pymethods)]
@@ -596,31 +616,50 @@ impl PySparseIndex {
         py: Python<'_>,
         py_query: &Bound<'_, PyDict>,
         top_k: usize,
-    ) -> PyResult<Py<PyAny>> {
-        self._search(py, py_query, top_k, search_wand)
+    ) -> PyResult<Vec<PyScoredDocument>> {
+        search_py(py, &**self.index, py_query, top_k, search_wand)
     }
 
-    /// Search using the WAND algorithm.
+    /// Search using the WAND algorithm (GIL released).
     fn search_wand(
         &self,
         py: Python<'_>,
         py_query: &Bound<'_, PyDict>,
         top_k: usize,
-    ) -> PyResult<Py<PyAny>> {
-        self._search(py, py_query, top_k, search_wand)
+    ) -> PyResult<Vec<PyScoredDocument>> {
+        search_py(py, &**self.index, py_query, top_k, search_wand)
     }
 
-    /// Search using the MaxScore algorithm.
+    /// Search using the MaxScore algorithm (GIL released).
     fn search_maxscore(
         &self,
         py: Python<'_>,
         py_query: &Bound<'_, PyDict>,
         top_k: usize,
-    ) -> PyResult<Py<PyAny>> {
-        self._search(py, py_query, top_k, |index, query, top_k| {
-            let options = MaxScoreOptions::default();
-            search_maxscore(index, query, top_k, options)
-        })
+    ) -> PyResult<Vec<PyScoredDocument>> {
+        search_py(py, &**self.index, py_query, top_k, maxscore_default)
+    }
+
+    /// Search a batch of queries with WAND, in parallel on a Rust thread
+    /// pool with the GIL released. Returns one result list per query, in
+    /// the order of ``queries``.
+    fn search_wand_many(
+        &self,
+        py: Python<'_>,
+        queries: Vec<HashMap<usize, ImpactValue>>,
+        top_k: usize,
+    ) -> PyResult<Vec<Vec<PyScoredDocument>>> {
+        search_many_py(py, &**self.index, queries, top_k, search_wand)
+    }
+
+    /// Search a batch of queries with MaxScore (see ``search_wand_many``).
+    fn search_maxscore_many(
+        &self,
+        py: Python<'_>,
+        queries: Vec<HashMap<usize, ImpactValue>>,
+        top_k: usize,
+    ) -> PyResult<Vec<Vec<PyScoredDocument>>> {
+        search_many_py(py, &**self.index, queries, top_k, maxscore_default)
     }
 
     /// Search using MaxScore, skipping filtered documents.
@@ -683,7 +722,7 @@ impl PySparseIndex {
         py_query: &Bound<'_, PyDict>,
         top_k: usize,
     ) -> PyResult<Bound<'a, PyAny>> {
-        self._aio_search(py, py_query, top_k, search_wand)
+        aio_search_py(py, self.index.clone(), py_query, top_k, search_wand)
     }
 
     /// Async version of search_maxscore.
@@ -693,10 +732,7 @@ impl PySparseIndex {
         py_query: &Bound<'_, PyDict>,
         top_k: usize,
     ) -> PyResult<Bound<'a, PyAny>> {
-        self._aio_search(py, py_query, top_k, |index, query, top_k| {
-            let options = MaxScoreOptions::default();
-            search_maxscore(index, query, top_k, options)
-        })
+        aio_search_py(py, self.index.clone(), py_query, top_k, maxscore_default)
     }
 
     /// Convert the index into BMP format.
@@ -2041,49 +2077,69 @@ pub struct PyScoredIndex {
     index: Arc<Box<dyn SparseIndex>>,
 }
 
-impl PyScoredIndex {
-    fn _search(
-        &self,
-        py: Python<'_>,
-        py_query: &Bound<'_, PyDict>,
-        top_k: usize,
-        search_fn: SearchFn,
-    ) -> PyResult<Py<PyAny>> {
-        let query: HashMap<usize, ImpactValue> = py_query.extract()?;
-        let results = search_fn(&**self.index, &query, top_k);
-        let v: Vec<PyScoredDocument> = results
-            .iter()
-            .map(|r| PyScoredDocument {
-                docid: r.docid,
-                score: r.score,
-            })
-            .collect();
-        Ok(pyo3::IntoPyObject::into_pyobject(v, py)?.into())
-    }
-}
-
 #[cfg_attr(feature = "stub-gen", gen_stub_pymethods)]
 #[pymethods]
 impl PyScoredIndex {
+    /// Search using the WAND algorithm (GIL released).
     fn search_wand(
         &self,
         py: Python<'_>,
         py_query: &Bound<'_, PyDict>,
         top_k: usize,
-    ) -> PyResult<Py<PyAny>> {
-        self._search(py, py_query, top_k, search_wand)
+    ) -> PyResult<Vec<PyScoredDocument>> {
+        search_py(py, &**self.index, py_query, top_k, search_wand)
     }
 
+    /// Search using the MaxScore algorithm (GIL released).
     fn search_maxscore(
         &self,
         py: Python<'_>,
         py_query: &Bound<'_, PyDict>,
         top_k: usize,
-    ) -> PyResult<Py<PyAny>> {
-        self._search(py, py_query, top_k, |index, query, top_k| {
-            let options = MaxScoreOptions::default();
-            search_maxscore(index, query, top_k, options)
-        })
+    ) -> PyResult<Vec<PyScoredDocument>> {
+        search_py(py, &**self.index, py_query, top_k, maxscore_default)
+    }
+
+    /// Search a batch of queries with WAND, in parallel on a Rust thread
+    /// pool with the GIL released. Returns one result list per query, in
+    /// the order of ``queries``.
+    fn search_wand_many(
+        &self,
+        py: Python<'_>,
+        queries: Vec<HashMap<usize, ImpactValue>>,
+        top_k: usize,
+    ) -> PyResult<Vec<Vec<PyScoredDocument>>> {
+        search_many_py(py, &**self.index, queries, top_k, search_wand)
+    }
+
+    /// Search a batch of queries with MaxScore (see ``search_wand_many``).
+    fn search_maxscore_many(
+        &self,
+        py: Python<'_>,
+        queries: Vec<HashMap<usize, ImpactValue>>,
+        top_k: usize,
+    ) -> PyResult<Vec<Vec<PyScoredDocument>>> {
+        search_many_py(py, &**self.index, queries, top_k, maxscore_default)
+    }
+
+    /// Async version of search_wand.
+    fn aio_search_wand<'a>(
+        &self,
+        py: Python<'a>,
+        py_query: &Bound<'_, PyDict>,
+        top_k: usize,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        aio_search_py(py, self.index.clone(), py_query, top_k, search_wand)
+    }
+
+    /// Async version of search_maxscore.
+    fn aio_search_maxscore<'a>(
+        &self,
+        py: Python<'a>,
+        py_query: &Bound<'_, PyDict>,
+        top_k: usize,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        aio_search_py(py, self.index.clone(), py_query, top_k, maxscore_default)
     }
 
     /// Search using WAND over a structured (matchop-style) query. See
