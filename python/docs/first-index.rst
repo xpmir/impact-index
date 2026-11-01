@@ -119,6 +119,10 @@ pool on the Python side). They return one result list per query, in order:
     for query, results in zip(queries, batch):
         ...
 
+Structured queries have the same batch form,
+``search_wand_query_many``/``search_maxscore_query_many`` (see
+:doc:`bow`).
+
 The thread pool is rayon's global pool; set ``RAYON_NUM_THREADS`` to bound
 its size.
 

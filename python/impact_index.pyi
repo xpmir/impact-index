@@ -552,6 +552,26 @@ class Index(IndexView):
         Search using MaxScore over a structured (matchop-style) query. Same
         ``query`` forms as [`search_wand_query`](Self::search_wand_query).
         """
+    def search_wand_query_many(
+        self, queries: typing.Sequence[typing.Any], top_k: builtins.int
+    ) -> builtins.list[builtins.list[ScoredDocument]]:
+        r"""
+        Search a batch of structured queries with WAND, in parallel on a
+        Rust thread pool with the GIL released. Each query may take any form
+        accepted by ``search_wand_query`` (forms can be mixed); queries are
+        parsed before the GIL is released. Returns one result list per query,
+        in the order of ``queries``. A query that fails to parse or evaluate
+        raises (the message starts with ``query <position>:``); one that
+        matches nothing (e.g. only unknown words or stop words) yields an
+        empty list, as with ``search_wand_query``.
+        """
+    def search_maxscore_query_many(
+        self, queries: typing.Sequence[typing.Any], top_k: builtins.int
+    ) -> builtins.list[builtins.list[ScoredDocument]]:
+        r"""
+        Search a batch of structured queries with MaxScore (see
+        ``search_wand_query_many``).
+        """
 
 @typing.final
 class IndexBuilder:
@@ -712,6 +732,21 @@ class ScoredIndex(IndexView):
         r"""
         Search using MaxScore over a structured (matchop-style) query. See
         ``Index.search_wand_query`` for the accepted ``query`` forms.
+        """
+    def search_wand_query_many(
+        self, queries: typing.Sequence[typing.Any], top_k: builtins.int
+    ) -> builtins.list[builtins.list[ScoredDocument]]:
+        r"""
+        Search a batch of structured queries with WAND, in parallel on a
+        Rust thread pool with the GIL released. See
+        ``Index.search_wand_query_many``.
+        """
+    def search_maxscore_query_many(
+        self, queries: typing.Sequence[typing.Any], top_k: builtins.int
+    ) -> builtins.list[builtins.list[ScoredDocument]]:
+        r"""
+        Search a batch of structured queries with MaxScore (see
+        ``search_wand_query_many``).
         """
     def search_maxscore_filtered(
         self,

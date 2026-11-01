@@ -456,6 +456,25 @@ weight]}``), ``{"combine": [[w1, node1], ...]}``, ``{"syn": [ix, ...]}``,
 ``{"band": [node, ...]}``, ``{"phrase": [ix, ...]}``, or ``{"window":
 {"terms": [ix, ...], "width": N}}``.
 
+To run many structured queries at once,
+:meth:`~impact_index.Index.search_wand_query_many` /
+:meth:`~impact_index.Index.search_maxscore_query_many` (also on
+:class:`~impact_index.ScoredIndex`) take a list of queries in any of the
+forms above (mixed forms are fine). The queries are parsed first, then
+searched in parallel on a Rust thread pool with the GIL released, like
+``search_maxscore_many``. They return one result list per query, in
+order. A query that matches nothing (only stop words or unknown words)
+gets an empty list; one that cannot be parsed or evaluated (e.g. ``#1``
+without positions) raises a ``ValueError`` whose message starts with
+``query <position>:``.
+
+.. code-block:: python
+
+    batch = scored.search_maxscore_query_many(
+        ["#combine:0=2:1=1(quick fox)", {"syn": [3, 7]}, 42],
+        top_k=10,
+    )
+
 How structured queries are scored
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

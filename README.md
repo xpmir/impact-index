@@ -155,7 +155,16 @@ results = scored.search_wand_query(
 )
 for doc in results:
     print(f"Document {doc.docid}: {doc.score:.4f}")
+
+# Batch: parsed up front, then searched in parallel with the GIL released
+batch = scored.search_maxscore_query_many(
+    ["#combine:0=2:1=1(quick fox)", {"syn": [3, 7]}, 42], top_k=10
+)
 ```
+
+`search_wand_query_many`/`search_maxscore_query_many` return one result list
+per query, in order; a query that fails to parse raises a `ValueError`
+naming its position.
 
 Scoring follows Terrier 5. Every operator is scored as one virtual term:
 - `#syn`: tf = sum of the children's tfs, df = sum of their dfs.

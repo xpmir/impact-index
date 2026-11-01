@@ -278,12 +278,82 @@ fn build_query_node(obj: &Bound<'_, PyAny>) -> PyResult<QueryNode> {
 /// [`QueryNode`], resolving matchop text against `index`'s `TextAnalyzer`
 /// when `query` is a string.
 fn query_node_from_py(obj: &Bound<'_, PyAny>, index: &dyn SparseIndex) -> PyResult<QueryNode> {
+    query_node_from_py_cached(obj, index, &mut None)
+}
+
+/// [`query_node_from_py`], reusing (or filling) `analyzer` so a batch of
+/// matchop strings loads the index's `TextAnalyzer` once.
+fn query_node_from_py_cached(
+    obj: &Bound<'_, PyAny>,
+    index: &dyn SparseIndex,
+    analyzer: &mut Option<Arc<TextAnalyzer>>,
+) -> PyResult<QueryNode> {
     if let Ok(text) = obj.extract::<String>() {
-        let analyzer = load_matchop_analyzer(index)?;
+        let analyzer = match analyzer {
+            Some(a) => a.clone(),
+            None => analyzer.insert(load_matchop_analyzer(index)?).clone(),
+        };
         let resolve = |tok: &str| analyzer.resolve_query_token(tok);
         return query::parse_matchop_with(&text, &resolve).map_err(map_query_error);
     }
     build_query_node(obj)
+}
+
+/// Re-raises `err` (same exception type, original as `__cause__`) with the
+/// position of the offending query in a batch prefixed to its message.
+fn with_query_position(py: Python<'_>, position: usize, err: pyo3::PyErr) -> pyo3::PyErr {
+    let wrapped = pyo3::PyErr::from_type(
+        err.get_type(py),
+        format!("query {position}: {}", err.value(py)),
+    );
+    wrapped.set_cause(py, Some(err));
+    wrapped
+}
+
+/// Structured-query batch search shared by `Index` and `ScoredIndex`:
+/// every query is converted to a [`QueryNode`] while holding the GIL, then
+/// all are searched with [`par_search_detached`]. Results keep the query
+/// order; a query that fails to convert or to evaluate raises, naming its
+/// position in `queries`.
+fn search_query_many_py(
+    py: Python<'_>,
+    index: &dyn SparseIndex,
+    queries: Vec<Bound<'_, PyAny>>,
+    top_k: usize,
+    search_fn: QuerySearchFn,
+) -> PyResult<Vec<Vec<PyScoredDocument>>> {
+    let mut analyzer = None;
+    let nodes = queries
+        .iter()
+        .enumerate()
+        .map(|(i, q)| {
+            query_node_from_py_cached(q, index, &mut analyzer)
+                .map_err(|e| with_query_position(py, i, e))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    par_search_detached(py, &nodes, |node| search_fn(index, node, top_k))
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            r.map(to_py_scored)
+                .map_err(|e| with_query_position(py, i, map_query_error(e)))
+        })
+        .collect()
+}
+
+/// Type alias for structured-query search functions.
+type QuerySearchFn = fn(
+    index: &dyn SparseIndex,
+    query: &QueryNode,
+    top_k: usize,
+) -> Result<Vec<crate::search::ScoredDocument>, QueryError>;
+
+fn query_maxscore_default(
+    index: &dyn SparseIndex,
+    query: &QueryNode,
+    top_k: usize,
+) -> Result<Vec<crate::search::ScoredDocument>, QueryError> {
+    query::search_maxscore_query(index, query, top_k, MaxScoreOptions::default())
 }
 
 /// A single term impact: a (document ID, impact value) pair.
@@ -546,13 +616,18 @@ fn search_many_py(
     top_k: usize,
     search_fn: SearchFn,
 ) -> PyResult<Vec<Vec<PyScoredDocument>>> {
-    let results: Vec<_> = py.detach(|| {
-        queries
-            .par_iter()
-            .map(|query| search_fn(index, query, top_k))
-            .collect()
-    });
+    let results = par_search_detached(py, &queries, |query| search_fn(index, query, top_k));
     Ok(results.into_iter().map(to_py_scored).collect())
+}
+
+/// Runs `search` over every query on the rayon thread pool with the GIL
+/// released, keeping the query order (shared by the `_many` methods).
+fn par_search_detached<Q: Sync, R: Send>(
+    py: Python<'_>,
+    queries: &[Q],
+    search: impl Fn(&Q) -> R + Sync + Send,
+) -> Vec<R> {
+    py.detach(|| queries.par_iter().map(search).collect())
 }
 
 /// Async search shared by `Index` and `ScoredIndex` (runs on tokio's
@@ -1068,6 +1143,34 @@ impl PySparseIndex {
             })
             .collect();
         Ok(pyo3::IntoPyObject::into_pyobject(v, py)?.into())
+    }
+
+    /// Search a batch of structured queries with WAND, in parallel on a
+    /// Rust thread pool with the GIL released. Each query may take any form
+    /// accepted by ``search_wand_query`` (forms can be mixed); queries are
+    /// parsed before the GIL is released. Returns one result list per query,
+    /// in the order of ``queries``. A query that fails to parse or evaluate
+    /// raises (the message starts with ``query <position>:``); one that
+    /// matches nothing (e.g. only unknown words or stop words) yields an
+    /// empty list, as with ``search_wand_query``.
+    fn search_wand_query_many(
+        &self,
+        py: Python<'_>,
+        queries: Vec<Bound<'_, PyAny>>,
+        top_k: usize,
+    ) -> PyResult<Vec<Vec<PyScoredDocument>>> {
+        search_query_many_py(py, &**self.index, queries, top_k, query::search_wand_query)
+    }
+
+    /// Search a batch of structured queries with MaxScore (see
+    /// ``search_wand_query_many``).
+    fn search_maxscore_query_many(
+        &self,
+        py: Python<'_>,
+        queries: Vec<Bound<'_, PyAny>>,
+        top_k: usize,
+    ) -> PyResult<Vec<Vec<PyScoredDocument>>> {
+        search_query_many_py(py, &**self.index, queries, top_k, query_maxscore_default)
     }
 }
 
@@ -2183,6 +2286,29 @@ impl PyScoredIndex {
             })
             .collect();
         Ok(pyo3::IntoPyObject::into_pyobject(v, py)?.into())
+    }
+
+    /// Search a batch of structured queries with WAND, in parallel on a
+    /// Rust thread pool with the GIL released. See
+    /// ``Index.search_wand_query_many``.
+    fn search_wand_query_many(
+        &self,
+        py: Python<'_>,
+        queries: Vec<Bound<'_, PyAny>>,
+        top_k: usize,
+    ) -> PyResult<Vec<Vec<PyScoredDocument>>> {
+        search_query_many_py(py, &**self.index, queries, top_k, query::search_wand_query)
+    }
+
+    /// Search a batch of structured queries with MaxScore (see
+    /// ``search_wand_query_many``).
+    fn search_maxscore_query_many(
+        &self,
+        py: Python<'_>,
+        queries: Vec<Bound<'_, PyAny>>,
+        top_k: usize,
+    ) -> PyResult<Vec<Vec<PyScoredDocument>>> {
+        search_query_many_py(py, &**self.index, queries, top_k, query_maxscore_default)
     }
 
     /// Search using MaxScore, skipping filtered documents. See
