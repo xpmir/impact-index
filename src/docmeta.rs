@@ -122,10 +122,7 @@ impl DocMetadata {
             let src = src_dir.join(filename);
             let dst = dst_dir.join(filename);
             if src.exists() {
-                // Try hard link first, fall back to copy
-                if std::fs::hard_link(&src, &dst).is_err() {
-                    std::fs::copy(&src, &dst)?;
-                }
+                crate::utils::fs::link_or_copy(&src, &dst)?;
             }
         }
         Ok(())

@@ -781,9 +781,7 @@ impl TextAnalyzer {
             let src = src_dir.join(filename);
             let dst = dst_dir.join(filename);
             if src.exists() {
-                if std::fs::hard_link(&src, &dst).is_err() {
-                    std::fs::copy(&src, &dst)?;
-                }
+                crate::utils::fs::link_or_copy(&src, &dst)?;
             }
         }
         Ok(())

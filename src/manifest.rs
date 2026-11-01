@@ -342,7 +342,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
         if ty.is_dir() {
             copy_dir_all(&entry.path(), &dst_path)?;
         } else {
-            std::fs::copy(entry.path(), dst_path)?;
+            crate::utils::fs::copy_file(&entry.path(), &dst_path)?;
         }
     }
     Ok(())

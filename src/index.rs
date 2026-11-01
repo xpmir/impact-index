@@ -465,7 +465,7 @@ pub trait SparseIndex: Send + Sync + SparseIndexView + AsSparseIndexView {
             let src_fst = src.join("vocab.fst");
             let dst_fst = dst.join("vocab.fst");
             if src_fst.exists() && !dst_fst.exists() {
-                std::fs::copy(&src_fst, &dst_fst)?;
+                crate::utils::fs::link_or_copy(&src_fst, &dst_fst)?;
             }
             // Save analyzer config
             let config_path = dst.join("analyzer.cbor");
