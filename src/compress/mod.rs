@@ -2401,14 +2401,7 @@ impl IndexLoader for CompressedIndexLoader {
         let impact_path = path.join("impacts.dat");
         // Auto-detect auxiliary components
         let doc_meta = crate::docmeta::DocMetadata::load(path).ok();
-        let analyzer_config = {
-            let cfg = crate::vocab::analyzer::TextAnalyzer::load_config(path);
-            if cfg.stemmer == "none" && !cfg.stop_words {
-                None
-            } else {
-                Some(cfg)
-            }
-        };
+        let analyzer_config = crate::vocab::analyzer::TextAnalyzer::try_load_config(path);
 
         let reorder_map = crate::transforms::reorder::ReorderMap::load(path).ok();
 

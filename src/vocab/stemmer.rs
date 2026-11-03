@@ -22,9 +22,9 @@ impl SnowballStemmer {
     /// Supported languages: "arabic", "danish", "dutch", "english", "finnish",
     /// "french", "german", "greek", "hungarian", "italian", "norwegian",
     /// "portuguese", "romanian", "russian", "spanish", "swedish", "tamil",
-    /// "turkish".
+    /// "turkish" (or their ISO 639-1 codes).
     pub fn new(language: &str) -> Result<Self, String> {
-        let algorithm = match language.to_lowercase().as_str() {
+        let algorithm = match super::language::normalize_language(language).as_str() {
             "arabic" => Algorithm::Arabic,
             "danish" => Algorithm::Danish,
             "dutch" => Algorithm::Dutch,

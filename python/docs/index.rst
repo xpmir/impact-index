@@ -12,7 +12,7 @@ Features
 --------
 
 - **BM25 bag-of-words indexing** with built-in tokenization, stemming
-  (Snowball, Porter) and stop words: Lucene-family lists (17 languages) or
+  (Snowball, Porter) and stop words: Lucene-family lists (23 languages) or
   Terrier's own, much longer list (English only)
 - **Block-Max MaxScore and BMW WAND** search with early termination
 - **Structured queries**: Terrier-style ``#combine``/``#syn``/``#band``/``#1``

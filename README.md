@@ -8,7 +8,7 @@ Supports both neural IR models with floating-point impact scores and traditional
 
 ## Features
 
-- **BM25 bag-of-words indexing** with built-in tokenization, stemming (Snowball), and stop words: Lucene-family lists (17 languages) or Terrier's own, much longer list (English only) — see [Stop Words](#stop-words)
+- **BM25 bag-of-words indexing** with built-in tokenization, Pyserini-aligned analyzers for other languages than English (`pipeline="pyserini", language=...`: ports of the Lucene analyzers Anserini uses, e.g. for the MIRACL languages), stemming (Snowball), and stop words: Lucene-family lists (23 languages) or Terrier's own, much longer list (English only) — see [Stop Words](#stop-words)
 - **Block-Max MaxScore and BMW (Block-Max WAND)** search with early termination
 - **SIMD bitpacking compression** (BitPacker4x) with quantized impacts and reusable block buffers
 - **One-liner compression**: `index.compress("/path/to/output")`
@@ -312,7 +312,7 @@ global statistics and are not supported yet.
 
 Two built-in stop word *families*, selectable independently of stemmer/language:
 
-- **`"lucene"`** (default): short, per-language lists matching Lucene's language analyzers. 17 languages: arabic, danish, dutch, english, finnish, french, german, greek, hungarian, italian, norwegian, portuguese, romanian, russian, spanish, swedish, turkish.
+- **`"lucene"`** (default): short, per-language lists matching Lucene's language analyzers. 23 languages: arabic, bengali, danish, dutch, english, finnish, french, german, greek, hindi, hungarian, indonesian, italian, norwegian, persian, portuguese, romanian, russian, spanish, swedish, telugu, thai, turkish (ISO 639-1 codes are accepted too).
 - **`"terrier"`**: Terrier's own, much longer list (`org.terrier.terms.Stopwords`, 733 words for English) — what PISA and Terrier 5 use by default. **English only** — other languages raise an error rather than silently substituting something else.
 
 ```python

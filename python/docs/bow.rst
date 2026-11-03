@@ -208,7 +208,10 @@ Two stemmers are available via ``stemmer=`` (or picked automatically by
   default (and what ``pipeline="terrier"`` picks by default — pass
   ``stemmer="porter"`` explicitly to match real Terrier 5's stemmer
   instead).
-- ``None`` (default without a stemmer) — no stemming.
+- ``"none"`` — text analysis without stemming (e.g. for languages without
+  a Snowball stemmer).
+- ``None`` (default without a pipeline) — no text analysis at all: terms
+  are given directly to ``add``.
 
 The two disagree on some common words (e.g. "community", "day", "use"
 stem differently), so pick based on which system you're comparing against
@@ -219,22 +222,68 @@ configurations against their respective reference systems.
 Tokenizer variant
 ------------------
 
-Besides stemming, the analyzer also picks a tokenizer variant at the Rust
-level: ``Tokenizer::Standard``, ``Tokenizer::LuceneEnglish``, or
-``Tokenizer::PisaEnglish`` (``src/vocab/analyzer.rs`` — see the pipeline
-table above for what each one does with an apostrophe). This is a
-tokenization concern, not a stemming one, so it composes with any stemmer
-choice (or none).
+Besides stemming, the analyzer also picks a tokenizer variant
+(``tokenizer=``): ``"standard"`` (UAX#29 word boundaries),
+``"lucene-english"``, ``"pisa-english"`` (see the pipeline table above for
+what each one does with an apostrophe) or ``"icu"``. This is a tokenization
+concern, not a stemming one, so it composes with any stemmer choice (or
+none).
 
-.. note::
+``"icu"`` follows UAX#29 too, but segments scripts written without spaces
+(Chinese, Japanese, Thai, Lao, Khmer, Burmese) into dictionary words with
+ICU4X's word segmenter, like Lucene's ICU-based tokenizers --
+``"standard"`` would produce one token per character for them.
 
-    There is no separate ``BOWIndexBuilder`` argument for the tokenizer
-    variant directly — it's selected via ``pipeline=`` (recommended) or
-    implied by ``language="english"`` (the default) for backward
-    compatibility when no ``pipeline`` is given, which always means
-    ``LuceneEnglish``. Every other language gets plain ``Standard``
-    splitting. Use the lower-level Rust ``TextAnalyzer`` API directly
-    (``set_tokenizer``) for anything not covered by these two paths.
+When ``tokenizer`` is not given, it is selected via ``pipeline=`` for
+English (``"lucene-english"`` without a pipeline, for backward
+compatibility), ``"icu"`` for the languages above, and ``"standard"``
+otherwise.
+
+Languages
+---------
+
+``language=`` accepts names (``"french"``) or ISO 639-1 codes (``"fr"``).
+
+With ``pipeline="pyserini"``, other languages than English are analyzed
+like Anserini/Pyserini's ``-language`` option does, i.e. with Lucene 10.5's
+language analyzer (``FrenchAnalyzer``, ``ArabicAnalyzer``,
+``CJKAnalyzer`` for Chinese, ``JapaneseAnalyzer`` (Kuromoji),
+``KoreanAnalyzer`` (Nori), ``WhitespaceAnalyzer`` for languages Anserini has
+no analyzer for, e.g. Swahili or Yoruba...) and its default stop words
+(``stop_words=False`` or a list to change them):
+
+.. code-block:: python
+
+    builder = impact_index.BOWIndexBuilder(
+        "/path/to/index", pipeline="pyserini", language="fr"
+    )
+
+These analyzers are ported from Lucene (``src/vocab/lucene``) and compared
+with Lucene itself on MIRACL passages (``examples/lucene_analyze.rs``): the
+terms are identical for ar, bn, de, es, fa, fr, hi, id, te, yo, zh and
+Finnish (except a few numbers); Japanese and Korean use Lindera with the same
+dictionaries as Kuromoji and Nori (~99% and ~97% of identical terms); Thai
+uses ICU4X's dictionary instead of the JDK's (~80%). Lucene analyzers that
+Anserini uses but that are not ported (da, hu, it, nl, no, pl, pt, sv, tr,
+uk) raise an error.
+
+Japanese and Korean need a morphological dictionary, downloaded into
+``$IMPACT_INDEX_CACHE`` or the OS cache directory (``~/.cache/impact-index``
+on Linux) when first needed. To download beforehand (e.g. for nodes without
+network access sharing that directory):
+
+.. code-block:: python
+
+    impact_index.prepare_analyzer("ja", pipeline="pyserini")  # -> [path]
+    impact_index.download_dictionary("ko-dic")  # -> path
+
+The dictionary path can also be given with ``dictionary=``, or set with
+``impact_index.set_dictionary_path(name, path)`` (e.g. to load an index built
+on another machine).
+
+Without a pipeline, ``stemmer="snowball"`` covers ar, da, de, el, en, es,
+fi, fr, hu, it, nl, no, pt, ro, ru, sv, ta, tr; ``stemmer="none"`` gives text
+analysis without stemming for other languages.
 
 Stop words
 ----------
@@ -243,7 +292,7 @@ Stop words (common words like "the", "is", "a") can be filtered during
 indexing and querying to reduce index size and improve search speed.
 Two built-in *families* are available, selectable independently of the
 stemmer/language settings: ``"lucene"`` (default; short, per-language
-lists matching Lucene's language analyzers, 17 languages) and
+lists matching Lucene's language analyzers, 23 languages) and
 ``"terrier"`` (Terrier's own, much longer list — the default PISA and
 Terrier 5 themselves use; English only).
 

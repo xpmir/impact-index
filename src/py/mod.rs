@@ -2535,6 +2535,111 @@ enum BOWBuilderEnum {
 // gen_stub_pymethods skipped: PyArray1<usize> not supported
 // https://github.com/Jij-Inc/pyo3-stub-gen/issues/97
 // gen_stub_pymethods skipped: (Self, Parent) return in #[new] unsupported
+/// Text analyzer replicating the Lucene analyzer Anserini/Pyserini uses for a
+/// (non-English) language, see `crate::vocab::lucene`
+fn lucene_analyzer(
+    lang: &str,
+    stop_words: Option<&Bound<'_, PyAny>>,
+    dictionary: Option<&str>,
+    position_gaps: bool,
+) -> PyResult<TextAnalyzer> {
+    use crate::vocab::analyzer::{AnalyzerConfig, StopWordFilterMode, Tokenizer};
+    use crate::vocab::lucene::{LuceneChain, LuceneLanguage, LuceneStemmer};
+    let language = LuceneLanguage::resolve(lang)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?
+        .expect("not English");
+    let chain = LuceneChain::load(language, dictionary)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+    let defaults = || -> Vec<String> {
+        language
+            .default_stop_words(lang)
+            .into_iter()
+            .map(String::from)
+            .collect()
+    };
+    // Stop words: the analyzer's (default or True), none (False), or a list
+    let words: Vec<String> = match stop_words {
+        None => defaults(),
+        Some(obj) => match obj.extract::<bool>() {
+            Ok(true) => defaults(),
+            Ok(false) => Vec::new(),
+            Err(_) => obj.extract::<Vec<String>>().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err(
+                    "with pipeline=\"pyserini\", stop_words must be a bool or a list of strings",
+                )
+            })?,
+        },
+    };
+    let refs: Vec<&str> = words.iter().map(|w| w.as_str()).collect();
+    let stemmer = Box::new(LuceneStemmer::new(language));
+    let mut analyzer = if refs.is_empty() {
+        TextAnalyzer::new(stemmer)
+    } else {
+        TextAnalyzer::with_stop_words(stemmer, &refs)
+    };
+    // Lucene's StopFilter: one check, before the filters that follow it
+    analyzer.set_stop_words_filter_mode(StopWordFilterMode::PreStem);
+    let dictionary_path = chain.dictionary_path();
+    analyzer.set_lucene_chain(chain);
+    analyzer.set_config(AnalyzerConfig {
+        stemmer: "lucene".to_string(),
+        language: lang.to_string(),
+        stop_words: !words.is_empty(),
+        stop_words_list: words,
+        stop_words_family: None,
+        stop_words_filter_mode: StopWordFilterMode::PreStem,
+        query_stop_words_list: Vec::new(),
+        english_possessive_filter: false,
+        tokenizer: Tokenizer::Lucene,
+        position_gaps,
+        dictionary: dictionary_path,
+    });
+    Ok(analyzer)
+}
+
+impl PyBOWIndexBuilder {
+    fn from_analyzer(
+        path: &Path,
+        builder_options: &BuilderOptions,
+        dtype_str: &str,
+        analyzer: Option<TextAnalyzer>,
+        positions: bool,
+    ) -> PyResult<Self> {
+        let builder_options = builder_options.clone();
+        let inner = match (dtype_str, analyzer) {
+            ("int32" | "i32", None) => {
+                BOWBuilderEnum::I32(BOWIndexBuilder::new(path, &builder_options))
+            }
+            ("int32" | "i32", Some(a)) => {
+                BOWBuilderEnum::I32(BOWIndexBuilder::with_analyzer(path, &builder_options, a))
+            }
+            ("int64" | "i64", None) => {
+                BOWBuilderEnum::I64(BOWIndexBuilder::new(path, &builder_options))
+            }
+            ("int64" | "i64", Some(a)) => {
+                BOWBuilderEnum::I64(BOWIndexBuilder::with_analyzer(path, &builder_options, a))
+            }
+            ("float32" | "f32", None) => {
+                BOWBuilderEnum::F32(BOWIndexBuilder::new(path, &builder_options))
+            }
+            ("float32" | "f32", Some(a)) => {
+                BOWBuilderEnum::F32(BOWIndexBuilder::with_analyzer(path, &builder_options, a))
+            }
+            (other, _) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unknown dtype '{}' for BOWIndexBuilder, expected int32, int64, or float32",
+                    other
+                )));
+            }
+        };
+
+        Ok(Self {
+            inner: Arc::new(Mutex::new(Some(inner))),
+            positions,
+        })
+    }
+}
+
 #[pymethods]
 impl PyBOWIndexBuilder {
     /// Create a new BOWIndexBuilder.
@@ -2549,7 +2654,11 @@ impl PyBOWIndexBuilder {
     ///         them:
     ///         - ``"pyserini"`` (default) matches Lucene/Pyserini
     ///           (``LuceneEnglish`` tokenizer, Lucene's ~33-word list,
-    ///           checked pre-stem, Porter stemmer).
+    ///           checked pre-stem, Porter stemmer). For other languages,
+    ///           the Lucene analyzer Anserini uses for ``-language``
+    ///           (e.g. ``FrenchAnalyzer``, ``CJKAnalyzer`` for Chinese,
+    ///           ``WhitespaceAnalyzer`` for Swahili) with its default stop
+    ///           words, unless ``stemmer`` or ``tokenizer`` is given.
     ///         - ``"terrier"`` matches real Terrier 5's own behavior:
     ///           PISA's tokenizer (see ``Tokenizer.pisa_english`` -- the
     ///           closest available approximation to Terrier 5's own Java
@@ -2581,11 +2690,15 @@ impl PyBOWIndexBuilder {
     ///         ``pipeline="terrier", stemmer="porter"`` keeps Terrier's
     ///         tokenizer/stop-word timing/list but swaps in the Porter
     ///         stemmer.
-    ///     stemmer: Stemmer to use ("snowball", "porter", or None).
-    ///         Defaults to the pipeline's own stemmer.
-    ///     language: Language for the stemmer (default: "english").
+    ///     stemmer: Stemmer to use ("snowball", "porter", "none" for text
+    ///         analysis without stemming, or None for no text analysis at
+    ///         all, i.e. terms given to ``add``). Defaults to the pipeline's
+    ///         own stemmer.
+    ///     language: Language for the stemmer, stop words and default
+    ///         tokenizer, as a name or ISO 639-1 code (default: "english").
     ///     stop_words: Stop words to filter. One of:
     ///         - a list of strings (used verbatim);
+    ///         - ``False`` for no stop words;
     ///         - ``True`` (alias for ``"lucene"``, for backward compatibility);
     ///         - ``"lucene"`` or ``"terrier"`` (case-insensitive) to use the
     ///           built-in list for that family and ``language``. Terrier only
@@ -2613,8 +2726,19 @@ impl PyBOWIndexBuilder {
     ///         ``#uwN``. Default: ``False`` for the ``"terrier"`` and
     ///         ``"terrier-pisa"`` pipelines, ``True`` otherwise. Only
     ///         matters with ``positions=True``.
+    ///     tokenizer: Word splitting: ``"standard"`` (UAX#29),
+    ///         ``"lucene-english"`` (UAX#29 + possessive removal),
+    ///         ``"pisa-english"``, or ``"icu"`` (UAX#29 + dictionary-based
+    ///         segmentation of Chinese, Japanese, Thai, Lao, Khmer and
+    ///         Burmese). Defaults to the pipeline's tokenizer for English,
+    ///         ``"lucene-english"`` for English without pipeline, ``"icu"``
+    ///         for the languages above and ``"standard"`` otherwise.
+    ///     dictionary: Directory of the morphological dictionary needed by
+    ///         ``pipeline="pyserini"`` for Japanese (``ipadic``) and Korean
+    ///         (``ko-dic``); downloaded into the cache if not given (see
+    ///         ``download_dictionary``).
     #[new]
-    #[pyo3(signature = (folder, options=None, dtype=None, pipeline=None, stemmer=None, language=None, stop_words=None, positions=false, position_gaps=None))]
+    #[pyo3(signature = (folder, options=None, dtype=None, pipeline=None, stemmer=None, language=None, stop_words=None, positions=false, position_gaps=None, tokenizer=None, dictionary=None))]
     fn new(
         folder: &str,
         options: Option<&PyBuilderOptions>,
@@ -2625,6 +2749,8 @@ impl PyBOWIndexBuilder {
         stop_words: Option<&Bound<'_, PyAny>>,
         positions: bool,
         position_gaps: Option<bool>,
+        tokenizer: Option<&str>,
+        dictionary: Option<&str>,
     ) -> PyResult<Self> {
         let mut builder_options = match options {
             Some(o) => o.0.clone(),
@@ -2633,7 +2759,14 @@ impl PyBOWIndexBuilder {
         builder_options.positions = positions;
         let path = Path::new(folder);
         let dtype_str = dtype.unwrap_or("int32");
-        let lang = language.unwrap_or("english");
+        let lang_name = crate::vocab::language::normalize_language(language.unwrap_or("english"));
+        let lang = lang_name.as_str();
+        let explicit_tokenizer = tokenizer
+            .map(|t| {
+                t.parse::<crate::vocab::analyzer::Tokenizer>()
+                    .map_err(pyo3::exceptions::PyValueError::new_err)
+            })
+            .transpose()?;
 
         // `pipeline` is the *only* knob that names another IR system: it
         // bundles that system's own tokenizer, stop-word-filter timing, and
@@ -2722,10 +2855,29 @@ impl PyBOWIndexBuilder {
             })
             .transpose()?;
 
+        let explicit_stemmer = stemmer;
         let stemmer = stemmer.or_else(|| pipeline_defaults.as_ref().map(|pd| pd.stemmer));
         let position_gaps = position_gaps
             .or_else(|| pipeline_defaults.as_ref().map(|pd| pd.position_gaps))
             .unwrap_or(true);
+
+        // Pyserini for another language than English: the Lucene analyzer
+        // Anserini uses for it (unless a stemmer or tokenizer is given)
+        let is_pyserini = pipeline.is_some_and(|p| p.eq_ignore_ascii_case("pyserini"));
+        if is_pyserini
+            && lang != "english"
+            && explicit_stemmer.is_none()
+            && explicit_tokenizer.is_none()
+        {
+            let analyzer = lucene_analyzer(lang, stop_words, dictionary, position_gaps)?;
+            return Self::from_analyzer(
+                path,
+                &builder_options,
+                dtype_str,
+                Some(analyzer),
+                positions,
+            );
+        }
 
         // Resolve stop words: True/"lucene"/"terrier" = built-in family list,
         // list = explicit, None = no stop words (or, with a `pipeline`, that
@@ -2755,6 +2907,8 @@ impl PyBOWIndexBuilder {
                     None => Vec::new(),
                 }
             }
+            // False: no stop words
+            Some(obj) if matches!(obj.extract::<bool>(), Ok(false)) => Vec::new(),
             Some(obj) => {
                 if let Ok(true) = obj.extract::<bool>() {
                     // True: alias for "lucene", by design -- this is the
@@ -2871,20 +3025,24 @@ impl PyBOWIndexBuilder {
                     == crate::vocab::analyzer::Tokenizer::LuceneEnglish,
                 tokenizer,
                 position_gaps,
+                dictionary: None,
             });
             a
         };
 
         let is_english = lang == "english";
-        // A pipeline's tokenizer is meant for English text (like
-        // `LuceneEnglish` already was); other languages fall back to plain
-        // `Standard` splitting, same as before `pipeline` existed.
+        // An explicit `tokenizer` always wins. Otherwise, a pipeline's
+        // tokenizer is meant for English text (like `LuceneEnglish` already
+        // was); other languages fall back to their default tokenizer
+        // (`Icu` for languages written without spaces, plain `Standard`
+        // splitting otherwise, same as before `pipeline` existed).
         let pipeline_tokenizer = |english_capable: bool| -> crate::vocab::analyzer::Tokenizer {
-            match &pipeline_defaults {
-                Some(pd) if english_capable => pd.tokenizer,
-                Some(_) => crate::vocab::analyzer::Tokenizer::Standard,
-                None if english_capable => crate::vocab::analyzer::Tokenizer::LuceneEnglish,
-                None => crate::vocab::analyzer::Tokenizer::Standard,
+            use crate::vocab::analyzer::Tokenizer;
+            match (explicit_tokenizer, &pipeline_defaults) {
+                (Some(t), _) => t,
+                (None, Some(pd)) if english_capable => pd.tokenizer,
+                (None, None) if english_capable => Tokenizer::LuceneEnglish,
+                (None, _) => Tokenizer::default_for_language(lang),
             }
         };
 
@@ -2904,46 +3062,24 @@ impl PyBOWIndexBuilder {
                 Box::new(PorterStemmer::new()),
                 pipeline_tokenizer(true),
             )),
-            Some("none") | None => None,
+            // An analyzer without stemming, for languages without a
+            // stemmer
+            Some("none") => Some(make_analyzer(
+                "none",
+                Box::new(crate::vocab::stemmer::NoStemmer),
+                pipeline_tokenizer(is_english),
+            )),
+            // No analyzer at all (terms are added with `add`)
+            None => None,
             Some(other) => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Unknown stemmer '{}', expected 'snowball', 'porter', or None",
+                    "Unknown stemmer '{}', expected 'snowball', 'porter', 'none', or None",
                     other
                 )));
             }
         };
 
-        let inner = match (dtype_str, analyzer) {
-            ("int32" | "i32", None) => {
-                BOWBuilderEnum::I32(BOWIndexBuilder::new(path, &builder_options))
-            }
-            ("int32" | "i32", Some(a)) => {
-                BOWBuilderEnum::I32(BOWIndexBuilder::with_analyzer(path, &builder_options, a))
-            }
-            ("int64" | "i64", None) => {
-                BOWBuilderEnum::I64(BOWIndexBuilder::new(path, &builder_options))
-            }
-            ("int64" | "i64", Some(a)) => {
-                BOWBuilderEnum::I64(BOWIndexBuilder::with_analyzer(path, &builder_options, a))
-            }
-            ("float32" | "f32", None) => {
-                BOWBuilderEnum::F32(BOWIndexBuilder::new(path, &builder_options))
-            }
-            ("float32" | "f32", Some(a)) => {
-                BOWBuilderEnum::F32(BOWIndexBuilder::with_analyzer(path, &builder_options, a))
-            }
-            (other, _) => {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Unknown dtype '{}' for BOWIndexBuilder, expected int32, int64, or float32",
-                    other
-                )));
-            }
-        };
-
-        Ok(Self {
-            inner: Arc::new(Mutex::new(Some(inner))),
-            positions,
-        })
+        Self::from_analyzer(path, &builder_options, dtype_str, analyzer, positions)
     }
 
     fn add(
@@ -3174,6 +3310,16 @@ impl PyTextAnalyzer {
                 Box::new(s)
             }
             "porter" => Box::new(PorterStemmer::new()),
+            "lucene" => {
+                let language = crate::vocab::lucene::LuceneLanguage::for_language(&config.language)
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "No Lucene analyzer for language '{}'",
+                            config.language
+                        ))
+                    })?;
+                Box::new(crate::vocab::lucene::LuceneStemmer::new(language))
+            }
             _ => Box::new(crate::vocab::stemmer::NoStemmer),
         };
 
@@ -3317,7 +3463,69 @@ fn impact_index(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()> {
             })
     }
 
+    /// Downloads (if not already there) a morphological dictionary used by
+    /// the Japanese ("ipadic") and Korean ("ko-dic") Lucene analyzers, and
+    /// returns its path. Dictionaries are stored in ``$IMPACT_INDEX_CACHE``
+    /// or the OS cache directory (``~/.cache/impact-index`` on Linux).
+    #[pyfn(module)]
+    #[pyo3(name = "download_dictionary")]
+    fn py_download_dictionary(name: &str) -> PyResult<String> {
+        let dict = parse_dictionary(name)?;
+        crate::vocab::lucene::morph::download_dictionary(dict)
+            .map(|p| p.to_string_lossy().to_string())
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    }
+
+    /// Downloads the resources needed to analyze text in ``language`` with
+    /// ``pipeline`` (so that indexing can then run without network access,
+    /// e.g. on cluster nodes sharing the cache directory), and returns their
+    /// paths. Only the Japanese and Korean Lucene analyzers
+    /// (``pipeline="pyserini"``) need resources (dictionaries) for now.
+    #[pyfn(module)]
+    #[pyo3(name = "prepare_analyzer")]
+    #[pyo3(signature = (language, pipeline=None))]
+    fn py_prepare_analyzer(language: &str, pipeline: Option<&str>) -> PyResult<Vec<String>> {
+        use crate::vocab::lucene::LuceneLanguage;
+        if !pipeline.is_some_and(|p| p.eq_ignore_ascii_case("pyserini")) {
+            return Ok(Vec::new());
+        }
+        let Some(lucene) =
+            LuceneLanguage::resolve(language).map_err(pyo3::exceptions::PyValueError::new_err)?
+        else {
+            return Ok(Vec::new());
+        };
+        lucene
+            .dictionary()
+            .map(|dict| {
+                crate::vocab::lucene::morph::download_dictionary(dict)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+            })
+            .into_iter()
+            .collect()
+    }
+
+    /// Sets the directory of a morphological dictionary ("ipadic" or
+    /// "ko-dic"), overriding the one recorded in indices (e.g. for an index
+    /// built on another machine).
+    #[pyfn(module)]
+    #[pyo3(name = "set_dictionary_path")]
+    fn py_set_dictionary_path(name: &str, path: &str) -> PyResult<()> {
+        let dict = parse_dictionary(name)?;
+        crate::vocab::lucene::morph::set_dictionary_path(dict, PathBuf::from(path));
+        Ok(())
+    }
+
     Ok(())
+}
+
+fn parse_dictionary(name: &str) -> PyResult<crate::vocab::lucene::morph::MorphDictionary> {
+    crate::vocab::lucene::morph::MorphDictionary::from_name(name).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "Unknown dictionary '{}', expected 'ipadic' or 'ko-dic'",
+            name
+        ))
+    })
 }
 
 #[cfg(feature = "stub-gen")]

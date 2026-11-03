@@ -2,7 +2,7 @@
 //!
 //! - **Lucene/Snowball** ([`StopWordFamily::Lucene`]): short, per-language
 //!   lists matching Lucene's language analyzers (English = the 33-word
-//!   `EnglishAnalyzer` default). Covers 17 languages.
+//!   `EnglishAnalyzer` default). Covers 25 languages.
 //! - **Terrier** ([`StopWordFamily::Terrier`]): Terrier's own, much longer
 //!   list (`org.terrier.terms.Stopwords`, 733 words), sourced from
 //!   `share/stopword-list.txt` in <https://github.com/terrier-org/terrier-core>.
@@ -21,7 +21,7 @@ use std::str::FromStr;
 /// Which stop word family to use. See the module docs for provenance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopWordFamily {
-    /// Lucene/Snowball lists (17 languages).
+    /// Lucene/Snowball lists (25 languages).
     Lucene,
     /// Terrier's own list (English only).
     Terrier,
@@ -64,9 +64,12 @@ impl FromStr for StopWordFamily {
 /// The `"english"` list is the Lucene EnglishAnalyzer default (33 words).
 /// Other languages use the Snowball/Lucene stop word lists.
 ///
-/// Supported languages: arabic, danish, dutch, english, finnish, french,
-/// german, greek, hungarian, italian, norwegian, portuguese, romanian,
-/// russian, spanish, swedish, turkish.
+/// Supported languages: arabic, bengali, chinese, danish, dutch, english,
+/// finnish, french, german, greek, hindi, hungarian, indonesian, italian,
+/// japanese, norwegian,
+/// persian, portuguese, romanian, russian, spanish, swedish, telugu, thai,
+/// turkish (or their ISO 639-1 codes, see
+/// [`super::language::normalize_language`]).
 ///
 /// This is a thin, unchanged wrapper around
 /// [`get_stop_words_for_family`]`(language, `[`StopWordFamily::Lucene`]`)`,
@@ -89,27 +92,39 @@ pub fn get_stop_words_for_family(
     language: &str,
     family: StopWordFamily,
 ) -> Option<Vec<&'static str>> {
-    let text = match (family, language.to_lowercase().as_str()) {
+    let text = match (
+        family,
+        super::language::normalize_language(language).as_str(),
+    ) {
         // Lucene/Snowball lists
         // English: use the Lucene EnglishAnalyzer default (33 words)
         (StopWordFamily::Lucene, "english") => {
             include_str!("stopwords/lucene/english_analyzer.txt")
         }
         (StopWordFamily::Lucene, "arabic") => include_str!("stopwords/lucene/arabic.txt"),
+        (StopWordFamily::Lucene, "bengali") => include_str!("stopwords/lucene/bengali.txt"),
+        // CJKAnalyzer's default (English) stop set, used for Chinese
+        (StopWordFamily::Lucene, "chinese") => include_str!("stopwords/lucene/chinese.txt"),
         (StopWordFamily::Lucene, "danish") => include_str!("stopwords/lucene/danish.txt"),
         (StopWordFamily::Lucene, "dutch") => include_str!("stopwords/lucene/dutch.txt"),
         (StopWordFamily::Lucene, "finnish") => include_str!("stopwords/lucene/finnish.txt"),
         (StopWordFamily::Lucene, "french") => include_str!("stopwords/lucene/french.txt"),
         (StopWordFamily::Lucene, "german") => include_str!("stopwords/lucene/german.txt"),
         (StopWordFamily::Lucene, "greek") => include_str!("stopwords/lucene/greek.txt"),
+        (StopWordFamily::Lucene, "hindi") => include_str!("stopwords/lucene/hindi.txt"),
         (StopWordFamily::Lucene, "hungarian") => include_str!("stopwords/lucene/hungarian.txt"),
+        (StopWordFamily::Lucene, "indonesian") => include_str!("stopwords/lucene/indonesian.txt"),
         (StopWordFamily::Lucene, "italian") => include_str!("stopwords/lucene/italian.txt"),
+        (StopWordFamily::Lucene, "japanese") => include_str!("stopwords/lucene/japanese.txt"),
         (StopWordFamily::Lucene, "norwegian") => include_str!("stopwords/lucene/norwegian.txt"),
+        (StopWordFamily::Lucene, "persian") => include_str!("stopwords/lucene/persian.txt"),
         (StopWordFamily::Lucene, "portuguese") => include_str!("stopwords/lucene/portuguese.txt"),
         (StopWordFamily::Lucene, "romanian") => include_str!("stopwords/lucene/romanian.txt"),
         (StopWordFamily::Lucene, "russian") => include_str!("stopwords/lucene/russian.txt"),
         (StopWordFamily::Lucene, "spanish") => include_str!("stopwords/lucene/spanish.txt"),
         (StopWordFamily::Lucene, "swedish") => include_str!("stopwords/lucene/swedish.txt"),
+        (StopWordFamily::Lucene, "telugu") => include_str!("stopwords/lucene/telugu.txt"),
+        (StopWordFamily::Lucene, "thai") => include_str!("stopwords/lucene/thai.txt"),
         (StopWordFamily::Lucene, "turkish") => include_str!("stopwords/lucene/turkish.txt"),
 
         // Terrier list: English only (see module docs)
@@ -149,6 +164,24 @@ mod tests {
         let words = get_stop_words("french").unwrap();
         assert!(words.len() > 100);
         assert!(words.contains(&"le"));
+    }
+
+    #[test]
+    fn test_iso_codes_and_new_lucene_lists() {
+        assert_eq!(get_stop_words("fr"), get_stop_words("french"));
+        for (lang, word) in [
+            ("bn", "এই"),
+            ("fa", "من"),
+            ("hi", "अपना"),
+            ("id", "ada"),
+            ("te", "గురించి"),
+            ("th", "และ"),
+        ] {
+            let words = get_stop_words(lang).unwrap_or_else(|| panic!("{}", lang));
+            assert!(words.contains(&word), "{} misses {}", lang, word);
+            assert!(words.iter().all(|w| !w.starts_with('#')));
+        }
+        assert!(get_stop_words("sw").is_none());
     }
 
     #[test]

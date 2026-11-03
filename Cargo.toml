@@ -108,6 +108,13 @@ rayon = "1"
 bitpacking = "0.9"
 rust-stemmers = "1.2"
 unicode-segmentation = "1.12"
+icu_segmenter = "2"
+# Japanese / Korean morphological analysis (dictionaries loaded at runtime)
+lindera = { version = "6.2", default-features = false }
+# Downloading the Lindera dictionaries (into the OS cache directory)
+ureq = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+dirs = "5"
 protobuf = "^2.27"
 # FST for term map (same as BMP uses)
 fst = "0.4.7"

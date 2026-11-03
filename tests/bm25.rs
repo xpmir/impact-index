@@ -451,6 +451,7 @@ fn test_compressed_index_standalone() {
             english_possessive_filter: true,
             tokenizer: impact_index::vocab::analyzer::Tokenizer::LuceneEnglish,
             position_gaps: true,
+            dictionary: None,
         });
     builder
         .analyzer_mut()
