@@ -439,3 +439,80 @@ class TestBOWIndexBuilder:
         impact_index.DocMetadata.copy_files(src, dst)
         meta = impact_index.DocMetadata.load(dst)
         assert meta.num_docs() == 10
+
+
+def _synthetic_corpus(n_docs=3000, vocab_size=400, seed=7):
+    """Made-up documents over a made-up vocabulary"""
+    rng = np.random.RandomState(seed)
+    words = [f"tok{i}word" for i in range(vocab_size)]
+    # Zipf-like word frequencies
+    p = 1.0 / np.arange(1, vocab_size + 1)
+    p /= p.sum()
+    return [
+        " ".join(rng.choice(words, rng.randint(5, 30), p=p)) for _ in range(n_docs)
+    ], words
+
+
+def _bow_builder(path):
+    return impact_index.BOWIndexBuilder(
+        str(path), dtype="int32", stemmer="porter", language="english"
+    )
+
+
+def test_batched_build_and_search_match_single(tmp_path):
+    """Batched indexing (``add_texts`` over several batches) gives the same
+    vocabulary and posting lists as ``add_text``, and batched searches
+    (``search_*_many``) the same results as one-by-one searches, on the
+    compressed index"""
+    texts, words = _synthetic_corpus()
+
+    single = _bow_builder(tmp_path / "single")
+    for docid, text in enumerate(texts):
+        single.add_text(docid, text)
+    single.build(False)
+
+    batched = _bow_builder(tmp_path / "batched")
+    for start in range(0, len(texts), 1000):
+        batched.add_texts(
+            [(i, texts[i]) for i in range(start, min(start + 1000, len(texts)))]
+        )
+    batched.build(False)
+
+    indices = []
+    for name in ("single", "batched"):
+        raw = impact_index.Index.load(str(tmp_path / name), False)
+        indices.append(raw.compress(str(tmp_path / f"{name}_compressed")))
+
+    analyzers = [index.analyzer() for index in indices]
+    for word in words:
+        assert analyzers[0].analyze_query(word) == analyzers[1].analyze_query(word)
+        (tid,) = analyzers[0].analyze_query(word)
+        postings = [
+            [(p.docid, p.value) for p in index.postings(tid)] for index in indices
+        ]
+        assert postings[0] == postings[1]
+        assert all(word in texts[d].split() for d, _ in postings[0])
+
+    rng = np.random.RandomState(3)
+    queries = [
+        analyzers[1].analyze_query(" ".join(rng.choice(words, rng.randint(1, 6))))
+        for _ in range(50)
+    ] + [{}]
+    key = lambda rs: [(r.docid, round(r.score, 5)) for r in rs]  # noqa: E731
+    for index in indices:
+        scored = index.with_scoring(impact_index.BM25Scoring())
+        for many, one in [
+            (scored.search_maxscore_many, scored.search_maxscore),
+            (scored.search_wand_many, scored.search_wand),
+        ]:
+            batch = many(queries, 10)
+            assert len(batch) == len(queries)
+            for q, rs in zip(queries, batch):
+                assert key(rs) == key(one(q, 10))
+
+    # Same results for both builds
+    scored = [index.with_scoring(impact_index.BM25Scoring()) for index in indices]
+    for q in queries:
+        assert key(scored[0].search_maxscore(q, 10)) == key(
+            scored[1].search_maxscore(q, 10)
+        )
