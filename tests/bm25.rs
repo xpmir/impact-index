@@ -7,7 +7,7 @@ use impact_index::base::{DocId, ImpactValue, TermIndex};
 use impact_index::bow::BOWIndexBuilder;
 use impact_index::builder::BuilderOptions;
 use impact_index::docmeta::DocMetadata;
-use impact_index::index::SparseIndex;
+use impact_index::index::{AsSparseIndexView, SparseIndex};
 use impact_index::scoring::bm25::BM25Scoring;
 use impact_index::scoring::{ScoredIndex, ScoringModel};
 use impact_index::search::maxscore::{search_maxscore, MaxScoreOptions};
@@ -546,4 +546,72 @@ fn test_compressed_index_standalone() {
         "Test 2 (no vocab, pre-built query): {} results, scores match",
         results2.len()
     );
+}
+
+/// Regression test: compressing into a directory that holds the leftovers of
+/// an earlier, interrupted compression of *another* index (e.g. a previous
+/// run of the same build job, whose vocabulary assigns other term ids) must
+/// not keep the stale `vocab.fst`: the compressed index would pair its
+/// posting lists with the wrong terms.
+#[test]
+fn test_compress_replaces_stale_vocab() {
+    use impact_index::base::load_index;
+    use impact_index::compress::{
+        docid::PForCompressor, impact::BitPackedIntCompressor, CompressionTransform,
+    };
+    use impact_index::transforms::IndexTransform;
+
+    init_logger();
+    let dir = temp_dir::TempDir::new().unwrap();
+    let compressed_path = dir.path().join("compressed");
+
+    // Builds a raw BOW index; term ids follow the order of first occurrence
+    let build = |name: &str, docs: &[&str]| {
+        let path = dir.path().join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        let mut builder = BOWIndexBuilder::<i32>::with_analyzer(
+            &path,
+            &BuilderOptions::default(),
+            TextAnalyzer::new(Box::new(NoStemmer)),
+        );
+        let batch: Vec<(DocId, &str)> = docs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (i as DocId, *t))
+            .collect();
+        builder.add_texts_batch(&batch).unwrap();
+        builder.build(false).unwrap();
+        path
+    };
+    let compress = |raw_path: &std::path::Path| {
+        let raw = load_index(raw_path, false);
+        let transform = CompressionTransform {
+            max_block_size: 128,
+            doc_ids_compressor_factory: Box::new(PForCompressor {}),
+            impacts_compressor_factory: Box::new(BitPackedIntCompressor {}),
+            positions_codec: None,
+        };
+        transform.process(&compressed_path, raw.as_view()).unwrap();
+        raw.save_auxiliary(&compressed_path).unwrap();
+    };
+
+    // An earlier build, whose compression left its files behind
+    let old_raw = build("old", &["peace treaty signed", "zebra crossing"]);
+    compress(&old_raw);
+
+    // The new build, compressed into the same directory: other term ids
+    let docs = ["war broke out", "peace returned", "zebra herd"];
+    let new_raw = build("new", &docs);
+    compress(&new_raw);
+
+    let raw_analyzer = TextAnalyzer::load(&new_raw, Box::new(NoStemmer)).unwrap();
+    let analyzer = TextAnalyzer::load(&compressed_path, Box::new(NoStemmer)).unwrap();
+    let index = load_index(&compressed_path, false);
+    for (docid, word) in [(0, "war"), (1, "peace"), (2, "zebra")] {
+        let query = analyzer.analyze_query(word);
+        assert_eq!(query, raw_analyzer.analyze_query(word), "term id of {word}");
+        let term = *query.keys().next().unwrap();
+        let postings: Vec<DocId> = index.as_view().iterator(term).map(|p| p.docid).collect();
+        assert_eq!(postings, vec![docid], "postings of {word}");
+    }
 }

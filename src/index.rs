@@ -459,21 +459,26 @@ pub trait SparseIndex: Send + Sync + SparseIndexView + AsSparseIndexView {
 
     /// Copy vocab/analyzer config only (no docmeta) -- see
     /// [`Self::save_auxiliary`] for when this is required instead.
+    ///
+    /// Files already in `dst` are replaced: `dst` may hold leftovers of an
+    /// earlier, interrupted transform of *another* index (e.g. a previous
+    /// run of the same job), whose vocabulary assigns other term ids --
+    /// keeping it would silently pair this index's posting lists with the
+    /// wrong terms.
     fn save_vocab_and_analyzer(&self, dst: &Path) -> Result<()> {
-        if let (Some(src), Some(_config)) = (self.source_path(), self.analyzer_config()) {
+        if let (Some(src), Some(config)) = (self.source_path(), self.analyzer_config()) {
             // Copy vocab FST from source (it's a binary file, not serializable from config alone)
             let src_fst = src.join("vocab.fst");
             let dst_fst = dst.join("vocab.fst");
-            if src_fst.exists() && !dst_fst.exists() {
+            if src_fst.exists() {
                 crate::utils::fs::link_or_copy(&src_fst, &dst_fst)?;
+            } else if dst_fst.exists() {
+                std::fs::remove_file(&dst_fst)?;
             }
             // Save analyzer config
-            let config_path = dst.join("analyzer.cbor");
-            if !config_path.exists() {
-                let file = std::fs::File::create(&config_path)?;
-                ciborium::ser::into_writer(_config, file)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-            }
+            let file = std::fs::File::create(dst.join("analyzer.cbor"))?;
+            ciborium::ser::into_writer(config, file)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         }
         Ok(())
     }

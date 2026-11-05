@@ -32,7 +32,17 @@ pub(crate) fn copy_file(src: &Path, dst: &Path) -> io::Result<u64> {
 
 /// Hard-links `src` to `dst`, falling back to [`copy_file`] (e.g. across
 /// filesystems).
+///
+/// An existing `dst` is replaced (it is removed first: copying over a hard
+/// link of `src` would truncate `src` itself); nothing is done when `dst` is
+/// `src`.
 pub(crate) fn link_or_copy(src: &Path, dst: &Path) -> io::Result<()> {
+    if dst.exists() {
+        if src.canonicalize()? == dst.canonicalize()? {
+            return Ok(());
+        }
+        std::fs::remove_file(dst)?;
+    }
     if std::fs::hard_link(src, dst).is_err() {
         copy_file(src, dst)?;
     }
@@ -58,6 +68,17 @@ mod tests {
         let linked = dir.join("c");
         link_or_copy(&src, &linked).unwrap();
         assert_eq!(std::fs::read(&linked).unwrap(), data);
+
+        // Replacing an existing (stale) destination, a hard link of the
+        // source, and the source itself
+        let stale = dir.join("d");
+        std::fs::write(&stale, b"stale").unwrap();
+        link_or_copy(&src, &stale).unwrap();
+        assert_eq!(std::fs::read(&stale).unwrap(), data);
+        link_or_copy(&src, &linked).unwrap();
+        link_or_copy(&src, &src).unwrap();
+        assert_eq!(std::fs::read(&linked).unwrap(), data);
+        assert_eq!(std::fs::read(&src).unwrap(), data);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
