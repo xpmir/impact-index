@@ -701,24 +701,12 @@ impl TextAnalyzer {
     ///
     /// Returns `(term_indices, tf_values)` suitable for indexing.
     pub fn analyze_doc(&mut self, text: &str) -> (Vec<TermIndex>, Vec<f32>) {
-        let tokens = self.tokenize(text);
-
-        // Count term frequencies
-        let mut tf_map: HashMap<String, f32> = HashMap::new();
-        for token in &tokens {
-            let stemmed = self.stemmer.stem(token);
-            if self.is_post_stem_stop_word(&stemmed) {
-                continue;
-            }
-            *tf_map.entry(stemmed).or_insert(0.0) += 1.0;
-        }
-
-        // Convert to term indices (growing vocabulary)
-        let mut term_indices = Vec::with_capacity(tf_map.len());
-        let mut tf_values = Vec::with_capacity(tf_map.len());
-        for (term, tf) in tf_map {
-            let idx = self.vocab.get_or_insert(&term);
-            term_indices.push(idx);
+        // Terms in order of first occurrence, so that the vocabulary grows
+        // deterministically (see `tokenize_and_stem`)
+        let mut term_indices = Vec::new();
+        let mut tf_values = Vec::new();
+        for (term, tf) in self.tokenize_and_stem(text) {
+            term_indices.push(self.vocab.get_or_insert(&term));
             tf_values.push(tf);
         }
 
@@ -799,19 +787,29 @@ impl TextAnalyzer {
 
     /// Tokenize and stem text without vocabulary insertion (thread-safe).
     ///
-    /// Returns a list of (stemmed_token, tf) pairs. This can be called
+    /// Returns a list of (stemmed_token, tf) pairs, in order of first
+    /// occurrence: the vocabulary, which assigns term ids in insertion
+    /// order, is then the same from one run to the next (a hash map's
+    /// iteration order differs between processes). This can be called
     /// from multiple threads since it only reads the stemmer and stop words.
     pub fn tokenize_and_stem(&self, text: &str) -> Vec<(String, f32)> {
         let tokens = self.tokenize(text);
-        let mut tf_map: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+        let mut terms: Vec<(String, f32)> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
         for token in &tokens {
             let stemmed = self.stemmer.stem(token);
             if self.is_post_stem_stop_word(&stemmed) {
                 continue;
             }
-            *tf_map.entry(stemmed).or_insert(0.0) += 1.0;
+            match index.get(&stemmed) {
+                Some(&ix) => terms[ix].1 += 1.0,
+                None => {
+                    index.insert(stemmed.clone(), terms.len());
+                    terms.push((stemmed, 1.0));
+                }
+            }
         }
-        tf_map.into_iter().collect()
+        terms
     }
 
     /// Thread-safe, position-preserving variant of [`Self::tokenize_and_stem`]
@@ -823,7 +821,8 @@ impl TextAnalyzer {
     pub fn tokenize_and_stem_positional(&self, text: &str) -> Vec<(String, Vec<u32>)> {
         let tokens = self.tokenize_indexed(text);
         let gaps = self.config.position_gaps;
-        let mut positions_map: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut terms: Vec<(String, Vec<u32>)> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
         let mut kept = 0u32;
         for (token, pos) in tokens {
             let stemmed = self.stemmer.stem(&token);
@@ -834,9 +833,15 @@ impl TextAnalyzer {
             // tokens (Terrier's block ids), not in the raw token stream.
             let pos = if gaps { pos } else { kept };
             kept += 1;
-            positions_map.entry(stemmed).or_default().push(pos);
+            match index.get(&stemmed) {
+                Some(&ix) => terms[ix].1.push(pos),
+                None => {
+                    index.insert(stemmed.clone(), terms.len());
+                    terms.push((stemmed, vec![pos]));
+                }
+            }
         }
-        positions_map.into_iter().collect()
+        terms
     }
 
     /// Get a reference to the vocabulary.
@@ -961,6 +966,36 @@ impl TextAnalyzer {
 mod tests {
     use super::*;
     use crate::vocab::stemmer::NoStemmer;
+
+    /// Term ids follow the order of first occurrence in the text, so that
+    /// two builds of the same collection share their vocabulary (it was the
+    /// iteration order of a hash map, which differs between processes)
+    #[test]
+    fn test_term_ids_follow_first_occurrence() {
+        let words: Vec<String> = (0..40).map(|i| format!("w{}x", 39 - i)).collect();
+        let text = format!("{} {}", words.join(" "), words[..5].join(" "));
+        let expected: Vec<(String, f32)> = words
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (w.clone(), if i < 5 { 2.0 } else { 1.0 }))
+            .collect();
+
+        let mut analyzer = TextAnalyzer::new(Box::new(NoStemmer));
+        assert_eq!(analyzer.tokenize_and_stem(&text), expected);
+        let positional: Vec<String> = analyzer
+            .tokenize_and_stem_positional(&text)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert_eq!(positional, words);
+
+        let (terms, values) = analyzer.analyze_doc(&text);
+        assert_eq!(terms, (0..40).collect::<Vec<TermIndex>>());
+        assert_eq!(values[..6], [2.0, 2.0, 2.0, 2.0, 2.0, 1.0]);
+        for (i, w) in words.iter().enumerate() {
+            assert_eq!(analyzer.vocab().get(w), Some(i as TermIndex));
+        }
+    }
 
     #[test]
     fn test_analyze_doc() {
