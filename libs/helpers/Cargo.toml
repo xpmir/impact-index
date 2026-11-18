@@ -11,6 +11,6 @@ log = { version = "0.4.17", features = ["max_level_debug", "release_max_level_in
 temp-dir = "0.1.11"
 rand_distr = "0.4.3"
 rand = "0.8.5"
-ndarray = "0.15.4"
+ndarray = "0.16"
 ntest = "*"
 impact-index = { path = "../.."}

@@ -75,7 +75,7 @@ pyo3-async-runtimes = { version = "0.28", features = ["attributes", "tokio-runti
 pyo3-log = "0.13"
 tokio = { version = "1", features = ["full"] }
 numpy = "0.28"
-ndarray = { version = "0.15.4", features = [ "serde" ] }
+ndarray = { version = "0.16", features = [ "serde" ] }
 serde = { version = "^1.0", features = ["derive"] }
 simple-error = "0.2.3"
 sucds = "0.5.0"
