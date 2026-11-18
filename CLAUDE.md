@@ -69,6 +69,15 @@ the same GitHub release as the PyPI wheels (`release.yml`) but in a separate
 workflow. Both read the single version in `[workspace.package]` of the root
 `Cargo.toml`: bump it there only (plus `Cargo.lock`).
 
+Release policy: one version for both targets (`chore: version bump X.Y.Z`,
+tag `vX.Y.Z`); a fix for one target is a plain patch bump, never a
+post-release (`.postN` cannot be expressed in Cargo or npm). A release
+publishes to both PyPI and npm unless its notes, at creation, contain
+`[skip pypi]` or `[skip npm]` (e.g. `gh release create v1.10.1 --notes
+"[skip npm]"`); release notes are generated either way. Each registry may
+thus skip versions. An npm version staged by mistake is rejected on
+npmjs.com rather than approved.
+
 ### ICU4X segmentation data
 The dictionaries of the `icu` tokenizer / Thai analyzer are not built in
 (they would add ~3 MB): `src/vocab/icu.rs` downloads the official ICU4X

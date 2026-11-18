@@ -2,6 +2,10 @@ name: Upload python packages
 
 # The npm package (wasm/) is published by release-npm.yml from the same
 # release, independently: a failure in one does not block the other.
+#
+# "[skip pypi]" in the release notes when the release is created skips
+# building and publishing the Python packages (release notes are still
+# generated), e.g. `gh release create v1.10.1 --notes "[skip pypi]"`.
 
 on:
   release:
@@ -24,6 +28,7 @@ jobs:
 
   linux:
     needs: check-version
+    if: ${{ !contains(github.event.release.body, '[skip pypi]') }}
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -64,6 +69,7 @@ jobs:
 
   windows:
     needs: check-version
+    if: ${{ !contains(github.event.release.body, '[skip pypi]') }}
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -114,6 +120,7 @@ jobs:
 
   macos:
     needs: check-version
+    if: ${{ !contains(github.event.release.body, '[skip pypi]') }}
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -161,6 +168,7 @@ jobs:
 
   sdist:
     needs: check-version
+    if: ${{ !contains(github.event.release.body, '[skip pypi]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -181,7 +189,8 @@ jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
-    if: "startsWith(github.ref, 'refs/tags/')"
+    # Also runs (for the release notes) when the builds were skipped
+    if: ${{ !cancelled() && !failure() && startsWith(github.ref, 'refs/tags/') }}
     needs: [linux, windows, macos, sdist]
     permissions:
       contents: write
@@ -203,9 +212,11 @@ jobs:
         with:
           body_path: release-notes.md
       - uses: actions/download-artifact@v7
+        if: ${{ !contains(github.event.release.body, '[skip pypi]') }}
         with:
           path: dist
           pattern: wheels-*
           merge-multiple: true
       - name: Publish to PyPI
+        if: ${{ !contains(github.event.release.body, '[skip pypi]') }}
         uses: pypa/gh-action-pypi-publish@release/v1

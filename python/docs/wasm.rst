@@ -25,7 +25,10 @@ Firefox code such as Zotero plugins)::
 
     npm install impact-index
 
-Its version follows the Python package. ``init()`` fetches
+Its version follows the Python package: the same version number means the
+same core library and index format, but a release that only concerns one of
+them is not published to the other, so either may skip versions.
+``init()`` fetches
 ``impact_index_wasm_bg.wasm`` next to the module; when loading it
 differently (Node.js, extensions), pass the bytes or a URL:
 ``await init({ module_or_path: bytes })``.

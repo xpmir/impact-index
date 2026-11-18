@@ -16,6 +16,10 @@ name: Upload npm package
 # protection rules.
 #
 # workflow_dispatch: dry run (build and pack, nothing is published).
+#
+# "[skip npm]" in the release notes when the release is created skips this
+# workflow, e.g. `gh release create v1.10.1 --notes "[skip npm]"`. A version
+# staged by mistake is rejected on npmjs.com instead of approved.
 
 on:
   release:
@@ -27,6 +31,7 @@ permissions:
 
 jobs:
   npm:
+    if: ${{ github.event_name != 'release' || !contains(github.event.release.body, '[skip npm]') }}
     runs-on: ubuntu-latest
     # must match the environment of the trusted publisher on npmjs.com
     environment: npm
@@ -59,6 +64,15 @@ jobs:
         run: cargo install wasm-pack --locked --version 0.15.1
       - name: Build the package
         run: wasm/build-npm.sh "$GITHUB_WORKSPACE/wasm/pkg"
+      - name: Check the npm version matches the tag
+        if: github.event_name == 'release'
+        working-directory: wasm/pkg
+        run: |
+          version=$(npm pkg get version | tr -d '"')
+          if [ "$version" != "${GITHUB_REF_NAME#v}" ]; then
+            echo "::error::package.json version $version does not match tag $GITHUB_REF_NAME"
+            exit 1
+          fi
       - name: Check the package
         working-directory: wasm/pkg
         run: npm publish --dry-run
