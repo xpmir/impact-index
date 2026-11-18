@@ -14,6 +14,7 @@
 //!     new Uint32Array([12, 40]), new Float32Array([1.2, 0.4]), 10);
 //! ```
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -135,11 +136,112 @@ fn docid32(docid: u64) -> Result<u32, JsError> {
     u32::try_from(docid).map_err(|_| JsError::new(&format!("document id {docid} exceeds 2^32")))
 }
 
+/// Live instances of a class, by id, so that a method can borrow one
+/// given as an optional parameter or an option field: wasm-bindgen only
+/// takes such values by value, which frees the JS object. The class has a
+/// hidden `id_field` getter returning the id.
+struct Handles<T> {
+    next: u32,
+    live: HashMap<u32, T>,
+}
+
+impl<T> Default for Handles<T> {
+    fn default() -> Self {
+        Self {
+            next: 0,
+            live: HashMap::new(),
+        }
+    }
+}
+
+type Registry<T> = std::thread::LocalKey<RefCell<Handles<T>>>;
+
+/// Registers `value`, returns its id
+fn register<T>(registry: &'static Registry<T>, value: T) -> u32 {
+    registry.with(|handles| {
+        let handles = &mut *handles.borrow_mut();
+        handles.next += 1;
+        handles.live.insert(handles.next, value);
+        handles.next
+    })
+}
+
+fn unregister<T>(registry: &'static Registry<T>, id: u32) {
+    // Dropped outside of the borrow
+    let _value = registry.with(|handles| handles.borrow_mut().live.remove(&id));
+}
+
+/// The registered value of the JS object `value` (`None` if undefined or
+/// null), through its `id_field` getter
+fn lookup<T: Clone>(
+    registry: &'static Registry<T>,
+    value: &JsValue,
+    id_field: &str,
+    class: &str,
+) -> Result<Option<T>, JsError> {
+    if value.is_undefined() || value.is_null() {
+        return Ok(None);
+    }
+    let not_found = || JsError::new(&format!("expected a {class} (not freed)"));
+    let id = Reflect::get(value, &id_field.into())
+        .ok()
+        .and_then(|id| id.as_f64())
+        .ok_or_else(not_found)?;
+    registry
+        .with(|handles| handles.borrow().live.get(&(id as u32)).cloned())
+        .map(Some)
+        .ok_or_else(not_found)
+}
+
+thread_local! {
+    static DOC_SETS: RefCell<Handles<Rc<RefCell<DocBitSet>>>> = RefCell::default();
+    static CACHES: RefCell<Handles<Arc<RangeCache>>> = RefCell::default();
+}
+
+#[wasm_bindgen]
+extern "C" {
+    /// A `DocSet` given as an optional parameter, borrowed through
+    /// [`DocSet::borrow_param`]
+    #[wasm_bindgen(typescript_type = "DocSet")]
+    pub type DocSetParam;
+}
+
 /// A set of document ids (e.g. deleted documents of a segment)
 #[wasm_bindgen]
-#[derive(Default, Clone)]
 pub struct DocSet {
-    inner: DocBitSet,
+    id: u32,
+    inner: Rc<RefCell<DocBitSet>>,
+}
+
+impl Drop for DocSet {
+    fn drop(&mut self) {
+        unregister(&DOC_SETS, self.id);
+    }
+}
+
+impl Default for DocSet {
+    fn default() -> Self {
+        DocSet::from_bits(DocBitSet::default())
+    }
+}
+
+impl DocSet {
+    fn from_bits(bits: DocBitSet) -> DocSet {
+        let inner = Rc::new(RefCell::new(bits));
+        DocSet {
+            id: register(&DOC_SETS, inner.clone()),
+            inner,
+        }
+    }
+
+    /// The bits of an optional `DocSet` parameter (not consumed, unlike
+    /// `Option<DocSet>`)
+    fn borrow_param(value: Option<DocSetParam>) -> Result<Option<Rc<RefCell<DocBitSet>>>, JsError> {
+        match value {
+            Some(value) => lookup(&DOC_SETS, &value, "__docSetId", "DocSet"),
+            None => Ok(None),
+        }
+    }
 }
 
 #[wasm_bindgen]
@@ -152,33 +254,37 @@ impl DocSet {
     /// The set of the given document ids
     #[wasm_bindgen(js_name = fromDocids)]
     pub fn from_docids(docids: &[u32]) -> DocSet {
-        DocSet {
-            inner: docids.iter().map(|&d| d as u64).collect(),
-        }
+        DocSet::from_bits(docids.iter().map(|&d| d as u64).collect())
+    }
+
+    /// Identifies the set when given as a parameter
+    #[wasm_bindgen(getter, js_name = __docSetId, skip_typescript)]
+    pub fn doc_set_id(&self) -> u32 {
+        self.id
     }
 
     /// Adds a document, returns `true` if it was not in the set
     pub fn add(&mut self, docid: u32) -> bool {
-        self.inner.insert(docid as u64)
+        self.inner.borrow_mut().insert(docid as u64)
     }
 
     /// Removes a document, returns `true` if it was in the set
     pub fn remove(&mut self, docid: u32) -> bool {
-        self.inner.remove(docid as u64)
+        self.inner.borrow_mut().remove(docid as u64)
     }
 
     pub fn has(&self, docid: u32) -> bool {
-        self.inner.contains(docid as u64)
+        self.inner.borrow().contains(docid as u64)
     }
 
     #[wasm_bindgen(getter)]
     pub fn size(&self) -> usize {
-        self.inner.len()
+        self.inner.borrow().len()
     }
 
     /// The document ids, in increasing order
     pub fn docids(&self) -> Result<Vec<u32>, JsError> {
-        self.inner.iter().map(docid32).collect()
+        self.inner.borrow().iter().map(docid32).collect()
     }
 }
 
@@ -251,35 +357,127 @@ pub struct Index {
     cache: Option<Arc<RangeCache>>,
 }
 
+/// A cache of posting lists (and decoded block tables), bounded in bytes,
+/// shared by the indexes opened with it (`Index.open(reader, { cache })`)
+#[wasm_bindgen]
+pub struct Cache {
+    id: u32,
+    inner: Arc<RangeCache>,
+}
+
+impl Drop for Cache {
+    fn drop(&mut self) {
+        unregister(&CACHES, self.id);
+    }
+}
+
+/// Default cache capacity (64 MiB)
+const CACHE_BYTES: f64 = (64 << 20) as f64;
+
+fn capacity(bytes: Option<f64>, name: &str) -> Result<usize, JsError> {
+    let bytes = bytes.unwrap_or(CACHE_BYTES);
+    if bytes.is_nan() || bytes < 0. {
+        return Err(JsError::new(&format!("{name} must be a number of bytes")));
+    }
+    Ok(bytes as usize)
+}
+
+#[wasm_bindgen]
+impl Cache {
+    /// A cache of `bytes` bytes (64 MiB by default)
+    #[wasm_bindgen(constructor)]
+    pub fn new(bytes: Option<f64>) -> Result<Cache, JsError> {
+        let inner = Arc::new(RangeCache::new(capacity(bytes, "bytes")?));
+        Ok(Cache {
+            id: register(&CACHES, inner.clone()),
+            inner,
+        })
+    }
+
+    /// Identifies the cache in `Index.open` options
+    #[wasm_bindgen(getter, js_name = __cacheId, skip_typescript)]
+    pub fn cache_id(&self) -> u32 {
+        self.id
+    }
+
+    /// Capacity in bytes
+    #[wasm_bindgen(getter)]
+    pub fn capacity(&self) -> f64 {
+        self.inner.capacity() as f64
+    }
+
+    /// Bytes held (above the capacity only while a query needs them)
+    #[wasm_bindgen(getter)]
+    pub fn bytes(&self) -> f64 {
+        self.inner.bytes() as f64
+    }
+
+    /// Number of reads so far, by all the indexes using the cache
+    #[wasm_bindgen(getter)]
+    pub fn reads(&self) -> f64 {
+        self.inner.reads() as f64
+    }
+
+    /// Empties the cache (the WASM memory is reused, not given back)
+    pub fn clear(&self) {
+        self.inner.clear();
+    }
+}
+
+/// The cache given as `cache` in the options of `Index.open`
+fn cache_option(options: &JsValue) -> Result<Option<Arc<RangeCache>>, JsError> {
+    match option(options, "cache")? {
+        Some(cache) => lookup(&CACHES, &cache, "__cacheId", "Cache"),
+        None => Ok(None),
+    }
+}
+
+/// The distinct caches of the indexes read lazily
+fn distinct_caches<'a>(
+    caches: impl IntoIterator<Item = &'a Option<Arc<RangeCache>>>,
+) -> Vec<&'a Arc<RangeCache>> {
+    let mut distinct: Vec<&Arc<RangeCache>> = Vec::new();
+    for cache in caches.into_iter().flatten() {
+        if !distinct.iter().any(|c| Arc::ptr_eq(c, cache)) {
+            distinct.push(cache);
+        }
+    }
+    distinct
+}
+
 /// Reads the postings of `terms` ahead of a search, for the indexes read
 /// lazily: read errors surface here, as exceptions. Each cache starts a
 /// single query, so that the data prefetched for one index is not evicted
-/// for another index sharing its cache (e.g. a segment pushed twice).
+/// for another index sharing its cache (e.g. segments opened with one
+/// `Cache`). [`after_search`] then brings the caches back to their
+/// capacity.
 fn prefetch<'a>(
-    indexes: impl IntoIterator<Item = (&'a dyn SparseIndex, &'a Option<Arc<RangeCache>>)>,
+    indexes: impl IntoIterator<Item = (&'a dyn SparseIndex, &'a Option<Arc<RangeCache>>)> + Clone,
     terms: &HashMap<TermIndex, ImpactValue>,
 ) -> Result<(), JsError> {
-    let lazy: Vec<(&dyn SparseIndex, &Arc<RangeCache>)> = indexes
-        .into_iter()
-        .filter_map(|(index, cache)| Some((index, cache.as_ref()?)))
-        .collect();
-    let mut caches: Vec<&Arc<RangeCache>> = Vec::new();
-    for &(_, cache) in &lazy {
-        if !caches.iter().any(|c| Arc::ptr_eq(c, cache)) {
-            caches.push(cache);
-        }
-    }
+    let caches = distinct_caches(indexes.clone().into_iter().map(|(_, cache)| cache));
     let terms: Vec<TermIndex> = terms.keys().copied().collect();
     for cache in &caches {
         cache.start_query();
     }
-    for (index, _) in lazy {
-        index.prefetch(&terms).map_err(js_error)?;
+    for (index, cache) in indexes {
+        if cache.is_some() {
+            index.prefetch(&terms).map_err(js_error)?;
+        }
     }
     for cache in caches {
         cache.evict();
     }
     Ok(())
+}
+
+/// Evicts what a search added beyond the capacity of the caches (blocks
+/// decoded while searching), so that between queries a cache holds at most
+/// its capacity, or the data of the last query if larger
+fn after_search<'a>(caches: impl IntoIterator<Item = &'a Option<Arc<RangeCache>>>) {
+    for cache in distinct_caches(caches) {
+        cache.evict();
+    }
 }
 
 #[wasm_bindgen]
@@ -308,13 +506,17 @@ impl Index {
             unchecked_param_type = "{size(name: string): number | undefined, read(name: string, offset: number, length: number): Uint8Array}"
         )]
         reader: JsValue,
-        #[wasm_bindgen(unchecked_param_type = "{cacheBytes?: number}")] options: JsValue,
+        #[wasm_bindgen(unchecked_param_type = "{cache?: Cache, cacheBytes?: number}")]
+        options: JsValue,
     ) -> Result<Index, JsError> {
-        let capacity = number_option(&options, "cacheBytes")?.unwrap_or((64 << 20) as f64);
-        if capacity.is_nan() || capacity < 0. {
-            return Err(JsError::new("cacheBytes must be a number of bytes"));
-        }
-        let cache = Arc::new(RangeCache::new(capacity as usize));
+        let bytes = number_option(&options, "cacheBytes")?;
+        let cache = match cache_option(&options)? {
+            Some(_) if bytes.is_some() => {
+                return Err(JsError::new("give either cache or cacheBytes"))
+            }
+            Some(cache) => cache,
+            None => Arc::new(RangeCache::new(capacity(bytes, "cacheBytes")?)),
+        };
         let files = ReaderFiles::new(Arc::new(JsRangeReader::new(&reader)?), cache.clone());
         let index = load_index_from_files(&files, true).map_err(js_error)?;
         Ok(Index {
@@ -323,13 +525,24 @@ impl Index {
         })
     }
 
-    /// Bytes of postings in the cache (`Index.open`)
+    /// Empties the cache (`Index.open`; the whole cache if shared): the
+    /// postings are read again when needed. The WASM memory is reused, not
+    /// given back.
+    #[wasm_bindgen(js_name = clearCache)]
+    pub fn clear_cache(&self) {
+        if let Some(cache) = &self.cache {
+            cache.clear();
+        }
+    }
+
+    /// Bytes held by the cache (`Index.open`; the whole cache if shared)
     #[wasm_bindgen(getter, js_name = cacheBytes)]
     pub fn cache_bytes(&self) -> Option<f64> {
         self.cache.as_ref().map(|c| c.bytes() as f64)
     }
 
-    /// Number of posting reads so far (`Index.open`)
+    /// Number of posting reads so far (`Index.open`; by all the indexes
+    /// using the cache if shared)
     #[wasm_bindgen(getter)]
     pub fn reads(&self) -> Option<f64> {
         self.cache.as_ref().map(|c| c.reads() as f64)
@@ -353,18 +566,20 @@ impl Index {
         terms: &[u32],
         weights: &[f32],
         k: usize,
-        deleted: Option<DocSet>,
+        deleted: Option<DocSetParam>,
     ) -> Result<SearchResults, JsError> {
+        let deleted = DocSet::borrow_param(deleted)?;
+        let deleted = deleted.as_ref().map(|d| d.borrow());
         let query = query(terms, weights)?;
         prefetch([(&*self.inner, &self.cache)], &query)?;
-        let deleted = deleted.map(|d| d.inner);
         let results = search_maxscore_filtered(
             &*self.inner,
             &query,
             k,
             MaxScoreOptions::default(),
-            deleted.as_ref().map(Exclude),
+            deleted.as_deref().map(Exclude),
         );
+        after_search([&self.cache]);
         Ok(SearchResults {
             docids: results
                 .iter()
@@ -396,28 +611,43 @@ impl SegmentedIndex {
     }
 
     /// Adds a segment, returns its position
-    pub fn push(&mut self, index: &Index, deleted: Option<DocSet>) -> usize {
+    pub fn push(&mut self, index: &Index, deleted: Option<DocSetParam>) -> Result<usize, JsError> {
+        let deleted = DocSet::borrow_param(deleted)?.map(|d| d.borrow().clone());
         self.indexes.push(index.inner.clone());
         self.caches.push(index.cache.clone());
-        self.deleted.push(deleted.map(|d| d.inner));
+        self.deleted.push(deleted);
         self.sizes.push(segment_size(&*index.inner));
-        self.indexes.len() - 1
+        Ok(self.indexes.len() - 1)
     }
 
     /// Replaces the deleted documents of a segment
     #[wasm_bindgen(js_name = setDeleted)]
-    pub fn set_deleted(&mut self, segment: usize, deleted: Option<DocSet>) -> Result<(), JsError> {
+    pub fn set_deleted(
+        &mut self,
+        segment: usize,
+        deleted: Option<DocSetParam>,
+    ) -> Result<(), JsError> {
+        let deleted = DocSet::borrow_param(deleted)?.map(|d| d.borrow().clone());
         let slot = self
             .deleted
             .get_mut(segment)
             .ok_or_else(|| JsError::new(&format!("no segment {segment}")))?;
-        *slot = deleted.map(|d| d.inner);
+        *slot = deleted;
         Ok(())
     }
 
     #[wasm_bindgen(getter)]
     pub fn length(&self) -> usize {
         self.indexes.len()
+    }
+
+    /// Empties the caches of the segments read lazily (see
+    /// `Index.clearCache`)
+    #[wasm_bindgen(js_name = clearCache)]
+    pub fn clear_cache(&self) {
+        for cache in distinct_caches(&self.caches) {
+            cache.clear();
+        }
     }
 
     /// Top-`k` documents over all segments
@@ -445,6 +675,7 @@ impl SegmentedIndex {
             })
             .collect();
         let results = SegmentedSearch::with_sizes(segments, &self.sizes).search(&query, k);
+        after_search(&self.caches);
         Ok(SearchResults {
             docids: results
                 .iter()

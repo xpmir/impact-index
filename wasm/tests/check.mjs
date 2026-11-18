@@ -12,7 +12,7 @@ import { createRequire } from "node:module";
 
 const [pkgDir, fixtureDir] = process.argv.slice(2);
 const require = createRequire(import.meta.url);
-const { Builder, Index, DocSet, SegmentedIndex, KeyStoreBuilder, DocumentStore, memoryBytes } = require(join(pkgDir, "impact_index_wasm.js"));
+const { Builder, Cache, Index, DocSet, SegmentedIndex, KeyStoreBuilder, DocumentStore, memoryBytes } = require(join(pkgDir, "impact_index_wasm.js"));
 
 /** Map from paths relative to `dir` to their contents */
 function readIndex(dir) {
@@ -80,10 +80,14 @@ timed("search split", queries, ([t, w]) => split.search(t, w, k)).forEach((r, i)
   compare(`split #${i}`, Array.from(r.docids, (d, j) => [d, r.scores[j]]), fixture.expected.split[i]),
 );
 
+// DocSets are not consumed by push / setDeleted / search: the same handles
+// are pushed here and to the lazy segments below
+const deletedSets = fixture.deleted.map((docids) => DocSet.fromDocids(new Uint32Array(docids)));
 const segmented = new SegmentedIndex();
 for (const [i, name] of ["seg0", "seg1"].entries()) {
-  segmented.push(Index.load(readIndex(join(fixtureDir, name))), DocSet.fromDocids(new Uint32Array(fixture.deleted[i])));
+  segmented.push(Index.load(readIndex(join(fixtureDir, name))), deletedSets[i]);
 }
+segmented.setDeleted(0, deletedSets[0]);
 timed("search 2 segments + tombstones", queries, ([t, w]) => segmented.search(t, w, k)).forEach((r, i) =>
   compare(
     `segmented #${i}`,
@@ -126,6 +130,28 @@ function fileReader(dir) {
     failures++;
     console.error("cached queries read again");
   }
+  // The same DocSet, given to several searches; a copy is taken by push
+  // and setDeleted (later changes do not apply)
+  {
+    const deleted = DocSet.fromDocids(new Uint32Array(Array.from(lazy.search(...queries[0], k).docids).slice(0, 3)));
+    const first = lazy.search(...queries[0], k, deleted);
+    const second = lazy.search(...queries[0], k, deleted);
+    if (deleted.size !== 3 || first.docids.some((d) => deleted.has(d)) ||
+        Array.from(first.docids).join() !== Array.from(second.docids).join()) {
+      failures++;
+      console.error("DocSet reused in search", deleted.size, first.docids, second.docids);
+    }
+  }
+  // clearCache empties the cache; postings are then read again
+  lazy.clearCache();
+  if (lazy.cacheBytes !== 0) { failures++; console.error("cache not cleared", lazy.cacheBytes); }
+  const readsBeforeClear = lazy.reads;
+  {
+    const r = lazy.search(...queries[0], k);
+    compare("lazy after clearCache", Array.from(r.docids, (d, j) => [d, r.scores[j]]), fixture.expected.compressed[0]);
+  }
+  if (lazy.reads === readsBeforeClear) { failures++; console.error("no read after clearCache"); }
+
   // A read error is an exception; the index works again afterwards
   reader.fail = true;
   try {
@@ -146,12 +172,70 @@ function fileReader(dir) {
   });
   const lazySegmented = new SegmentedIndex();
   for (const [i, name] of ["seg0", "seg1"].entries()) {
-    lazySegmented.push(Index.open(fileReader(join(fixtureDir, name)), {}), DocSet.fromDocids(new Uint32Array(fixture.deleted[i])));
+    lazySegmented.push(Index.open(fileReader(join(fixtureDir, name)), {}), deletedSets[i]);
   }
   queries.forEach(([t, w], i) => {
     const r = lazySegmented.search(t, w, k);
     compare(`lazy segmented #${i}`, Array.from(r.docids, (d, j) => [r.segments[j], d, r.scores[j]]), fixture.expected.segmented[i]);
   });
+  if (deletedSets.some((d, i) => d.size !== new Set(fixture.deleted[i]).size)) {
+    failures++;
+    console.error("DocSet consumed by push");
+  }
+
+  // Segments sharing one Cache: same results; between queries, the cache
+  // holds at most its capacity, or the data of the last query if larger.
+  // That data is measured with a cache of capacity 0, which keeps only it.
+  const openShared = (cache) => {
+    const segments = new SegmentedIndex();
+    for (const [i, name] of ["seg0", "seg1"].entries()) {
+      segments.push(Index.open(fileReader(join(fixtureDir, name)), { cache }), deletedSets[i]);
+    }
+    return segments;
+  };
+  const empty = new Cache(0);
+  const emptySegments = openShared(empty);
+  const footprints = queries.map(([t, w]) => (emptySegments.search(t, w, k), empty.bytes));
+  const capacity = 64 << 10;
+  const shared = new Cache(capacity);
+  const sharedSegments = openShared(shared);
+  let over = 0;
+  queries.forEach(([t, w], i) => {
+    const r = sharedSegments.search(t, w, k);
+    compare(`shared cache #${i}`, Array.from(r.docids, (d, j) => [r.segments[j], d, r.scores[j]]), fixture.expected.segmented[i]);
+    if (shared.bytes > Math.max(capacity, footprints[i])) {
+      over++;
+      console.error(`shared cache #${i}: ${shared.bytes} bytes > max(${capacity}, ${footprints[i]})`);
+    }
+  });
+  const footprintSum = footprints.reduce((a, b) => a + b, 0);
+  console.log(`shared cache: ${shared.reads} reads, ${shared.bytes} / ${capacity} bytes (queries alone: ${footprintSum} bytes)`);
+  if (over || footprintSum <= capacity) {
+    failures++;
+    console.error("shared cache over budget, or never full", over, footprintSum);
+  }
+  sharedSegments.clearCache();
+  if (shared.bytes !== 0) { failures++; console.error("SegmentedIndex.clearCache"); }
+  for (const options of [{ cache: shared, cacheBytes: 1 }, { cache: {} }, { cache: deletedSets[0] }]) {
+    try {
+      Index.open(fileReader(join(fixtureDir, "seg0")), options);
+      failures++;
+      console.error("bad cache option accepted", options);
+    } catch (e) {}
+  }
+  const freed = new Cache();
+  freed.free();
+  try {
+    Index.open(fileReader(join(fixtureDir, "seg0")), { cache: freed });
+    failures++;
+    console.error("freed cache accepted");
+  } catch (e) {}
+  // A freed Cache stays alive for the indexes using it
+  shared.free();
+  {
+    const r = sharedSegments.search(...queries[0], k);
+    compare("freed shared cache", Array.from(r.docids, (d, j) => [r.segments[j], d, r.scores[j]]), fixture.expected.segmented[0]);
+  }
   try {
     Index.open(fileReader(join(fixtureDir, "nothing-here")), {});
     failures++;

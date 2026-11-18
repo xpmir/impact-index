@@ -688,3 +688,115 @@ fn test_lazy_cache_nested_ranges() {
     blocks.prefetch(&[term]).unwrap();
     assert_eq!(blocks_cache.bytes(), whole_cache.bytes());
 }
+
+/// Clearing the cache drops everything, the current query included, while
+/// iterators keep the data they walk; the postings are then read again
+#[test]
+fn test_lazy_cache_clear() {
+    use impact_index::storage::{RangeCache, ReaderFiles};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    let mut data = test_index();
+    let index = data.indexer.to_index(true);
+    let out = TempDir::new().unwrap();
+    compression().process(out.path(), &index).unwrap();
+    let files = read_dir(out.path());
+    let reference = load_index_from_files(&files, true).unwrap();
+    let reader = Arc::new(TestReader {
+        files,
+        reads: Default::default(),
+        fail: Default::default(),
+    });
+    let cache = Arc::new(RangeCache::new(1 << 30));
+    let lazy =
+        load_index_from_files(&ReaderFiles::new(reader.clone(), cache.clone()), true).unwrap();
+    let term = (0..reference.len())
+        .max_by_key(|&t| reference.term_postings(t))
+        .unwrap();
+
+    cache.start_query();
+    lazy.prefetch(&[term]).unwrap();
+    let cached = cache.bytes();
+    let reads = reader.reads.load(Ordering::SeqCst);
+    assert!(cached > 0);
+    let mut iterator = lazy.block_iterator(term);
+
+    cache.clear();
+    assert_eq!(cache.bytes(), 0);
+    check_same_index(
+        reference.block_iterator(term).as_mut(),
+        iterator.as_mut(),
+        0.,
+    );
+
+    cache.start_query();
+    lazy.prefetch(&[term]).unwrap();
+    assert_eq!(cache.bytes(), cached);
+    assert!(reader.reads.load(Ordering::SeqCst) > reads, "read again");
+}
+
+/// Two indexes read lazily through one cache: their files have the same
+/// names, but each index gets its own postings
+#[test]
+fn test_lazy_shared_cache() {
+    use impact_index::storage::{RangeCache, ReaderFiles};
+    use std::sync::Arc;
+
+    let cache = Arc::new(RangeCache::new(4000));
+    let indexes: Vec<_> = [42, 7]
+        .into_iter()
+        .map(|seed| {
+            let mut data = TestIndex::new(
+                100,
+                2_000,
+                5.,
+                10,
+                Some(seed),
+                BuilderOptions {
+                    checkpoint_frequency: 0,
+                    in_memory_threshold: 10,
+                    checkpoint_flush_ratio: 0.5,
+                    positions: false,
+                },
+                &HashSet::<DocId>::new(),
+            );
+            let out = TempDir::new().unwrap();
+            compression()
+                .process(out.path(), &data.indexer.to_index(true))
+                .unwrap();
+            let files = read_dir(out.path());
+            let reference = load_index_from_files(&files, true).unwrap();
+            let reader = Arc::new(TestReader {
+                files,
+                reads: Default::default(),
+                fail: Default::default(),
+            });
+            let lazy =
+                load_index_from_files(&ReaderFiles::new(reader, cache.clone()), true).unwrap();
+            (reference, lazy)
+        })
+        .collect();
+
+    let mut rng = Rng(5);
+    for _ in 0..100 {
+        let terms: Vec<TermIndex> = (0..4).map(|_| rng.below(100) as TermIndex).collect();
+        let query: HashMap<TermIndex, ImpactValue> = terms.iter().map(|&t| (t, 1.)).collect();
+        // One query on the cache for both indexes, as SegmentedIndex does
+        cache.start_query();
+        for (_, lazy) in &indexes {
+            lazy.prefetch(&terms).unwrap();
+        }
+        cache.evict();
+        for (reference, lazy) in &indexes {
+            let key = |r: Vec<impact_index::search::ScoredDocument>| -> Vec<(DocId, f32)> {
+                r.iter().map(|d| (d.docid, d.score)).collect()
+            };
+            let options = MaxScoreOptions::default();
+            assert_eq!(
+                key(search_maxscore(&**lazy, &query, 10, options.clone())),
+                key(search_maxscore(&**reference, &query, 10, options))
+            );
+        }
+    }
+}

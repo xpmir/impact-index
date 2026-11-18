@@ -344,14 +344,15 @@ struct CachedObject {
 
 /// What [`RangeCache::evict`] removes
 enum CacheKey {
-    Range(String, u64),
+    Range(u64, String, u64),
     Object(u64, usize),
 }
 
 #[derive(Default)]
 struct CacheState {
-    /// File name → start → range
-    files: HashMap<String, BTreeMap<u64, CachedRange>>,
+    /// Owner → file name → start → range: indexes sharing the cache have
+    /// files of the same names
+    files: HashMap<u64, HashMap<String, BTreeMap<u64, CachedRange>>>,
     /// (owner, key) → object
     objects: HashMap<(u64, usize), CachedObject>,
     owners: u64,
@@ -391,13 +392,16 @@ impl RangeCache {
             return;
         }
         let current = state.query;
-        let ranges = state.files.iter().flat_map(|(name, ranges)| {
-            ranges
-                .iter()
-                .filter(|(_, r)| r.query < current)
-                .map(move |(&start, r)| {
-                    (r.query, CacheKey::Range(name.clone(), start), r.data.len())
-                })
+        let ranges = state.files.iter().flat_map(move |(&owner, files)| {
+            files.iter().flat_map(move |(name, ranges)| {
+                ranges
+                    .iter()
+                    .filter(move |(_, r)| r.query < current)
+                    .map(move |(&start, r)| {
+                        let key = CacheKey::Range(owner, name.clone(), start);
+                        (r.query, key, r.data.len())
+                    })
+            })
         });
         let objects = state
             .objects
@@ -411,8 +415,9 @@ impl RangeCache {
                 break;
             }
             match key {
-                CacheKey::Range(name, start) => {
-                    state.files.get_mut(&name).unwrap().remove(&start);
+                CacheKey::Range(owner, name, start) => {
+                    let files = state.files.get_mut(&owner).unwrap();
+                    files.get_mut(&name).unwrap().remove(&start);
                 }
                 CacheKey::Object(owner, key) => {
                     state.objects.remove(&(owner, key));
@@ -422,7 +427,7 @@ impl RangeCache {
         }
     }
 
-    /// A new owner id, for [`Self::get_object`] and [`Self::insert_object`]
+    /// A new owner id, which keys the ranges and objects of an index
     pub fn new_owner(&self) -> u64 {
         let mut state = self.state.lock().unwrap();
         state.owners += 1;
@@ -457,6 +462,21 @@ impl RangeCache {
         }
     }
 
+    /// Drops every cached range and object (those of the current query
+    /// too: they are read again if needed). Iterators keep the data they
+    /// use, which is freed with them.
+    pub fn clear(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.files.clear();
+        state.objects.clear();
+        state.bytes = 0;
+    }
+
+    /// Capacity in bytes
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// Bytes held
     pub fn bytes(&self) -> usize {
         self.state.lock().unwrap().bytes
@@ -467,11 +487,17 @@ impl RangeCache {
         self.state.lock().unwrap().reads
     }
 
-    /// The cached range of `name` containing `start..end`, marked as used
-    fn get(&self, name: &str, start: u64, end: u64) -> Option<(u64, Arc<Vec<u8>>)> {
+    /// The cached range of the file `name` of `owner` containing
+    /// `start..end`, marked as used
+    fn get(&self, owner: u64, name: &str, start: u64, end: u64) -> Option<(u64, Arc<Vec<u8>>)> {
         let mut state = self.state.lock().unwrap();
         let query = state.query;
-        let (&range_start, range) = state.files.get_mut(name)?.range_mut(..=start).next_back()?;
+        let (&range_start, range) = state
+            .files
+            .get_mut(&owner)?
+            .get_mut(name)?
+            .range_mut(..=start)
+            .next_back()?;
         (end <= range.end).then(|| {
             range.query = query;
             (range_start, range.data.clone())
@@ -483,12 +509,17 @@ impl RangeCache {
     /// whole), so that their bytes are not held twice. Ranges that only
     /// overlap the new one are kept: reads are per term or per block, so
     /// ranges are either nested or disjoint.
-    fn insert(&self, name: &str, start: u64, data: Vec<u8>) -> Arc<Vec<u8>> {
+    fn insert(&self, owner: u64, name: &str, start: u64, data: Vec<u8>) -> Arc<Vec<u8>> {
         let data = Arc::new(data);
         let end = start + data.len() as u64;
         let mut state = self.state.lock().unwrap();
         let query = state.query;
-        let ranges = state.files.entry(name.to_string()).or_default();
+        let ranges = state
+            .files
+            .entry(owner)
+            .or_default()
+            .entry(name.to_string())
+            .or_default();
         let contained: Vec<u64> = ranges
             .range(start..end.max(start + 1))
             .filter(|(_, r)| r.end <= end)
@@ -528,11 +559,18 @@ impl RangeCache {
 pub struct ReaderFiles {
     reader: Arc<dyn RangeReader>,
     cache: Arc<RangeCache>,
+    /// Key of these files in the cache, which other indexes may share
+    owner: u64,
 }
 
 impl ReaderFiles {
     pub fn new(reader: Arc<dyn RangeReader>, cache: Arc<RangeCache>) -> Self {
-        Self { reader, cache }
+        let owner = cache.new_owner();
+        Self {
+            reader,
+            cache,
+            owner,
+        }
     }
 
     fn read_whole(&self, name: &str) -> io::Result<Vec<u8>> {
@@ -588,6 +626,7 @@ impl IndexFiles for ReaderFiles {
                 name: name.to_string(),
                 reader: self.reader.clone(),
                 cache: self.cache.clone(),
+                owner: self.owner,
             }))
         } else {
             Ok(Box::new(SharedBuffer::new(Arc::new(
@@ -621,18 +660,22 @@ struct ReaderBuffer {
     name: String,
     reader: Arc<dyn RangeReader>,
     cache: Arc<RangeCache>,
+    owner: u64,
 }
 
 impl ReaderBuffer {
     fn load(&self, start: u64, end: u64) -> io::Result<(u64, Arc<Vec<u8>>)> {
-        if let Some(found) = self.cache.get(&self.name, start, end) {
+        if let Some(found) = self.cache.get(self.owner, &self.name, start, end) {
             return Ok(found);
         }
         let length = (end - start) as usize;
         self.cache.count_read();
         let data = self.reader.read(&self.name, start, length)?;
         check_length(&self.name, start, length, &data)?;
-        Ok((start, self.cache.insert(&self.name, start, data)))
+        Ok((
+            start,
+            self.cache.insert(self.owner, &self.name, start, data),
+        ))
     }
 }
 

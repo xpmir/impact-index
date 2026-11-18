@@ -163,7 +163,30 @@ reads ranges without copying the file; in a web page, an OPFS
 Posting lists are cached, up to ``cacheBytes`` bytes (64 MiB by default,
 least recently used out; the lists of the current query always stay).
 ``index.reads`` and ``index.cacheBytes`` give the number of reads and the
-cache size.
+cache size; ``index.clearCache()`` empties it (e.g. when the application
+goes idle: the WASM memory is not given back, but reused by later
+searches).
+
+Each ``Index.open`` has its own cache by default, so memory grows with the
+number of segments. A ``Cache`` bounds them together:
+
+.. code-block:: javascript
+
+    import { Cache, Index, SegmentedIndex } from "impact-index";
+
+    const cache = new Cache(32 << 20); // bytes (64 MiB by default)
+    const segments = new SegmentedIndex();
+    for (const reader of readers) {
+        segments.push(Index.open(reader, { cache }));
+    }
+    segments.search(terms, weights, 10);
+    console.log(cache.bytes, cache.reads); // all the segments together
+    cache.clear(); // or segments.clearCache()
+
+``cache`` and ``cacheBytes`` cannot be given together. Between searches, a
+cache holds at most its capacity, or the data of the last search if larger
+(the posting lists of the current search always stay); ``index.cacheBytes``
+and ``index.reads`` of an index then report the whole shared cache.
 
 Each search first reads the lists it needs, so a read error (e.g. a deleted
 file) is thrown by ``search``, and the index can be searched again once the
@@ -203,6 +226,11 @@ segments as one.
     // hits.segments, hits.docids, hits.scores
 
     segments.setDeleted(1, DocSet.fromDocids(new Uint32Array([5])));
+
+``push`` and ``setDeleted`` copy the ``DocSet`` (later changes to it do not
+apply until the next ``setDeleted``), and ``Index.search(terms, weights, k,
+deleted)`` only reads it: the same set can be reused, e.g. a collection
+filter turned into deletions, query after query.
 
 Document ids and keys
 ---------------------
