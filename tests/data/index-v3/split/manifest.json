@@ -1,0 +1,12 @@
+{
+  "format_version": 3,
+  "index_kind": "split",
+  "created": "2026-11-18T09:34:46Z",
+  "builder": {
+    "library_version": "1.7.1",
+    "codecs": "quantiles=[0.78125, 0.984375]"
+  },
+  "features": [
+    "split-value-range"
+  ]
+}

@@ -2,7 +2,8 @@ default_install_hook_types:
   - pre-commit
   - commit-msg
 
-exclude: ^BMP/
+# fixtures are byte-exact files written by older releases: never rewrite them
+exclude: ^(BMP/|tests/data/)
 
 repos:
 - repo: https://github.com/pre-commit/pre-commit-hooks
