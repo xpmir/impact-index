@@ -53,6 +53,11 @@ jobs:
           fi
           echo "Version $version matches tag $GITHUB_REF_NAME"
       - run: rustup toolchain install nightly-2026-09-20 --profile minimal --target wasm32-unknown-unknown
+      # Reuses the build cache of the wasm job of test.yml (saved on master)
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm
+          save-if: false
       # No registry-url: setup-node would then set a placeholder
       # NODE_AUTH_TOKEN, which breaks OIDC publishing
       - uses: actions/setup-node@v5
@@ -60,8 +65,10 @@ jobs:
           node-version: '24'
       - name: npm >= 11.15.0 (staged publishing)
         run: npm install -g 'npm@^11.15.0' && npm --version
-      - name: Install wasm-pack
-        run: cargo install wasm-pack --locked --version 0.15.1
+      - name: Install wasm-pack (prebuilt)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.15.1
       - name: Build the package
         run: wasm/build-npm.sh "$GITHUB_WORKSPACE/wasm/pkg"
       - name: Check the npm version matches the tag
