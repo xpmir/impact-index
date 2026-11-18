@@ -131,6 +131,8 @@ pub fn download_dictionary(dictionary: MorphDictionary) -> std::io::Result<PathB
     let zip_path = tmp.join("dictionary.zip");
     {
         let mut file = std::fs::File::create(&zip_path)?;
+        // From a network stream, not a file: no copy_file_range
+        #[allow(clippy::disallowed_methods)]
         std::io::copy(&mut response.into_reader(), &mut file)?;
     }
     let mut archive = zip::ZipArchive::new(std::fs::File::open(&zip_path)?)

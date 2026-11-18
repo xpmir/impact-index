@@ -12,7 +12,7 @@
 //! When bumping `icu_segmenter`, bump [`ICU4X_VERSION`] and [`SHA256`]
 //! together (the digest is shown on the release page).
 
-use std::io::{Error, ErrorKind};
+use std::io::{Error, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -77,7 +77,7 @@ pub fn download_data() -> std::io::Result<PathBuf> {
         .call()
         .map_err(|e| Error::other(format!("cannot download {}: {}", url, e)))?;
     let mut bytes = Vec::new();
-    std::io::copy(&mut response.into_reader(), &mut bytes)?;
+    response.into_reader().read_to_end(&mut bytes)?;
     let digest = sha256_hex(&bytes);
     if digest != SHA256 {
         return Err(Error::new(

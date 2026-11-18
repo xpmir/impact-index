@@ -1,0 +1,8 @@
+# File copies must go through src/utils/fs.rs (copy_file, link_or_copy,
+# copy_dir_all), which follow the global CopyMode: on Linux, std::fs::copy
+# and std::io::copy between files use copy_file_range, which NFS v4.2 turns
+# into a server-side COPY that can hang forever in nfs42_proc_copy.
+disallowed-methods = [
+    { path = "std::fs::copy", reason = "use crate::utils::fs::copy_file (NFS server-side copy can hang)" },
+    { path = "std::io::copy", reason = "file-to-file copies must use crate::utils::fs::copy_file (NFS server-side copy can hang); allow it explicitly for non-file streams" },
+]

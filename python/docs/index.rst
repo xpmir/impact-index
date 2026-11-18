@@ -84,3 +84,4 @@ Each page ends with the API reference of the classes it covers.
    incremental
    docstore
    versioning
+   filesystems

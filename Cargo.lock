@@ -1567,6 +1567,7 @@ dependencies = [
  "icu_segmenter",
  "indicatif 0.15.0",
  "intertrait",
+ "libc",
  "lindera",
  "log",
  "memmap2 0.5.8",

@@ -225,6 +225,15 @@ impact_index.Index.update("/path/to/index", "/dest")   # or to a copy
 Indices without a manifest (built before versioning existed) load
 normally and are stamped on first load.
 
+## Network Filesystems (NFS)
+
+Compressing, reordering or migrating an index copies files. On Linux, the
+native copy turns into a server-side copy on NFS v4.2, which some servers
+never complete (the process hangs in `nfs42_proc_copy`). By default
+(`auto`), impact-index copies through a user-space buffer on network
+filesystems; force a mode with `impact_index.set_copy_mode("buffered")` (or
+`"native"`, `"auto"`), or with `IMPACT_INDEX_COPY_MODE=buffered`.
+
 ## Neural IR (Impact Scores)
 
 ```python

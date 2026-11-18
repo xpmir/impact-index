@@ -3440,6 +3440,37 @@ fn impact_index(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyTextAnalyzer>()?;
 
     // Functions
+    /// Sets how index files are copied (e.g. by ``compress``, ``reorder`` or
+    /// index migrations), for the whole process.
+    ///
+    /// Args:
+    ///     mode: ``"auto"`` (default: copies through a user-space buffer when
+    ///         the source or destination is on a network filesystem such as
+    ///         NFS, Linux only; native copy otherwise), ``"buffered"``
+    ///         (always a user-space copy) or ``"native"`` (always the OS
+    ///         copy, i.e. ``copy_file_range`` on Linux).
+    ///
+    /// The native copy on NFS v4.2 asks the server to copy, which some
+    /// servers never complete (the process hangs in ``nfs42_proc_copy``).
+    /// Without a call, the mode comes from ``$IMPACT_INDEX_COPY_MODE``.
+    #[pyfn(module)]
+    #[pyo3(name = "set_copy_mode")]
+    fn py_set_copy_mode(mode: &str) -> PyResult<()> {
+        let mode = mode
+            .parse::<crate::CopyMode>()
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        crate::set_copy_mode(mode);
+        Ok(())
+    }
+
+    /// Returns the current file copy mode (``"auto"``, ``"buffered"`` or
+    /// ``"native"``), see :func:`set_copy_mode`.
+    #[pyfn(module)]
+    #[pyo3(name = "copy_mode")]
+    fn py_copy_mode() -> &'static str {
+        crate::copy_mode().name()
+    }
+
     /// Get the built-in stop word list for a language and family.
     ///
     /// Args:
