@@ -108,7 +108,12 @@ rayon = "1"
 bitpacking = "0.9"
 rust-stemmers = "1.2"
 unicode-segmentation = "1.12"
-icu_segmenter = "2"
+# Word segmentation; the dictionaries (~3 MB) are not built in but loaded
+# from the official ICU4X data blob, downloaded on demand (src/vocab/icu.rs)
+icu_segmenter = { version = "~2.4", default-features = false, features = ["compiled_data", "serde"] }
+icu_provider = { version = "2", features = ["sync"] }
+icu_provider_blob = { version = "2", features = ["alloc"] }
+sha2 = "0.10"
 # Japanese / Korean morphological analysis (dictionaries loaded at runtime)
 lindera = { version = "6.2", default-features = false }
 # Downloading the Lindera dictionaries (into the OS cache directory)

@@ -133,7 +133,16 @@ def test_pyserini_unported_language(tmp_path):
 
 def test_prepare_analyzer_without_resources():
     assert impact_index.prepare_analyzer("fr", pipeline="pyserini") == []
-    assert impact_index.prepare_analyzer("ja") == []
+    assert impact_index.prepare_analyzer("de") == []
+
+
+def test_prepare_analyzer_icu_data():
+    # Languages written without spaces use the ICU tokenizer, whose data is
+    # downloaded on demand (as for the Lucene Thai analyzer)
+    (path,) = impact_index.prepare_analyzer("ja")
+    assert path.endswith("full.postcard")
+    assert impact_index.prepare_analyzer("th", pipeline="pyserini") == [path]
+    assert impact_index.download_dictionary("icu") == path
 
 
 needs_dictionaries = pytest.mark.skipif(

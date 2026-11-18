@@ -13,7 +13,9 @@ Features
 
 - **BM25 bag-of-words indexing** with built-in tokenization, stemming
   (Snowball, Porter) and stop words: Lucene-family lists (23 languages) or
-  Terrier's own, much longer list (English only)
+  Terrier's own, much longer list (English only); dictionary-based word
+  segmentation (ICU4X) for Chinese, Japanese, Thai, Lao, Khmer and Burmese,
+  with its data downloaded on demand
 - **Block-Max MaxScore and BMW WAND** search with early termination
 - **Structured queries**: Terrier-style ``#combine``/``#syn``/``#band``/``#1``
   (phrase)/``#uwN`` (window) operators, evaluated by WAND/MaxScore

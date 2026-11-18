@@ -232,7 +232,13 @@ none).
 ``"icu"`` follows UAX#29 too, but segments scripts written without spaces
 (Chinese, Japanese, Thai, Lao, Khmer, Burmese) into dictionary words with
 ICU4X's word segmenter, like Lucene's ICU-based tokenizers --
-``"standard"`` would produce one token per character for them.
+``"standard"`` would produce one token per character for them. Its
+dictionaries are not built into the package: the official ICU4X data file
+(``full.postcard`` of the `ICU4X release
+<https://github.com/unicode-org/icu4x/releases>`_ matching the bundled
+``icu_segmenter``, ~8 MB, checked against its SHA-256) is downloaded into the
+cache directory the first time the tokenizer is used (see
+:ref:`below <dictionaries>`).
 
 When ``tokenizer`` is not given, it is selected via ``pipeline=`` for
 English (``"lucene-english"`` without a pipeline, for backward
@@ -267,19 +273,26 @@ uses ICU4X's dictionary instead of the JDK's (~80%). Lucene analyzers that
 Anserini uses but that are not ported (da, hu, it, nl, no, pl, pt, sv, tr,
 uk) raise an error.
 
-Japanese and Korean need a morphological dictionary, downloaded into
-``$IMPACT_INDEX_CACHE`` or the OS cache directory (``~/.cache/impact-index``
-on Linux) when first needed. To download beforehand (e.g. for nodes without
-network access sharing that directory):
+.. _dictionaries:
+
+Japanese and Korean need a morphological dictionary, and the ``"icu"``
+tokenizer and the Thai analyzer need the ICU4X segmentation data; they are
+downloaded into ``$IMPACT_INDEX_CACHE`` or the OS cache directory
+(``~/.cache/impact-index`` on Linux) when first needed. To download
+beforehand (e.g. for nodes without network access sharing that directory):
 
 .. code-block:: python
 
     impact_index.prepare_analyzer("ja", pipeline="pyserini")  # -> [path]
+    impact_index.prepare_analyzer("zh")  # -> [path] (ICU4X data)
     impact_index.download_dictionary("ko-dic")  # -> path
+    impact_index.download_dictionary("icu")  # -> path
 
-The dictionary path can also be given with ``dictionary=``, or set with
-``impact_index.set_dictionary_path(name, path)`` (e.g. to load an index built
-on another machine).
+The morphological dictionary path can also be given with ``dictionary=``,
+and any of them can be set with ``impact_index.set_dictionary_path(name,
+path)`` (``name`` is ``"icu"``, ``"ipadic"`` or ``"ko-dic"``; e.g. to load an
+index built on another machine, or to use a copied ICU4X file without
+network access).
 
 Without a pipeline, ``stemmer="snowball"`` covers ar, da, de, el, en, es,
 fi, fr, hu, it, nl, no, pt, ro, ru, sv, ta, tr; ``stemmer="none"`` gives text

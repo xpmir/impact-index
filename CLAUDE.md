@@ -45,6 +45,12 @@ When bumping the pinned `seismic` rev, also bump `SEISMIC_FORMAT` in
 When bumping the nightly, update `rust-toolchain.toml` and the
 `rust-toolchain`/`rustup` lines in `.github/workflows/*.yml` together.
 
+### ICU4X segmentation data
+The dictionaries of the `icu` tokenizer / Thai analyzer are not built in
+(they would add ~3 MB): `src/vocab/icu.rs` downloads the official ICU4X
+`full.postcard` release asset on demand. When bumping `icu_segmenter`, bump
+`ICU4X_VERSION` and `SHA256` there together (digest on the release page).
+
 ### Python Bindings (BMP)
 ```bash
 # Build and install (from BMP/python directory)

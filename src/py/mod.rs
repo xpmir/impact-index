@@ -2999,7 +2999,7 @@ impl PyBOWIndexBuilder {
         let make_analyzer = |stemmer_name: &str,
                              stemmer_box: Box<dyn crate::vocab::stemmer::Stemmer>,
                              tokenizer: crate::vocab::analyzer::Tokenizer|
-         -> TextAnalyzer {
+         -> PyResult<TextAnalyzer> {
             let mut a = if stop_word_refs.is_empty() {
                 TextAnalyzer::new(stemmer_box)
             } else {
@@ -3007,7 +3007,8 @@ impl PyBOWIndexBuilder {
             };
             a.set_stop_words_filter_mode(filter_mode);
             a.set_query_stop_words(&query_stop_word_refs);
-            a.set_tokenizer(tokenizer);
+            a.set_tokenizer(tokenizer)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
             // Store config for later retrieval. `stop_words_list` preserves
             // the *exact* list used here (not just whether one was given) so
             // `PyTextAnalyzer::from_index` can reconstruct the real custom
@@ -3027,7 +3028,7 @@ impl PyBOWIndexBuilder {
                 position_gaps,
                 dictionary: None,
             });
-            a
+            Ok(a)
         };
 
         let is_english = lang == "english";
@@ -3055,20 +3056,20 @@ impl PyBOWIndexBuilder {
                     "snowball",
                     Box::new(s),
                     pipeline_tokenizer(is_english),
-                ))
+                )?)
             }
             Some("porter") => Some(make_analyzer(
                 "porter",
                 Box::new(PorterStemmer::new()),
                 pipeline_tokenizer(true),
-            )),
+            )?),
             // An analyzer without stemming, for languages without a
             // stemmer
             Some("none") => Some(make_analyzer(
                 "none",
                 Box::new(crate::vocab::stemmer::NoStemmer),
                 pipeline_tokenizer(is_english),
-            )),
+            )?),
             // No analyzer at all (terms are added with `add`)
             None => None,
             Some(other) => {
@@ -3374,7 +3375,9 @@ impl PyTextAnalyzer {
         let tokenizer = config.effective_tokenizer();
         let query_stop_words = config.query_stop_words_list.clone();
         analyzer.set_config(config);
-        analyzer.set_tokenizer(tokenizer);
+        analyzer
+            .set_tokenizer(tokenizer)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         analyzer.set_stop_words_filter_mode(filter_mode);
         let query_stop_word_refs: Vec<&str> = query_stop_words.iter().map(|s| s.as_str()).collect();
         analyzer.set_query_stop_words(&query_stop_word_refs);
@@ -3463,69 +3466,104 @@ fn impact_index(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()> {
             })
     }
 
-    /// Downloads (if not already there) a morphological dictionary used by
-    /// the Japanese ("ipadic") and Korean ("ko-dic") Lucene analyzers, and
-    /// returns its path. Dictionaries are stored in ``$IMPACT_INDEX_CACHE``
-    /// or the OS cache directory (``~/.cache/impact-index`` on Linux).
+    /// Downloads (if not already there) a dictionary, and returns its path:
+    /// ``"icu"`` (the ICU4X data used by the ``"icu"`` tokenizer and the
+    /// Lucene Thai analyzer), or a morphological dictionary used by the
+    /// Japanese (``"ipadic"``) and Korean (``"ko-dic"``) Lucene analyzers.
+    /// Dictionaries are stored in ``$IMPACT_INDEX_CACHE`` or the OS cache
+    /// directory (``~/.cache/impact-index`` on Linux).
     #[pyfn(module)]
     #[pyo3(name = "download_dictionary")]
     fn py_download_dictionary(name: &str) -> PyResult<String> {
-        let dict = parse_dictionary(name)?;
-        crate::vocab::lucene::morph::download_dictionary(dict)
-            .map(|p| p.to_string_lossy().to_string())
+        let path = match parse_dictionary(name)? {
+            Dictionary::Icu => crate::vocab::icu::download_data(),
+            Dictionary::Morph(dict) => crate::vocab::lucene::morph::download_dictionary(dict),
+        };
+        path.map(|p| p.to_string_lossy().to_string())
             .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
     }
 
     /// Downloads the resources needed to analyze text in ``language`` with
     /// ``pipeline`` (so that indexing can then run without network access,
     /// e.g. on cluster nodes sharing the cache directory), and returns their
-    /// paths. Only the Japanese and Korean Lucene analyzers
-    /// (``pipeline="pyserini"``) need resources (dictionaries) for now.
+    /// paths. Resources are dictionaries: the ICU4X data for languages
+    /// written without spaces (Chinese, Japanese, Thai, Lao, Khmer, Burmese)
+    /// without pipeline, or for Thai with ``pipeline="pyserini"``; the
+    /// morphological dictionaries of the Japanese and Korean Lucene
+    /// analyzers (``pipeline="pyserini"``).
     #[pyfn(module)]
     #[pyo3(name = "prepare_analyzer")]
     #[pyo3(signature = (language, pipeline=None))]
     fn py_prepare_analyzer(language: &str, pipeline: Option<&str>) -> PyResult<Vec<String>> {
+        use crate::vocab::analyzer::Tokenizer;
         use crate::vocab::lucene::LuceneLanguage;
+        let io_err = |e: std::io::Error| pyo3::exceptions::PyIOError::new_err(e.to_string());
+        let path = |p: PathBuf| p.to_string_lossy().to_string();
         if !pipeline.is_some_and(|p| p.eq_ignore_ascii_case("pyserini")) {
-            return Ok(Vec::new());
+            return if Tokenizer::default_for_language(language) == Tokenizer::Icu {
+                Ok(vec![path(
+                    crate::vocab::icu::download_data().map_err(io_err)?,
+                )])
+            } else {
+                Ok(Vec::new())
+            };
         }
         let Some(lucene) =
             LuceneLanguage::resolve(language).map_err(pyo3::exceptions::PyValueError::new_err)?
         else {
             return Ok(Vec::new());
         };
-        lucene
-            .dictionary()
-            .map(|dict| {
-                crate::vocab::lucene::morph::download_dictionary(dict)
-                    .map(|p| p.to_string_lossy().to_string())
-                    .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
-            })
-            .into_iter()
-            .collect()
+        let mut paths = Vec::new();
+        if lucene == LuceneLanguage::Thai {
+            paths.push(path(crate::vocab::icu::download_data().map_err(io_err)?));
+        }
+        if let Some(dict) = lucene.dictionary() {
+            paths.push(path(
+                crate::vocab::lucene::morph::download_dictionary(dict).map_err(io_err)?,
+            ));
+        }
+        Ok(paths)
     }
 
-    /// Sets the directory of a morphological dictionary ("ipadic" or
-    /// "ko-dic"), overriding the one recorded in indices (e.g. for an index
-    /// built on another machine).
+    /// Sets the path of a dictionary instead of the cache: the ICU4X data
+    /// file (``"icu"``, to be called before any ICU tokenization), or the
+    /// directory of a morphological dictionary (``"ipadic"`` or
+    /// ``"ko-dic"``), overriding the one recorded in indices (e.g. for an
+    /// index built on another machine).
     #[pyfn(module)]
     #[pyo3(name = "set_dictionary_path")]
     fn py_set_dictionary_path(name: &str, path: &str) -> PyResult<()> {
-        let dict = parse_dictionary(name)?;
-        crate::vocab::lucene::morph::set_dictionary_path(dict, PathBuf::from(path));
+        match parse_dictionary(name)? {
+            Dictionary::Icu => crate::vocab::icu::set_data_path(PathBuf::from(path)),
+            Dictionary::Morph(dict) => {
+                crate::vocab::lucene::morph::set_dictionary_path(dict, PathBuf::from(path))
+            }
+        }
         Ok(())
     }
 
     Ok(())
 }
 
-fn parse_dictionary(name: &str) -> PyResult<crate::vocab::lucene::morph::MorphDictionary> {
-    crate::vocab::lucene::morph::MorphDictionary::from_name(name).ok_or_else(|| {
-        pyo3::exceptions::PyValueError::new_err(format!(
-            "Unknown dictionary '{}', expected 'ipadic' or 'ko-dic'",
-            name
-        ))
-    })
+/// Dictionaries that can be downloaded / located from Python
+enum Dictionary {
+    /// ICU4X segmentation data (see [`crate::vocab::icu`])
+    Icu,
+    Morph(crate::vocab::lucene::morph::MorphDictionary),
+}
+
+fn parse_dictionary(name: &str) -> PyResult<Dictionary> {
+    if name.eq_ignore_ascii_case("icu") {
+        return Ok(Dictionary::Icu);
+    }
+    crate::vocab::lucene::morph::MorphDictionary::from_name(name)
+        .map(Dictionary::Morph)
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "Unknown dictionary '{}', expected 'icu', 'ipadic' or 'ko-dic'",
+                name
+            ))
+        })
 }
 
 #[cfg(feature = "stub-gen")]

@@ -306,11 +306,10 @@ fn whitespace_tokens(text: &str) -> Vec<String> {
 /// `ThaiTokenizer`: dictionary-based word segmentation (ICU4X's Thai
 /// dictionary here, the JDK's in Lucene -- so segmentation may differ),
 /// keeping words that start with a letter or digit
-fn thai_tokens(text: &str) -> Vec<String> {
-    use icu_segmenter::{options::WordBreakInvariantOptions, WordSegmenter};
-    // The dictionary model is the closest to the JDK's (the LSTM one is
-    // further off on MIRACL Thai)
-    let segmenter = WordSegmenter::new_dictionary(WordBreakInvariantOptions::default());
+///
+/// The dictionary model is the closest to the JDK's (the LSTM one is further
+/// off on MIRACL Thai)
+fn thai_tokens(segmenter: icu_segmenter::WordSegmenterBorrowed<'_>, text: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut last = 0;
     for boundary in segmenter.segment_str(text) {
@@ -439,20 +438,32 @@ fn cjk_bigrams(tokens: Vec<Option<Tok>>) -> Vec<String> {
 pub struct LuceneChain {
     language: LuceneLanguage,
     morphology: Option<Arc<Morphology>>,
+    /// Thai word segmenter (see [`crate::vocab::icu`])
+    thai: Option<icu_segmenter::WordSegmenterBorrowed<'static>>,
 }
 
 impl LuceneChain {
-    /// `morphology` must be given for Japanese and Korean
-    pub fn new(language: LuceneLanguage, morphology: Option<Arc<Morphology>>) -> Self {
+    /// `morphology` must be given for Japanese and Korean; Thai loads the
+    /// ICU4X segmentation data (downloading it if needed, see
+    /// [`crate::vocab::icu::word_segmenter`]), hence the error
+    pub fn new(
+        language: LuceneLanguage,
+        morphology: Option<Arc<Morphology>>,
+    ) -> std::io::Result<Self> {
         assert!(
             language.dictionary().is_none() || morphology.is_some(),
             "a morphological dictionary is required for {:?}",
             language
         );
-        Self {
+        let thai = match language {
+            LuceneLanguage::Thai => Some(crate::vocab::icu::word_segmenter()?),
+            _ => None,
+        };
+        Ok(Self {
             language,
             morphology,
-        }
+            thai,
+        })
     }
 
     pub fn language(&self) -> LuceneLanguage {
@@ -498,7 +509,7 @@ impl LuceneChain {
                 Some(Morphology::load(dict, &path)?)
             }
         };
-        Ok(Self::new(language, morphology))
+        Self::new(language, morphology)
     }
 
     /// Path of the loaded morphological dictionary, if any
@@ -544,7 +555,7 @@ impl LuceneChain {
             }),
             German | Spanish | Finnish | Indonesian | Russian => standard(&lowercase),
             French => standard(&|t| lowercase(&french_elision(t))),
-            Thai => thai_tokens(text)
+            Thai => thai_tokens(self.thai.expect("Thai without its segmenter"), text)
                 .iter()
                 .map(|t| util::decimal_digits(&lowercase(t)))
                 .collect(),
@@ -637,6 +648,7 @@ mod tests {
     fn analyze(lang: LuceneLanguage, text: &str) -> Vec<String> {
         let stemmer = LuceneStemmer::new(lang);
         LuceneChain::new(lang, None)
+            .unwrap()
             .tokens(text)
             .iter()
             .filter(|t| !t.is_empty())
