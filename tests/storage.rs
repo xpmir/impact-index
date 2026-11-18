@@ -467,3 +467,114 @@ fn test_memory_indexer_spill() {
         }
     }
 }
+
+/// A [`RangeReader`] over files in memory, counting reads, failing on demand
+struct TestReader {
+    files: MemoryFiles,
+    reads: std::sync::atomic::AtomicUsize,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl impact_index::storage::RangeReader for TestReader {
+    fn size(&self, name: &str) -> std::io::Result<Option<u64>> {
+        Ok(self.files.get_bytes(name).map(|b| b.len() as u64))
+    }
+
+    fn read(&self, name: &str, offset: u64, length: usize) -> std::io::Result<Vec<u8>> {
+        use std::sync::atomic::Ordering;
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(std::io::Error::other("file deleted"));
+        }
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        let bytes = self.files.get_bytes(name).unwrap();
+        Ok(bytes[offset as usize..offset as usize + length].to_vec())
+    }
+}
+
+fn check_lazy_index(files: MemoryFiles) {
+    use impact_index::storage::{RangeCache, ReaderFiles};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    let reference = load_index_from_files(&files, true).unwrap();
+    let reader = Arc::new(TestReader {
+        files,
+        reads: Default::default(),
+        fail: Default::default(),
+    });
+    let capacity = 4000;
+    let cache = Arc::new(RangeCache::new(capacity));
+    let lazy =
+        load_index_from_files(&ReaderFiles::new(reader.clone(), cache.clone()), true).unwrap();
+
+    let mut rng = Rng(17);
+    for _ in 0..200 {
+        let terms: Vec<TermIndex> = (0..4)
+            .map(|_| rng.below(reference.len() as u64) as TermIndex)
+            .collect();
+        let query: HashMap<TermIndex, ImpactValue> = terms.iter().map(|&t| (t, 1.)).collect();
+        cache.start_query();
+        lazy.prefetch(&terms).unwrap();
+        cache.evict();
+        let reads = reader.reads.load(Ordering::SeqCst);
+        let expected = search_maxscore(&*reference, &query, 10, MaxScoreOptions::default());
+        let got = search_maxscore(&*lazy, &query, 10, MaxScoreOptions::default());
+        // Nothing read during the search
+        assert_eq!(reader.reads.load(Ordering::SeqCst), reads);
+        let key = |r: &[impact_index::search::ScoredDocument]| -> Vec<(DocId, f32)> {
+            r.iter().map(|d| (d.docid, d.score)).collect()
+        };
+        assert_eq!(key(&got), key(&expected));
+    }
+    // Bounded cache, and repeated queries hit it
+    assert!(
+        cache.bytes() <= capacity + 4 * 2 * 2000,
+        "{}",
+        cache.bytes()
+    );
+    let terms = [0, 1];
+    cache.start_query();
+    lazy.prefetch(&terms).unwrap();
+    cache.evict();
+    let reads = reader.reads.load(Ordering::SeqCst);
+    for _ in 0..2 {
+        cache.start_query();
+        lazy.prefetch(&terms).unwrap();
+        cache.evict();
+    }
+    assert_eq!(reader.reads.load(Ordering::SeqCst), reads);
+
+    // A failing reader: an error from prefetch, and the index still works
+    // once the reader is back
+    reader.fail.store(true, Ordering::SeqCst);
+    let all: Vec<TermIndex> = (0..reference.len()).collect();
+    cache.start_query();
+    assert!(lazy.prefetch(&all).is_err());
+    reader.fail.store(false, Ordering::SeqCst);
+    cache.start_query();
+    lazy.prefetch(&all).unwrap();
+    assert_same(&*reference, &*lazy);
+}
+
+#[test]
+fn test_lazy_compressed_index() {
+    let mut data = test_index();
+    let index = data.indexer.to_index(true);
+    let out = TempDir::new().unwrap();
+    compression().process(out.path(), &index).unwrap();
+    check_lazy_index(read_dir(out.path()));
+}
+
+#[test]
+fn test_lazy_split_index() {
+    let mut data = test_index();
+    let index = data.indexer.to_index(true);
+    let out = TempDir::new().unwrap();
+    SplitIndexTransform {
+        sink: Box::new(compression()),
+        quantiles: vec![0.5, 0.9],
+    }
+    .process(out.path(), &index)
+    .unwrap();
+    check_lazy_index(read_dir(out.path()));
+}

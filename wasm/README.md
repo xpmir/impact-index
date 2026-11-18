@@ -25,6 +25,7 @@ const files = builder.finish(); // Map: file name -> Uint8Array
 
 // Load (from a Map or a plain object) and search
 const index = Index.load(files);
+// or read posting lists lazily: Index.open({ size(name), read(name, offset, length) })
 const { docids, scores } = index.search(
     new Uint32Array([12, 40]), new Float32Array([1.2, 0.4]), 10);
 ```

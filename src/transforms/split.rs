@@ -327,6 +327,14 @@ impl<'a> BlockTermImpactIterator for SplitIndexTermIterator<'a> {
 }
 
 impl SparseIndex for SplitIndex {
+    fn prefetch(&self, terms: &[crate::base::TermIndex]) -> std::io::Result<()> {
+        let inner_terms: Vec<_> = terms
+            .iter()
+            .flat_map(|&t| (0..self.splits).map(move |j| t * self.splits + j))
+            .collect();
+        self.inner.prefetch(&inner_terms)
+    }
+
     fn reorder_map(&self) -> Option<&Vec<DocId>> {
         self.inner.reorder_map()
     }

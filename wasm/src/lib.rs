@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use impact_index::base::{load_index_from_files, ImpactValue, TermIndex};
 use impact_index::builder::MemoryIndexer;
@@ -32,13 +33,13 @@ use impact_index::index::{SparseIndex, SparseIndexView};
 use impact_index::search::filter::{DocBitSet, Exclude};
 use impact_index::search::maxscore::{search_maxscore_filtered, MaxScoreOptions};
 use impact_index::search::segments::{segment_size, Segment, SegmentedSearch};
-use impact_index::storage::{MemoryFiles, MemoryOutput};
+use impact_index::storage::{MemoryFiles, MemoryOutput, RangeCache, ReaderFiles};
 use js_sys::{Array, Map, Object, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 mod io;
-use io::{JsOutput, JsSpillReader, JsSpillWriter};
+use io::{JsOutput, JsRangeReader, JsSpillReader, JsSpillWriter};
 
 #[cfg(target_family = "wasm")]
 extern "C" {
@@ -246,6 +247,24 @@ impl SearchResults {
 #[wasm_bindgen]
 pub struct Index {
     inner: Rc<dyn SparseIndex>,
+    /// Cache of an index read lazily (`Index.open`)
+    cache: Option<Arc<RangeCache>>,
+}
+
+/// Reads the postings of `terms` ahead of a search, for an index read
+/// lazily: read errors surface here, as exceptions
+fn prefetch(
+    index: &dyn SparseIndex,
+    cache: &Option<Arc<RangeCache>>,
+    terms: &HashMap<TermIndex, ImpactValue>,
+) -> Result<(), JsError> {
+    if let Some(cache) = cache {
+        let terms: Vec<TermIndex> = terms.keys().copied().collect();
+        cache.start_query();
+        index.prefetch(&terms).map_err(js_error)?;
+        cache.evict();
+    }
+    Ok(())
 }
 
 #[wasm_bindgen]
@@ -258,7 +277,47 @@ impl Index {
         let index = load_index_from_files(&files, true).map_err(js_error)?;
         Ok(Index {
             inner: Rc::from(index),
+            cache: None,
         })
+    }
+
+    /// Opens an index read lazily through `reader = {size(name),
+    /// read(name, offset, length)}`, both synchronous: `size` returns the
+    /// size of a file (`undefined` if it does not exist), `read` exactly
+    /// `length` bytes of it at `offset`, as a `Uint8Array`. File names are
+    /// relative to the index directory, as for `load`. Only the metadata is
+    /// read here; each search reads the posting lists of its terms, kept in
+    /// a cache of `cacheBytes` bytes (64 MiB; least recently used out).
+    pub fn open(
+        #[wasm_bindgen(
+            unchecked_param_type = "{size(name: string): number | undefined, read(name: string, offset: number, length: number): Uint8Array}"
+        )]
+        reader: JsValue,
+        #[wasm_bindgen(unchecked_param_type = "{cacheBytes?: number}")] options: JsValue,
+    ) -> Result<Index, JsError> {
+        let capacity = number_option(&options, "cacheBytes")?.unwrap_or((64 << 20) as f64);
+        if capacity.is_nan() || capacity < 0. {
+            return Err(JsError::new("cacheBytes must be a number of bytes"));
+        }
+        let cache = Arc::new(RangeCache::new(capacity as usize));
+        let files = ReaderFiles::new(Arc::new(JsRangeReader::new(&reader)?), cache.clone());
+        let index = load_index_from_files(&files, true).map_err(js_error)?;
+        Ok(Index {
+            inner: Rc::from(index),
+            cache: Some(cache),
+        })
+    }
+
+    /// Bytes of postings in the cache (`Index.open`)
+    #[wasm_bindgen(getter, js_name = cacheBytes)]
+    pub fn cache_bytes(&self) -> Option<f64> {
+        self.cache.as_ref().map(|c| c.bytes() as f64)
+    }
+
+    /// Number of posting reads so far (`Index.open`)
+    #[wasm_bindgen(getter)]
+    pub fn reads(&self) -> Option<f64> {
+        self.cache.as_ref().map(|c| c.reads() as f64)
     }
 
     /// Number of terms
@@ -282,6 +341,7 @@ impl Index {
         deleted: Option<DocSet>,
     ) -> Result<SearchResults, JsError> {
         let query = query(terms, weights)?;
+        prefetch(&*self.inner, &self.cache, &query)?;
         let deleted = deleted.map(|d| d.inner);
         let results = search_maxscore_filtered(
             &*self.inner,
@@ -308,6 +368,7 @@ impl Index {
 #[derive(Default)]
 pub struct SegmentedIndex {
     indexes: Vec<Rc<dyn SparseIndex>>,
+    caches: Vec<Option<Arc<RangeCache>>>,
     deleted: Vec<Option<DocBitSet>>,
     sizes: Vec<usize>,
 }
@@ -322,6 +383,7 @@ impl SegmentedIndex {
     /// Adds a segment, returns its position
     pub fn push(&mut self, index: &Index, deleted: Option<DocSet>) -> usize {
         self.indexes.push(index.inner.clone());
+        self.caches.push(index.cache.clone());
         self.deleted.push(deleted.map(|d| d.inner));
         self.sizes.push(segment_size(&*index.inner));
         self.indexes.len() - 1
@@ -351,6 +413,9 @@ impl SegmentedIndex {
         k: usize,
     ) -> Result<SearchResults, JsError> {
         let query = query(terms, weights)?;
+        for (index, cache) in self.indexes.iter().zip(&self.caches) {
+            prefetch(&**index, cache, &query)?;
+        }
         let segments = self
             .indexes
             .iter()

@@ -6,7 +6,7 @@
 //       target/wasm32-unknown-unknown/release/impact_index_wasm.wasm
 //   node wasm/tests/check.mjs <pkg-dir> <fixture-dir>
 
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { openSync, readFileSync, readSync, readdirSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { createRequire } from "node:module";
 
@@ -91,6 +91,72 @@ timed("search 2 segments + tombstones", queries, ([t, w]) => segmented.search(t,
     fixture.expected.segmented[i],
   ),
 );
+
+// Lazy indexes (Index.open): posting lists read from the files at search
+// time, through a synchronous ranged reader
+function fileReader(dir) {
+  const fds = new Map();
+  const reader = {
+    fail: false,
+    size(name) {
+      try { return statSync(join(dir, name)).size; } catch { return undefined; }
+    },
+    read(name, offset, length) {
+      if (reader.fail) throw new Error("file deleted");
+      if (!fds.has(name)) fds.set(name, openSync(join(dir, name), "r"));
+      const bytes = new Uint8Array(length);
+      readSync(fds.get(name), bytes, 0, length, offset);
+      return bytes;
+    },
+  };
+  return reader;
+}
+{
+  const before = memoryBytes();
+  const reader = fileReader(join(fixtureDir, "compressed"));
+  const lazy = Index.open(reader, { cacheBytes: 1 << 20 });
+  const loaded = memoryBytes() - before;
+  timed("search compressed, lazy", queries, ([t, w]) => lazy.search(t, w, k)).forEach((r, i) =>
+    compare(`lazy compressed #${i}`, Array.from(r.docids, (d, j) => [d, r.scores[j]]), fixture.expected.compressed[i]),
+  );
+  const reads = lazy.reads;
+  timed("search compressed, lazy (cached)", queries.slice(0, 5), ([t, w]) => lazy.search(t, w, k));
+  console.log(`lazy: open +${(loaded / 2 ** 20).toFixed(1)} MB, ${reads} reads, cache ${(lazy.cacheBytes / 2 ** 20).toFixed(2)} MB`);
+  if (lazy.reads !== reads && lazy.cacheBytes <= 1 << 20) {
+    failures++;
+    console.error("cached queries read again");
+  }
+  // A read error is an exception; the index works again afterwards
+  reader.fail = true;
+  try {
+    lazy.search(new Uint32Array([7, 8, 9, 10, 11, 12]), new Float32Array(6).fill(1), k);
+    failures++;
+    console.error("read error ignored");
+  } catch (e) {
+    if (!e.message.includes("file deleted")) { failures++; console.error(e.message); }
+  }
+  reader.fail = false;
+  const r = lazy.search(...queries[0], k);
+  compare("lazy after error", Array.from(r.docids, (d, j) => [d, r.scores[j]]), fixture.expected.compressed[0]);
+
+  const lazySplit = Index.open(fileReader(join(fixtureDir, "split")), {});
+  queries.forEach(([t, w], i) => {
+    const r = lazySplit.search(t, w, k);
+    compare(`lazy split #${i}`, Array.from(r.docids, (d, j) => [d, r.scores[j]]), fixture.expected.split[i]);
+  });
+  const lazySegmented = new SegmentedIndex();
+  for (const [i, name] of ["seg0", "seg1"].entries()) {
+    lazySegmented.push(Index.open(fileReader(join(fixtureDir, name)), {}), DocSet.fromDocids(new Uint32Array(fixture.deleted[i])));
+  }
+  queries.forEach(([t, w], i) => {
+    const r = lazySegmented.search(t, w, k);
+    compare(`lazy segmented #${i}`, Array.from(r.docids, (d, j) => [r.segments[j], d, r.scores[j]]), fixture.expected.segmented[i]);
+  });
+  try {
+    Index.open(fileReader(join(fixtureDir, "nothing-here")), {});
+    failures++;
+  } catch (e) {}
+}
 
 // Indexes built in WASM are the same as native ones (same options as
 // `compressed/` in examples/wasm_fixture.rs)

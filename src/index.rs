@@ -412,6 +412,15 @@ pub trait SparseIndex: Send + Sync + SparseIndexView + AsSparseIndexView {
         false
     }
 
+    /// Loads the postings of `terms` ahead of a search, for an index whose
+    /// files are read lazily ([`crate::storage::ReaderFiles`]): read errors
+    /// surface here, as errors, instead of during the search. Does nothing
+    /// by default (files in memory or memory-mapped).
+    fn prefetch(&self, terms: &[TermIndex]) -> std::io::Result<()> {
+        let _ = terms;
+        Ok(())
+    }
+
     /// Per-term iterator of each posting's positions, aligned with
     /// [`SparseIndex::block_iterator`]/[`SparseIndexView::iterator`] (same
     /// length and order). `None` if the index stores no positions.

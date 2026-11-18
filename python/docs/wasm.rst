@@ -137,6 +137,42 @@ with file names relative to the index directory (e.g. ``inner/docids.dat``
 for a split index). Search uses MaxScore. Document ids are returned as a
 ``Uint32Array``, so they must be below 2\ :sup:`32`.
 
+Lazy loading
+~~~~~~~~~~~~
+
+``Index.load`` copies every file into the WASM memory. ``Index.open`` reads
+only the metadata (``index.bin``...), and each search then reads the posting
+lists of its terms, through a synchronous ranged reader:
+
+.. code-block:: javascript
+
+    const index = Index.open({
+        // size of a file, undefined if it does not exist
+        size(name) { return sizes.get(name); },
+        // exactly `length` bytes of `name` at `offset`
+        read(name, offset, length) {
+            return new Uint8Array(new FileReaderSync().readAsArrayBuffer(
+                files.get(name).slice(offset, offset + length)));
+        },
+    }, { cacheBytes: 16 << 20 });
+    const { docids, scores } = index.search(terms, weights, 10);
+
+In a Firefox worker (e.g. Zotero), ``File`` + ``FileReaderSync`` as above
+reads ranges without copying the file; in a web page, an OPFS
+``createSyncAccessHandle`` or a ``File`` from an ``<input>`` works too.
+Posting lists are cached, up to ``cacheBytes`` bytes (64 MiB by default,
+least recently used out; the lists of the current query always stay).
+``index.reads`` and ``index.cacheBytes`` give the number of reads and the
+cache size.
+
+Each search first reads the lists it needs, so a read error (e.g. a deleted
+file) is thrown by ``search``, and the index can be searched again once the
+file is back. Compressed and split indexes (including positions) are read
+lazily; ``SegmentedIndex`` accepts lazy and loaded segments alike. On 10M
+postings (12.8 MB of files), ``open`` takes 9 MB of WASM memory (the term
+and block table) against 21 MB for ``load``, and a 30-term query 0.34 ms
+instead of 0.23 ms (Node.js, files in the OS cache).
+
 Incremental indexing
 --------------------
 
@@ -192,9 +228,9 @@ Limits
 ------
 
 - Single-threaded: no ``rayon`` and no shared memory.
-- The index files are copied into the WASM memory when loaded (no memory
+- ``Index.load`` copies the index files into the WASM memory (no memory
   mapping), so memory grows with the index size: plan for the size of the
-  index files plus some 30 MB. On 200k synthetic documents (45 MB index),
+  index files plus some 30 MB, or use ``Index.open``. On 200k synthetic documents (45 MB index),
   a top-100 search takes 1-3 ms in Node.js.
 - ``Builder`` keeps the postings in memory until ``finish``, at about 8
   bytes per posting (10M postings: ~80 MB), plus the compressed files,

@@ -57,6 +57,32 @@ pub trait Buffer: Send + Sync {
     fn as_bytes(&self) -> Option<&[u8]> {
         None
     }
+
+    /// Loads the bytes `start..end` ahead of [`Buffer::slice`] calls within
+    /// that range, for buffers read lazily: read errors surface here.
+    /// Nothing to do for buffers already in memory or memory-mapped.
+    fn prefetch(&self, start: usize, end: usize) -> std::io::Result<()> {
+        let _ = (start, end);
+        Ok(())
+    }
+}
+
+/// A range of shared bytes
+pub struct ArcSlice {
+    pub data: Arc<Vec<u8>>,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl Slice for ArcSlice {
+    fn data(&'_ self) -> &'_ [u8] {
+        &self.data[self.start..self.end]
+    }
+
+    fn read(&mut self, index: usize, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut data = &self.data[self.start + index..self.end];
+        data.read(buf)
+    }
 }
 
 /// Stores the data in memory

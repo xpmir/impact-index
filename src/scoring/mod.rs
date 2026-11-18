@@ -315,6 +315,10 @@ impl ScoredIndex {
 }
 
 impl SparseIndex for ScoredIndex {
+    fn prefetch(&self, terms: &[TermIndex]) -> std::io::Result<()> {
+        self.inner.prefetch(terms)
+    }
+
     fn block_iterator(&self, term_ix: TermIndex) -> Box<dyn BlockTermImpactIterator + '_> {
         if term_ix >= self.inner.len() {
             let inner_iter = self.inner.block_iterator(term_ix);

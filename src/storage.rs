@@ -14,7 +14,9 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::utils::buffer::{Buffer, MemoryBuffer, MmapBuffer, SharedBuffer};
+use crate::utils::buffer::{ArcSlice, Buffer, MemoryBuffer, MmapBuffer, SharedBuffer, Slice};
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 /// The files of one index directory
 pub trait IndexFiles: Send + Sync {
@@ -295,5 +297,268 @@ impl IndexOutput for MemoryOutput {
 
     fn describe(&self, name: &str) -> String {
         name.to_string()
+    }
+}
+
+/*
+ * ---- Lazy reading through a ranged reader
+ */
+
+/// Ranged reads of index files, e.g. from a JS callback in WASM. File
+/// names are relative to the index directory (`inner/docids.dat` for a
+/// split index).
+pub trait RangeReader: Send + Sync {
+    /// Size of the file `name`, `None` if it does not exist
+    fn size(&self, name: &str) -> io::Result<Option<u64>>;
+
+    /// Exactly `length` bytes of `name` at `offset`
+    fn read(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>>;
+}
+
+/// A cached byte range of a file
+struct CachedRange {
+    end: u64,
+    data: Arc<Vec<u8>>,
+    /// Query during which the range was last used
+    query: u64,
+}
+
+#[derive(Default)]
+struct CacheState {
+    /// File name → start → range
+    files: HashMap<String, BTreeMap<u64, CachedRange>>,
+    bytes: usize,
+    query: u64,
+    reads: u64,
+}
+
+/// Byte ranges read by [`ReaderFiles`], bounded in bytes, least recently
+/// used first out. Ranges used by the current query are never evicted
+/// (a query may thus exceed the capacity).
+pub struct RangeCache {
+    capacity: usize,
+    state: Mutex<CacheState>,
+}
+
+impl RangeCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            state: Mutex::default(),
+        }
+    }
+
+    /// Starts a query: ranges prefetched from now on belong to it
+    pub fn start_query(&self) {
+        self.state.lock().unwrap().query += 1;
+    }
+
+    /// Evicts ranges of earlier queries, least recently used first, until
+    /// the cache fits in its capacity
+    pub fn evict(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.bytes <= self.capacity {
+            return;
+        }
+        let current = state.query;
+        let mut old: Vec<(u64, String, u64, usize)> = state
+            .files
+            .iter()
+            .flat_map(|(name, ranges)| {
+                ranges
+                    .iter()
+                    .filter(|(_, r)| r.query < current)
+                    .map(move |(&start, r)| (r.query, name.clone(), start, r.data.len()))
+            })
+            .collect();
+        old.sort_unstable();
+        for (_, name, start, size) in old {
+            if state.bytes <= self.capacity {
+                break;
+            }
+            state.files.get_mut(&name).unwrap().remove(&start);
+            state.bytes -= size;
+        }
+    }
+
+    /// Bytes held
+    pub fn bytes(&self) -> usize {
+        self.state.lock().unwrap().bytes
+    }
+
+    /// Number of reads done so far (cache misses)
+    pub fn reads(&self) -> u64 {
+        self.state.lock().unwrap().reads
+    }
+
+    /// The cached range of `name` containing `start..end`, marked as used
+    fn get(&self, name: &str, start: u64, end: u64) -> Option<(u64, Arc<Vec<u8>>)> {
+        let mut state = self.state.lock().unwrap();
+        let query = state.query;
+        let (&range_start, range) = state.files.get_mut(name)?.range_mut(..=start).next_back()?;
+        (end <= range.end).then(|| {
+            range.query = query;
+            (range_start, range.data.clone())
+        })
+    }
+
+    fn insert(&self, name: &str, start: u64, data: Vec<u8>) -> Arc<Vec<u8>> {
+        let data = Arc::new(data);
+        let mut state = self.state.lock().unwrap();
+        let query = state.query;
+        state.bytes += data.len();
+        let range = CachedRange {
+            end: start + data.len() as u64,
+            data: data.clone(),
+            query,
+        };
+        if let Some(old) = state
+            .files
+            .entry(name.to_string())
+            .or_default()
+            .insert(start, range)
+        {
+            state.bytes -= old.data.len();
+        }
+        data
+    }
+
+    fn count_read(&self) {
+        self.state.lock().unwrap().reads += 1;
+    }
+}
+
+/// Index files read through a [`RangeReader`]: the posting files of a
+/// compressed index (`docids.dat`, `impacts.dat`, `positions.dat`) lazily, by term, through a shared
+/// [`RangeCache`]; the other files (metadata) whole, when loading. Call
+/// [`crate::index::SparseIndex::prefetch`] with the query terms before each
+/// search (between [`RangeCache::start_query`] and [`RangeCache::evict`]):
+/// postings that were not prefetched are read during the search, where a
+/// read error can only panic.
+pub struct ReaderFiles {
+    reader: Arc<dyn RangeReader>,
+    cache: Arc<RangeCache>,
+}
+
+impl ReaderFiles {
+    pub fn new(reader: Arc<dyn RangeReader>, cache: Arc<RangeCache>) -> Self {
+        Self { reader, cache }
+    }
+
+    fn read_whole(&self, name: &str) -> io::Result<Vec<u8>> {
+        let size = self.reader.size(name)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Missing index file {name}"),
+            )
+        })?;
+        let data = self.reader.read(name, 0, size as usize)?;
+        check_length(name, 0, size as usize, &data)?;
+        Ok(data)
+    }
+}
+
+fn check_length(name: &str, offset: u64, length: usize, data: &[u8]) -> io::Result<()> {
+    if data.len() != length {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!(
+                "{name}: read {} bytes at {offset} instead of {length}",
+                data.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `name` is a posting file of a compressed index, read lazily
+fn is_lazy(name: &str) -> bool {
+    let base = name.rsplit('/').next().unwrap_or(name);
+    base == "docids.dat" || base == "impacts.dat" || base == "positions.dat"
+}
+
+impl IndexFiles for ReaderFiles {
+    fn exists(&self, name: &str) -> bool {
+        matches!(self.reader.size(name), Ok(Some(_)))
+    }
+
+    fn open(&self, name: &str) -> io::Result<Box<dyn Read + '_>> {
+        Ok(Box::new(io::Cursor::new(self.read_whole(name)?)))
+    }
+
+    fn buffer(&self, name: &str, _in_memory: bool) -> io::Result<Box<dyn Buffer>> {
+        if is_lazy(name) {
+            if !self.exists(name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Missing index file {name}"),
+                ));
+            }
+            Ok(Box::new(ReaderBuffer {
+                name: name.to_string(),
+                reader: self.reader.clone(),
+                cache: self.cache.clone(),
+            }))
+        } else {
+            Ok(Box::new(SharedBuffer::new(Arc::new(
+                self.read_whole(name)?,
+            ))))
+        }
+    }
+
+    fn sub(&self, name: &str) -> Box<dyn IndexFiles + '_> {
+        Box::new(SubFiles {
+            parent: self,
+            prefix: format!("{name}/"),
+        })
+    }
+
+    fn dir(&self) -> Option<&Path> {
+        None
+    }
+
+    fn describe(&self, name: &str) -> String {
+        name.to_string()
+    }
+}
+
+/// A posting file read through the cache of its [`ReaderFiles`]
+struct ReaderBuffer {
+    name: String,
+    reader: Arc<dyn RangeReader>,
+    cache: Arc<RangeCache>,
+}
+
+impl ReaderBuffer {
+    fn load(&self, start: u64, end: u64) -> io::Result<(u64, Arc<Vec<u8>>)> {
+        if let Some(found) = self.cache.get(&self.name, start, end) {
+            return Ok(found);
+        }
+        let length = (end - start) as usize;
+        self.cache.count_read();
+        let data = self.reader.read(&self.name, start, length)?;
+        check_length(&self.name, start, length, &data)?;
+        Ok((start, self.cache.insert(&self.name, start, data)))
+    }
+}
+
+impl Buffer for ReaderBuffer {
+    fn slice(&'_ self, start: usize, end: usize) -> Box<dyn Slice + '_> {
+        let (range_start, data) = self
+            .load(start as u64, end as u64)
+            .unwrap_or_else(|e| panic!("{} (postings not prefetched): {e}", self.name));
+        let offset = (start as u64 - range_start) as usize;
+        Box::new(ArcSlice {
+            data,
+            start: offset,
+            end: offset + end - start,
+        })
+    }
+
+    fn prefetch(&self, start: usize, end: usize) -> io::Result<()> {
+        if end > start {
+            self.load(start as u64, end as u64)?;
+        }
+        Ok(())
     }
 }

@@ -188,3 +188,61 @@ impl impact_index::memory_indexer::SpillReader for JsSpillReader {
         Ok(bytes.to_vec())
     }
 }
+
+/// Ranged reads of index files through `{size(name), read(name, offset,
+/// length)}`, both synchronous
+pub(crate) struct JsRangeReader {
+    this: JsValue,
+    size: Function,
+    read: Function,
+}
+
+// wasm32-unknown-unknown without atomics is single-threaded: the JS
+// functions are never shared between threads
+unsafe impl Send for JsRangeReader {}
+unsafe impl Sync for JsRangeReader {}
+
+impl JsRangeReader {
+    pub(crate) fn new(reader: &JsValue) -> Result<Self, JsError> {
+        let size = method(reader, "size")?
+            .ok_or_else(|| JsError::new("the reader needs a size(name) method"))?;
+        let read = method(reader, "read")?
+            .ok_or_else(|| JsError::new("the reader needs a read(name, offset, length) method"))?;
+        Ok(Self {
+            this: reader.clone(),
+            size,
+            read,
+        })
+    }
+}
+
+impl impact_index::storage::RangeReader for JsRangeReader {
+    fn size(&self, name: &str) -> io::Result<Option<u64>> {
+        let size = self
+            .size
+            .call1(&self.this, &JsValue::from_str(name))
+            .map_err(|e| js_io_error(name, "size", &e))?;
+        if size.is_undefined() || size.is_null() {
+            return Ok(None);
+        }
+        size.as_f64()
+            .filter(|s| *s >= 0.)
+            .map(|s| Some(s as u64))
+            .ok_or_else(|| io::Error::other(format!("{name}: size must be a number")))
+    }
+
+    fn read(&self, name: &str, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        let bytes = self
+            .read
+            .call3(
+                &self.this,
+                &JsValue::from_str(name),
+                &JsValue::from_f64(offset as f64),
+                &JsValue::from_f64(length as f64),
+            )
+            .map_err(|e| js_io_error(name, "read", &e))?
+            .dyn_into::<Uint8Array>()
+            .map_err(|_| io::Error::other(format!("{name}: read must return a Uint8Array")))?;
+        Ok(bytes.to_vec())
+    }
+}

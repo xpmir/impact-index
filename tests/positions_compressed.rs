@@ -506,3 +506,52 @@ fn test_lossy_impact_codec_refused_for_positional_index() {
         err
     );
 }
+
+// ---------------------------------------------------------------------
+// Lazily read positions (storage::ReaderFiles, the WASM `Index.open` path)
+// ---------------------------------------------------------------------
+
+/// Reads files under a directory, counting reads
+struct DirReader {
+    dir: std::path::PathBuf,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl impact_index::storage::RangeReader for DirReader {
+    fn size(&self, name: &str) -> std::io::Result<Option<u64>> {
+        Ok(std::fs::metadata(self.dir.join(name)).ok().map(|m| m.len()))
+    }
+
+    fn read(&self, name: &str, offset: u64, length: usize) -> std::io::Result<Vec<u8>> {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let data = std::fs::read(self.dir.join(name))?;
+        Ok(data[offset as usize..offset as usize + length].to_vec())
+    }
+}
+
+#[test]
+fn test_lazy_positions_round_trip() {
+    use impact_index::base::load_index_from_files;
+    use impact_index::storage::{RangeCache, ReaderFiles};
+    use std::sync::atomic::Ordering;
+    init_logger();
+    let dir = temp_dir::TempDir::new().unwrap();
+    let forward = build_forward_index(&dir.path().join("forward"), 4);
+    let compressed_path = dir.path().join("compressed");
+    compress_index(&compressed_path, &forward, 4, None);
+
+    let reader = Arc::new(DirReader {
+        dir: compressed_path.clone(),
+        reads: Default::default(),
+    });
+    let cache = Arc::new(RangeCache::new(0));
+    let loaded = load_index_from_files(&ReaderFiles::new(reader.clone(), cache.clone()), true)
+        .expect("lazy load");
+    let all: Vec<TermIndex> = (0..loaded.len()).collect();
+    cache.start_query();
+    loaded.prefetch(&all).unwrap();
+    cache.evict();
+    let reads = reader.reads.load(Ordering::SeqCst);
+    assert_positions_round_trip(&forward, &*loaded);
+    assert_eq!(reader.reads.load(Ordering::SeqCst), reads);
+}

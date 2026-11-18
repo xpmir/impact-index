@@ -1296,11 +1296,20 @@ impl<'a> CompressedIndexIterator<'a> {
             .as_ref()
             .expect("ensure_positions_loaded called on an index with no positions compressor");
 
-        let data = positions_buffer
-            .as_bytes()
-            .expect("positions buffer should expose contiguous bytes");
-        let slice = &data
-            [info.positions_position_range.0 as usize..info.positions_position_range.1 as usize];
+        let (start, end) = (
+            info.positions_position_range.0 as usize,
+            info.positions_position_range.1 as usize,
+        );
+        // Lazily read buffers (`storage::ReaderFiles`) have no contiguous
+        // bytes: go through a slice
+        let lazy;
+        let slice = match positions_buffer.as_bytes() {
+            Some(data) => &data[start..end],
+            None => {
+                lazy = positions_buffer.slice(start, end);
+                lazy.data()
+            }
+        };
         positions_compressor.decode_into(
             slice,
             info.num_positions as usize,
@@ -1840,6 +1849,31 @@ impl<'a, S: ScoringFunction> TermCursor for CompressedScoringCursor<'a, S> {
 }
 
 impl SparseIndex for CompressedIndex {
+    fn prefetch(&self, terms: &[TermIndex]) -> std::io::Result<()> {
+        for &term in terms {
+            let Some(info) = self.information.terms.get(term) else {
+                continue;
+            };
+            if let (Some(first), Some(last)) = (info.pages.first(), info.pages.last()) {
+                self.docid_buffer.prefetch(
+                    first.docid_position_range.0 as usize,
+                    last.docid_position_range.1 as usize,
+                )?;
+                self.impact_buffer.prefetch(
+                    first.impact_position_range.0 as usize,
+                    last.impact_position_range.1 as usize,
+                )?;
+                if let Some(positions) = &self.positions_buffer {
+                    positions.prefetch(
+                        first.positions_position_range.0 as usize,
+                        last.positions_position_range.1 as usize,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn block_iterator(
         &self,
         term_index: crate::base::TermIndex,
