@@ -15,7 +15,6 @@ exclude = ["BMP/python"]
 name = "impact_index"
 crate-type = ["cdylib", "rlib"]
 bench = false
-test = false
 
 [features]
 extension-module = ["pyo3/extension-module"]
