@@ -27,7 +27,9 @@ Firefox code such as Zotero plugins)::
 
 Its version follows the Python package: the same version number means the
 same core library and index format, but a release that only concerns one of
-them is not published to the other, so either may skip versions.
+them is not published to the other, so either may skip versions. The
+`GitHub release notes <https://github.com/xpmir/impact-index/releases>`_
+start with the registries each version was published to.
 ``init()`` fetches
 ``impact_index_wasm_bg.wasm`` next to the module; when loading it
 differently (Node.js, extensions), pass the bytes or a URL:

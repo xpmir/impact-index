@@ -207,6 +207,28 @@ jobs:
           args: --latest --strip header
         env:
           OUTPUT: release-notes.md
+      # The notes replace the body, markers included: say where this
+      # version is published instead (registries may skip versions)
+      - name: List the registries in the release notes
+        env:
+          SKIP_PYPI: ${{ contains(github.event.release.body, '[skip pypi]') }}
+          SKIP_NPM: ${{ contains(github.event.release.body, '[skip npm]') }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          registries=""
+          [ "$SKIP_PYPI" = true ] || registries="[PyPI](https://pypi.org/project/impact-index/$version/)"
+          [ "$SKIP_NPM" = true ] || registries="${registries:+$registries, }[npm](https://www.npmjs.com/package/impact-index/v/$version)"
+          case "$SKIP_PYPI,$SKIP_NPM" in
+            true,false) note="WASM only: no Python release for this version." ;;
+            false,true) note="Python only: no npm release for this version." ;;
+            true,true) note="No package published for this version." ;;
+            *) note="" ;;
+          esac
+          {
+            echo "**Published to:** ${registries:-none}${note:+ — $note}"
+            echo
+            cat release-notes.md
+          } > release-notes.tmp && mv release-notes.tmp release-notes.md
       - name: Update release notes
         uses: softprops/action-gh-release@v2
         with:
