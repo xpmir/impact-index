@@ -72,3 +72,6 @@ docs/_build/
 .python-version
 
 libs/*/target
+
+# npm package built by wasm/build-npm.sh
+/wasm/pkg/

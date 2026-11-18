@@ -55,11 +55,15 @@ byte-compatible Elias-Fano codec used on 32-bit targets.
 ```bash
 rustup target add wasm32-unknown-unknown
 cargo build --target wasm32-unknown-unknown --no-default-features  # core
-CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
-    cargo test -p impact-index-wasm --target wasm32-unknown-unknown
+cargo test -p impact-index-wasm --target wasm32-unknown-unknown  # runner: .cargo/config.toml
 wasm/tests/check.sh   # WASM vs native results and builds (needs node)
 ```
 `wasm-bindgen-cli` must match the `wasm-bindgen` version in `Cargo.lock`.
+The npm package `impact-index` is built by `wasm/build-npm.sh` and
+published by `.github/workflows/release-npm.yml` (trusted publishing), from
+the same GitHub release as the PyPI wheels (`release.yml`) but in a separate
+workflow. Both read the single version in `[workspace.package]` of the root
+`Cargo.toml`: bump it there only (plus `Cargo.lock`).
 
 ### ICU4X segmentation data
 The dictionaries of the `icu` tokenizer / Thai analyzer are not built in

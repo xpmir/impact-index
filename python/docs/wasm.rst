@@ -16,14 +16,29 @@ and returned as maps from file names to ``Uint8Array``\ s, which the
 application stores where it likes (IndexedDB, the Origin Private File
 System, a server, files...).
 
+Installation
+------------
+
+The package is published on npm as ``impact-index`` (an ES module built
+with ``wasm-pack --target web``, for browsers, workers and privileged
+Firefox code such as Zotero plugins)::
+
+    npm install impact-index
+
+Its version follows the Python package. ``init()`` fetches
+``impact_index_wasm_bg.wasm`` next to the module; when loading it
+differently (Node.js, extensions), pass the bytes or a URL:
+``await init({ module_or_path: bytes })``.
+
 Building
 --------
 
-The crate is not published yet; build it from a checkout (with the nightly
-toolchain pinned in ``rust-toolchain.toml``)::
+To build from a checkout (with the nightly toolchain pinned in
+``rust-toolchain.toml``)::
 
     rustup target add wasm32-unknown-unknown
-    wasm-pack build --release --target web wasm
+    wasm/build-npm.sh            # the npm package, in wasm/pkg
+    wasm-pack build --release --target web wasm   # plain wasm-pack build
 
 ``--target nodejs`` or ``--target bundler`` give packages for Node.js or for
 bundlers (webpack, Vite...). Without ``wasm-pack``, build with ``cargo build
@@ -36,7 +51,7 @@ Indexing and search
 
 .. code-block:: javascript
 
-    import init, { Builder, Index } from "./pkg/impact_index_wasm.js";
+    import init, { Builder, Index } from "impact-index";
     await init();
 
     // Build: document ids must be increasing; terms are vocabulary indices
@@ -76,7 +91,7 @@ segments as one.
 
 .. code-block:: javascript
 
-    import { Builder, DocSet, Index, SegmentedIndex } from "./pkg/impact_index_wasm.js";
+    import { Builder, DocSet, Index, SegmentedIndex } from "impact-index";
 
     const seg0 = Index.load(files0);
     // A new segment, quantised like the first one: exactly comparable scores
@@ -102,7 +117,7 @@ WASM with ``KeyStoreBuilder``, or natively (``content=False``):
 
 .. code-block:: javascript
 
-    import { KeyStoreBuilder, DocumentStore } from "./pkg/impact_index_wasm.js";
+    import { KeyStoreBuilder, DocumentStore } from "impact-index";
 
     const keys = new KeyStoreBuilder();
     keys.add({ docno: "D-17" }, 0);       // document id 0 (as in Builder.add)

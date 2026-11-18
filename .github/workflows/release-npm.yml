@@ -1,0 +1,61 @@
+name: Upload npm package
+
+# Publishes the WASM build (wasm/) to npm as `impact-index`, from the same
+# GitHub release as the Python packages (release.yml) but independently: a
+# failure in one does not block the other. Both use the version in
+# [workspace.package] of Cargo.toml.
+#
+# Publishing uses npm trusted publishing (OIDC, no token; provenance is
+# generated automatically). On npmjs.com, package `impact-index` > Settings >
+# Trusted Publisher: GitHub Actions, organization `xpmir`, repository
+# `impact-index`, workflow `release-npm.yml`.
+#
+# workflow_dispatch: dry run (build and pack, nothing is published).
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  npm:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: 'true'
+      - name: Check tag matches the workspace version
+        if: github.event_name == 'release'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          if [ "$tag" != "$version" ]; then
+            echo "::error file=Cargo.toml::Release tag $GITHUB_REF_NAME does not match Cargo.toml version $version. Bump [workspace.package] version in Cargo.toml (and Cargo.lock), then recreate the release."
+            exit 1
+          fi
+          echo "Version $version matches tag $GITHUB_REF_NAME"
+      - run: rustup toolchain install nightly-2026-09-20 --profile minimal --target wasm32-unknown-unknown
+      # No registry-url: setup-node would then set a placeholder
+      # NODE_AUTH_TOKEN, which breaks OIDC publishing
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: npm >= 11.5.1 (trusted publishing)
+        run: npm install -g npm@11 && npm --version
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked --version 0.15.1
+      - name: Build the package
+        run: wasm/build-npm.sh "$GITHUB_WORKSPACE/wasm/pkg"
+      - name: Check the package
+        working-directory: wasm/pkg
+        run: npm publish --dry-run
+      - name: Publish
+        if: github.event_name == 'release'
+        working-directory: wasm/pkg
+        run: npm publish --access public

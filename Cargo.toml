@@ -1,6 +1,6 @@
 [package]
 name = "impact-index"
-version = "1.9.3"
+version.workspace = true
 edition = "2021"
 authors = ["Benjamin Piwowarski <benjamin@piwowarski.fr>"]
 license = "MIT OR Apache-2.0"
@@ -10,6 +10,11 @@ license = "MIT OR Apache-2.0"
 members = [".", "wasm"]
 default-members = ["."]
 exclude = ["BMP/python"]
+
+# Single version for the Python package (PyPI) and the npm package
+# (wasm/, published as `impact-index`): bump it here only.
+[workspace.package]
+version = "1.9.3"
 
 [lib]
 name = "impact_index"

@@ -1,5 +1,8 @@
 name: Upload python packages
 
+# The npm package (wasm/) is published by release-npm.yml from the same
+# release, independently: a failure in one does not block the other.
+
 on:
   release:
     types: [created]
@@ -12,9 +15,9 @@ jobs:
       - name: Check tag matches Cargo.toml version
         run: |
           tag="${GITHUB_REF_NAME#v}"
-          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
           if [ "$tag" != "$version" ]; then
-            echo "::error file=Cargo.toml::Release tag $GITHUB_REF_NAME does not match Cargo.toml version $version. Bump Cargo.toml (and Cargo.lock), then recreate the release."
+            echo "::error file=Cargo.toml::Release tag $GITHUB_REF_NAME does not match Cargo.toml version $version. Bump [workspace.package] version in Cargo.toml (and Cargo.lock), then recreate the release."
             exit 1
           fi
           echo "Version $version matches tag $GITHUB_REF_NAME"
