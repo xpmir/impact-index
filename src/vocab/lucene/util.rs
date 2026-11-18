@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Derived from Apache Lucene (Copyright The Apache Software Foundation);
+// see NOTICE.
+
 //! UTF-16 term buffers, mirroring Lucene's `char[]` term attributes so that
 //! ported filters keep Lucene's exact length semantics (lengths are counted
 //! in UTF-16 code units, like Java's `char`).

@@ -349,3 +349,19 @@ builder = impact_index.BOWIndexBuilder(
 Full documentation including guides on compression, BMP search, and the document store:
 
 **https://impact-index.readthedocs.io/en/latest/index.html**
+
+## License
+
+Licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE)
+or the [MIT license](LICENSE-MIT), at your option. Versions up to 1.9.3 were
+released under the GPL-2.0-or-later.
+
+Code ported from Apache Lucene (stemmers, analyzers, stop word lists) is
+under the Apache License 2.0 only, and Terrier's English stop word list under
+the MPL-2.0; see [NOTICE](NOTICE). The vendored `BMP/` crate keeps its own
+Apache-2.0 licence.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this project by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.

@@ -1,0 +1,39 @@
+impact-index
+Copyright (c) 2022-2026 Benjamin Piwowarski
+
+Licensed under either of the Apache License, Version 2.0 (LICENSE-APACHE) or
+the MIT license (LICENSE-MIT), at your option, except for the third-party
+material listed below, which keeps its own licence.
+
+-------------------------------------------------------------------------------
+Apache Lucene (https://lucene.apache.org/), Apache License 2.0
+
+Copyright 2001-2025 The Apache Software Foundation
+This product includes software developed at The Apache Software Foundation
+(http://www.apache.org/).
+
+Ported or generated from Lucene's Java sources (these files are licensed
+under the Apache License 2.0 only):
+  - src/vocab/lucene_porter.rs (PorterStemmer)
+  - src/vocab/lucene/stemmers.rs (normalizers and light stemmers)
+  - src/vocab/lucene/indic_rules.rs (Indic light stemmer suffix tables)
+  - src/vocab/lucene/util.rs (StemmerUtil)
+  - src/vocab/lucene/mod.rs (analyzer chains)
+Stop word lists distributed with Lucene:
+  - src/vocab/stopwords/lucene/*.txt
+Several of these lists come from the Snowball project
+(https://snowballstem.org/), Copyright (c) 2001 Dr Martin Porter and
+Copyright (c) 2004-2005 Richard Boulton, BSD 3-Clause License.
+
+-------------------------------------------------------------------------------
+Terrier (https://github.com/terrier-org/terrier-core), Mozilla Public
+License 2.0
+
+  - src/vocab/stopwords/terrier/english.txt (share/stopword-list.txt),
+    unmodified; this file is licensed under the MPL-2.0
+    (https://mozilla.org/MPL/2.0/).
+
+-------------------------------------------------------------------------------
+BMP (https://github.com/pisa-engine/BMP), Apache License 2.0
+
+  - BMP/ (see BMP/LICENSE)

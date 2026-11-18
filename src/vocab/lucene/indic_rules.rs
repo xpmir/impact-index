@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Derived from Apache Lucene (Copyright The Apache Software Foundation);
+// see NOTICE.
+
 //! Suffix tables of Lucene 10.5.0 Indic light stemmers, generated from the
 //! Java sources (each rule: strip the suffix if the term is longer than the
 //! threshold, in UTF-16 code units).

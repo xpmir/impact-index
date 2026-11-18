@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Derived from Apache Lucene (Copyright The Apache Software Foundation);
+// see NOTICE.
+
 //! Ports of Lucene 10.5.0 normalizers and light stemmers (`ArabicNormalizer`,
 //! `ArabicStemmer`, `PersianNormalizer`, `PersianStemmer`, `IndicNormalizer`,
 //! `HindiNormalizer`, `HindiStemmer`, `BengaliNormalizer`, `BengaliStemmer`,

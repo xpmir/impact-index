@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Derived from Apache Lucene (Copyright The Apache Software Foundation);
+// see NOTICE.
+
 //! Lucene 10.5.0 language analyzers, as selected by Anserini/Pyserini's
 //! `-language` option (`AnalyzerMap`): `ArabicAnalyzer`, `BengaliAnalyzer`,
 //! `GermanAnalyzer`, `SpanishAnalyzer`, `PersianAnalyzer`, `FinnishAnalyzer`,
