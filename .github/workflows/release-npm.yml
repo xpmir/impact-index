@@ -6,9 +6,14 @@ name: Upload npm package
 # [workspace.package] of Cargo.toml.
 #
 # Publishing uses npm trusted publishing (OIDC, no token; provenance is
-# generated automatically). On npmjs.com, package `impact-index` > Settings >
-# Trusted Publisher: GitHub Actions, organization `xpmir`, repository
-# `impact-index`, workflow `release-npm.yml`.
+# generated automatically) with staged publishing: the workflow stages the
+# version, which goes live only once a maintainer approves it on npmjs.com
+# (2FA). On npmjs.com, package `impact-index` > Settings > Trusted
+# Publisher: GitHub Actions, organization `xpmir`, repository
+# `impact-index`, workflow `release-npm.yml`, environment `npm`, "Allow
+# npm publish" and "Allow npm dist-tag" unticked (stage only). The GitHub
+# environment `npm` (repository settings > Environments) can add its own
+# protection rules.
 #
 # workflow_dispatch: dry run (build and pack, nothing is published).
 
@@ -23,6 +28,8 @@ permissions:
 jobs:
   npm:
     runs-on: ubuntu-latest
+    # must match the environment of the trusted publisher on npmjs.com
+    environment: npm
     permissions:
       contents: read
       id-token: write
@@ -46,8 +53,8 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
-      - name: npm >= 11.5.1 (trusted publishing)
-        run: npm install -g npm@11 && npm --version
+      - name: npm >= 11.15.0 (staged publishing)
+        run: npm install -g 'npm@^11.15.0' && npm --version
       - name: Install wasm-pack
         run: cargo install wasm-pack --locked --version 0.15.1
       - name: Build the package
@@ -55,7 +62,7 @@ jobs:
       - name: Check the package
         working-directory: wasm/pkg
         run: npm publish --dry-run
-      - name: Publish
+      - name: Stage for publication (approve on npmjs.com)
         if: github.event_name == 'release'
         working-directory: wasm/pkg
-        run: npm publish --access public
+        run: npm stage publish

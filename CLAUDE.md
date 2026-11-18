@@ -60,7 +60,8 @@ wasm/tests/check.sh   # WASM vs native results and builds (needs node)
 ```
 `wasm-bindgen-cli` must match the `wasm-bindgen` version in `Cargo.lock`.
 The npm package `impact-index` is built by `wasm/build-npm.sh` and
-published by `.github/workflows/release-npm.yml` (trusted publishing), from
+staged by `.github/workflows/release-npm.yml` (trusted + staged publishing:
+a maintainer approves each version on npmjs.com), from
 the same GitHub release as the PyPI wheels (`release.yml`) but in a separate
 workflow. Both read the single version in `[workspace.package]` of the root
 `Cargo.toml`: bump it there only (plus `Cargo.lock`).
