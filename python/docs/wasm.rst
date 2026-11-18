@@ -75,7 +75,10 @@ Indexing and search
 - ``nbits`` (8): bits per quantised impact;
 - ``range``: quantisation range, ``{min, max}`` or the ``quantizer()`` of
   another index (see :ref:`incremental`); by default, the range of the
-  indexed impacts.
+  indexed impacts;
+- ``spill``: see :ref:`below <wasm-spill>`.
+
+They are typed as ``BuilderOptions`` in the TypeScript declarations.
 
 Streamed output
 ~~~~~~~~~~~~~~~
@@ -98,6 +101,8 @@ The callbacks are synchronous and their return value is ignored: queue
 asynchronous writes, and wait for the queue before loading the index or
 writing anything that refers to it. An exception thrown by a callback aborts
 ``finish`` with that error; the builder can be finished again.
+
+.. _wasm-spill:
 
 Spilling builder
 ~~~~~~~~~~~~~~~~
@@ -227,7 +232,15 @@ segments as one.
 
     segments.setDeleted(1, DocSet.fromDocids(new Uint32Array([5])));
 
-``push`` and ``setDeleted`` copy the ``DocSet`` (later changes to it do not
+A search can also be restricted to a sub-collection (e.g. a library
+collection): ``index.search(terms, weights, k, deleted, allowed)`` only
+returns documents of the ``allowed`` set, and ``segments.push(index,
+deleted, allowed)`` / ``segments.setAllowed(segment, allowed)`` set the
+allowed documents of a segment (ids of that segment; none means all). The
+cost is that of ``deleted``: a candidate is checked before entering the
+top-k, so a small allowed set does not make the search faster.
+
+``push``, ``setDeleted`` and ``setAllowed`` copy the ``DocSet`` (later changes to it do not
 apply until the next ``setDeleted``), and ``Index.search(terms, weights, k,
 deleted)`` only reads it: the same set can be reused, e.g. a collection
 filter turned into deletions, query after query.

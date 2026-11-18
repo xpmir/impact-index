@@ -170,6 +170,16 @@ impl FromIterator<DocId> for DocBitSet {
     }
 }
 
+/// Both filters (e.g. tombstones and an allow-list, borrowed).
+impl<A: DocFilter, B: DocFilter> DocFilter for (A, B) {
+    const ACCEPTS_ALL: bool = A::ACCEPTS_ALL && B::ACCEPTS_ALL;
+
+    #[inline(always)]
+    fn accept(&self, docid: DocId) -> bool {
+        self.0.accept(docid) && self.1.accept(docid)
+    }
+}
+
 /// Rejects the documents in the set (tombstones of deleted documents).
 #[derive(Clone, Copy, Debug)]
 pub struct Exclude<'a>(pub &'a DocBitSet);

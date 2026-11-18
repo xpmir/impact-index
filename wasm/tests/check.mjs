@@ -96,6 +96,32 @@ timed("search 2 segments + tombstones", queries, ([t, w]) => segmented.search(t,
   ),
 );
 
+// Allowed documents (even ids): same as the unrestricted top-(10k)
+// filtered, for an index and for segments (alongside their deletions)
+{
+  const even = (n) => DocSet.fromDocids(Uint32Array.from({ length: n }, (_, i) => 2 * i));
+  const evens = even(fixture.docs ? fixture.docs.length : 100_000);
+  const restrict = (r, withSegment) =>
+    Array.from(r.docids, (d, j) => (withSegment ? [r.segments[j], d, r.scores[j]] : [d, r.scores[j]]))
+      .filter((x) => x.at(-2) % 2 === 0)
+      .slice(0, k);
+  queries.forEach(([t, w], i) => {
+    const got = compressed.search(t, w, k, undefined, evens);
+    compare(`allowed #${i}`, Array.from(got.docids, (d, j) => [d, got.scores[j]]), restrict(compressed.search(t, w, 10 * k), false));
+  });
+  const allowedSegments = new SegmentedIndex();
+  for (const [i, name] of ["seg0", "seg1"].entries()) {
+    allowedSegments.push(Index.load(readIndex(join(fixtureDir, name))), deletedSets[i]);
+  }
+  queries.forEach(([t, w], i) => {
+    const all = allowedSegments.search(t, w, 10 * k);
+    for (const s of [0, 1]) allowedSegments.setAllowed(s, evens);
+    const got = allowedSegments.search(t, w, k);
+    for (const s of [0, 1]) allowedSegments.setAllowed(s);
+    compare(`segments allowed #${i}`, Array.from(got.docids, (d, j) => [got.segments[j], d, got.scores[j]]), restrict(all, true));
+  });
+}
+
 // Lazy indexes (Index.open): posting lists read from the files at search
 // time, through a synchronous ranged reader
 function fileReader(dir) {

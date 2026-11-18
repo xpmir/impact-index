@@ -31,7 +31,7 @@ use impact_index::compress::{
 use impact_index::docstore::keys::KeyStoreBuilder as KeyStoreBuilderInner;
 use impact_index::docstore::store::{ContentAccess, DocumentStore as StoreInner};
 use impact_index::index::{SparseIndex, SparseIndexView};
-use impact_index::search::filter::{DocBitSet, Exclude};
+use impact_index::search::filter::{DocBitSet, Exclude, Only};
 use impact_index::search::maxscore::{search_maxscore_filtered, MaxScoreOptions};
 use impact_index::search::segments::{segment_size, Segment, SegmentedSearch};
 use impact_index::storage::{MemoryFiles, MemoryOutput, RangeCache, ReaderFiles};
@@ -204,7 +204,39 @@ extern "C" {
     /// [`DocSet::borrow_param`]
     #[wasm_bindgen(typescript_type = "DocSet")]
     pub type DocSetParam;
+
+    /// Options of `new Builder` (see `BuilderOptions` below)
+    #[wasm_bindgen(typescript_type = "BuilderOptions")]
+    pub type BuilderOptionsParam;
 }
+
+#[wasm_bindgen(typescript_custom_section)]
+const BUILDER_OPTIONS: &str = r#"
+/** Options of `new Builder` (all optional) */
+export interface BuilderOptions {
+    /** Postings per block (128) */
+    blockSize?: number;
+    /** Document id codec ("pfor") */
+    docids?: "pfor" | "ef" | "bitpacking";
+    /** Impact codec ("quantized") */
+    impacts?: "quantized" | "float";
+    /** Bits per quantised impact, 1 to 32 (8) */
+    nbits?: number;
+    /**
+     * Quantisation range: fixed ({min, max}, scores then exactly comparable
+     * across indexes built with the same range), or the `Quantizer` of
+     * another index; by default, the range of the indexed impacts
+     */
+    range?: { min: number; max: number } | Quantizer;
+    /**
+     * Bounds the memory used by postings: beyond `budget` bytes (64 MiB),
+     * the largest posting lists are appended to a scratch stream through
+     * `write` (synchronous; `bytes` is a copy); `finish` then needs
+     * `readSpill`
+     */
+    spill?: { budget?: number; write(bytes: Uint8Array): void };
+}
+"#;
 
 /// A set of document ids (e.g. deleted documents of a segment)
 #[wasm_bindgen]
@@ -560,16 +592,20 @@ impl Index {
     }
 
     /// Top-`k` documents (MaxScore) for the query `terms` / `weights`,
-    /// skipping the `deleted` documents
+    /// skipping the `deleted` documents and, if `allowed` is given, the
+    /// documents not in it (both sets are only read)
     pub fn search(
         &self,
         terms: &[u32],
         weights: &[f32],
         k: usize,
         deleted: Option<DocSetParam>,
+        allowed: Option<DocSetParam>,
     ) -> Result<SearchResults, JsError> {
         let deleted = DocSet::borrow_param(deleted)?;
         let deleted = deleted.as_ref().map(|d| d.borrow());
+        let allowed = DocSet::borrow_param(allowed)?;
+        let allowed = allowed.as_ref().map(|d| d.borrow());
         let query = query(terms, weights)?;
         prefetch([(&*self.inner, &self.cache)], &query)?;
         let results = search_maxscore_filtered(
@@ -577,7 +613,10 @@ impl Index {
             &query,
             k,
             MaxScoreOptions::default(),
-            deleted.as_deref().map(Exclude),
+            (
+                deleted.as_deref().map(Exclude),
+                allowed.as_deref().map(Only),
+            ),
         );
         after_search([&self.cache]);
         Ok(SearchResults {
@@ -592,7 +631,8 @@ impl Index {
 }
 
 /// Several indexes (segments) searched as one, each with its own deleted
-/// documents; scores must be comparable across segments (see the
+/// documents (and optionally its allowed documents; document ids are those
+/// of the segment); scores must be comparable across segments (see the
 /// quantisation range modes)
 #[wasm_bindgen]
 #[derive(Default)]
@@ -600,6 +640,7 @@ pub struct SegmentedIndex {
     indexes: Vec<Rc<dyn SparseIndex>>,
     caches: Vec<Option<Arc<RangeCache>>>,
     deleted: Vec<Option<DocBitSet>>,
+    allowed: Vec<Option<DocBitSet>>,
     sizes: Vec<usize>,
 }
 
@@ -610,30 +651,41 @@ impl SegmentedIndex {
         SegmentedIndex::default()
     }
 
-    /// Adds a segment, returns its position
-    pub fn push(&mut self, index: &Index, deleted: Option<DocSetParam>) -> Result<usize, JsError> {
+    /// Adds a segment, returns its position. The sets are copied.
+    pub fn push(
+        &mut self,
+        index: &Index,
+        deleted: Option<DocSetParam>,
+        allowed: Option<DocSetParam>,
+    ) -> Result<usize, JsError> {
         let deleted = DocSet::borrow_param(deleted)?.map(|d| d.borrow().clone());
+        let allowed = DocSet::borrow_param(allowed)?.map(|d| d.borrow().clone());
         self.indexes.push(index.inner.clone());
         self.caches.push(index.cache.clone());
         self.deleted.push(deleted);
+        self.allowed.push(allowed);
         self.sizes.push(segment_size(&*index.inner));
         Ok(self.indexes.len() - 1)
     }
 
-    /// Replaces the deleted documents of a segment
+    /// Replaces the deleted documents of a segment (copied)
     #[wasm_bindgen(js_name = setDeleted)]
     pub fn set_deleted(
         &mut self,
         segment: usize,
         deleted: Option<DocSetParam>,
     ) -> Result<(), JsError> {
-        let deleted = DocSet::borrow_param(deleted)?.map(|d| d.borrow().clone());
-        let slot = self
-            .deleted
-            .get_mut(segment)
-            .ok_or_else(|| JsError::new(&format!("no segment {segment}")))?;
-        *slot = deleted;
-        Ok(())
+        set_segment_docs(&mut self.deleted, segment, deleted)
+    }
+
+    /// Replaces the allowed documents of a segment (copied; none: all)
+    #[wasm_bindgen(js_name = setAllowed)]
+    pub fn set_allowed(
+        &mut self,
+        segment: usize,
+        allowed: Option<DocSetParam>,
+    ) -> Result<(), JsError> {
+        set_segment_docs(&mut self.allowed, segment, allowed)
     }
 
     #[wasm_bindgen(getter)]
@@ -668,10 +720,10 @@ impl SegmentedIndex {
         let segments = self
             .indexes
             .iter()
-            .zip(&self.deleted)
-            .map(|(index, deleted)| Segment {
+            .zip(self.deleted.iter().zip(&self.allowed))
+            .map(|(index, (deleted, allowed))| Segment {
                 index: &**index,
-                filter: deleted.as_ref().map(Exclude),
+                filter: (deleted.as_ref().map(Exclude), allowed.as_ref().map(Only)),
             })
             .collect();
         let results = SegmentedSearch::with_sizes(segments, &self.sizes).search(&query, k);
@@ -685,6 +737,20 @@ impl SegmentedIndex {
             segments: Some(results.iter().map(|d| d.segment as u32).collect()),
         })
     }
+}
+
+/// Replaces the set of `segment` in `sets` by a copy of `docs`
+fn set_segment_docs(
+    sets: &mut [Option<DocBitSet>],
+    segment: usize,
+    docs: Option<DocSetParam>,
+) -> Result<(), JsError> {
+    let docs = DocSet::borrow_param(docs)?.map(|d| d.borrow().clone());
+    let slot = sets
+        .get_mut(segment)
+        .ok_or_else(|| JsError::new(&format!("no segment {segment}")))?;
+    *slot = docs;
+    Ok(())
 }
 
 /// Field `name` of a JS options object, if set
@@ -740,7 +806,8 @@ impl Builder {
     ///   `write` (synchronous, append-only, `bytes` a copy), down to half the
     ///   budget; `finish` then needs `readSpill` to read them back
     #[wasm_bindgen(constructor)]
-    pub fn new(options: JsValue) -> Result<Builder, JsError> {
+    pub fn new(options: Option<BuilderOptionsParam>) -> Result<Builder, JsError> {
+        let options: JsValue = options.map_or(JsValue::UNDEFINED, Into::into);
         let block_size = number_option(&options, "blockSize")?.unwrap_or(128.) as usize;
         if block_size == 0 {
             return Err(JsError::new("blockSize must be positive"));
