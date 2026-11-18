@@ -14,7 +14,7 @@ exclude = ["BMP/python"]
 # Single version for the Python package (PyPI) and the npm package
 # (wasm/, published as `impact-index`): bump it here only.
 [workspace.package]
-version = "1.10.0"
+version = "1.11.0"
 
 [lib]
 name = "impact_index"
