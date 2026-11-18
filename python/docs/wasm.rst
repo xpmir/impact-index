@@ -153,3 +153,15 @@ They can also be disabled in other Rust projects:
     is a C library); key-only stores do not need it
 ``bmp``
     conversion to BMP indexes and CIFF export
+``analysis``
+    text analyzers (tokenizers, stemmers, stop words, Lucene analyzers,
+    ICU4X word segmentation); pure Rust, it also builds for WASM, but the
+    WASM bindings do not expose it. Without it, documents and queries are
+    given as term ids
+``analysis-download``
+    on-demand download of the analysis data (ICU4X segmentation data,
+    Japanese / Korean dictionaries) into the cache directory; native only.
+    Without it, the paths of the data must be set explicitly
+``analysis-cjk``
+    Japanese and Korean morphological analysis (Lindera); implies
+    ``analysis-download``

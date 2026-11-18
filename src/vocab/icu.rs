@@ -5,18 +5,22 @@
 //! Lao, Khmer, Burmese) would add ~3 MB, so they are loaded at runtime from
 //! the official ICU4X data blob (`full.postcard`, a release asset of
 //! [ICU4X](https://github.com/unicode-org/icu4x/releases)), downloaded into
-//! the cache directory (see [`super::lucene::morph::cache_dir`]) when first
-//! needed. Its segmentation is identical to the data built into
+//! the cache directory (see [`super::cache_dir`]) when first
+//! needed (feature `analysis-download`; without it, the path must be set
+//! with [`set_data_path`]). Its segmentation is identical to the data built into
 //! `icu_segmenter` of the same version.
 //!
 //! When bumping `icu_segmenter`, bump [`ICU4X_VERSION`] and [`SHA256`]
 //! together (the digest is shown on the release page).
 
-use std::io::{Error, ErrorKind, Read};
+#[cfg(feature = "analysis-download")]
+use std::io::Read;
+use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use icu_segmenter::{WordSegmenter, WordSegmenterBorrowed};
+#[cfg(feature = "analysis-download")]
 use sha2::{Digest, Sha256};
 
 /// ICU4X release whose data blob is used (same as `icu_segmenter`)
@@ -25,8 +29,10 @@ pub const ICU4X_VERSION: &str = "2.4.0";
 /// SHA-256 of the data blob of [`ICU4X_VERSION`]
 pub const SHA256: &str = "73e5e956536fbc571f484daa514cf1eee346c95fc41759478219de23777a0e88";
 
+#[cfg(feature = "analysis-download")]
 const FILE_NAME: &str = "full.postcard";
 
+#[cfg(feature = "analysis-download")]
 fn url() -> String {
     format!(
         "https://github.com/unicode-org/icu4x/releases/download/icu%40{}/{}",
@@ -51,12 +57,14 @@ pub fn set_data_path(path: PathBuf) {
 }
 
 /// Path of the data blob in the cache
+#[cfg(feature = "analysis-download")]
 fn cached_path() -> PathBuf {
-    super::lucene::morph::cache_dir()
+    super::cache_dir()
         .join(format!("icu4x-{}", ICU4X_VERSION))
         .join(FILE_NAME)
 }
 
+#[cfg(feature = "analysis-download")]
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -66,6 +74,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Returns the path of the ICU4X data blob in the cache, downloading it if
 /// needed
+#[cfg(feature = "analysis-download")]
 pub fn download_data() -> std::io::Result<PathBuf> {
     let target = cached_path();
     if target.exists() {
@@ -132,7 +141,16 @@ pub fn word_segmenter() -> std::io::Result<WordSegmenterBorrowed<'static>> {
     if SEGMENTER.get().is_none() {
         let path = match DATA_PATH.lock().unwrap().clone() {
             Some(path) => path,
+            #[cfg(feature = "analysis-download")]
             None => download_data()?,
+            #[cfg(not(feature = "analysis-download"))]
+            None => {
+                return Err(Error::new(
+                    ErrorKind::NotFound,
+                    "no ICU4X segmentation data: set its path with set_data_path \
+                     (impact-index was built without the analysis-download feature)",
+                ))
+            }
         };
         let _ = SEGMENTER.set(load(&path)?);
     }

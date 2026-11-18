@@ -7,6 +7,7 @@ pub(crate) use rayon::{join, prelude::*};
 #[cfg(not(feature = "parallel"))]
 mod sequential {
     /// Sequential `par_iter`: the plain borrowing iterator
+    #[allow(dead_code)] // only used by the text analysis (feature `analysis`)
     pub(crate) trait IntoParallelRefIterator<'a> {
         type Iter: Iterator;
         fn par_iter(&'a self) -> Self::Iter;

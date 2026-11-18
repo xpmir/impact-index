@@ -5,12 +5,14 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "analysis")]
 use crate::utils::par::*;
 use ndarray::Array1;
 
 use crate::base::{BoxResult, DocId, PostingValue, TermIndex};
 use crate::builder::{BuilderOptions, Indexer, SparseBuilderIndex};
 use crate::docmeta::DocMetadata;
+#[cfg(feature = "analysis")]
 use crate::vocab::analyzer::TextAnalyzer;
 
 /// Builder for bag-of-words IR indices (BM25, TF-IDF, etc.).
@@ -20,6 +22,7 @@ use crate::vocab::analyzer::TextAnalyzer;
 pub struct BOWIndexBuilder<V: PostingValue> {
     indexer: Indexer<V>,
     doc_lengths: Vec<u32>,
+    #[cfg(feature = "analysis")]
     analyzer: Option<TextAnalyzer>,
     folder: PathBuf,
     /// Mirrors `options.positions`: routes `add_text`/`add_texts_batch`
@@ -33,6 +36,7 @@ impl<V: PostingValue> BOWIndexBuilder<V> {
         Self {
             indexer: Indexer::new(folder, options),
             doc_lengths: Vec::new(),
+            #[cfg(feature = "analysis")]
             analyzer: None,
             folder: folder.to_path_buf(),
             positions: options.positions,
@@ -40,6 +44,7 @@ impl<V: PostingValue> BOWIndexBuilder<V> {
     }
 
     /// Create with a text analyzer (stemmer + vocabulary).
+    #[cfg(feature = "analysis")]
     pub fn with_analyzer(folder: &Path, options: &BuilderOptions, analyzer: TextAnalyzer) -> Self {
         Self {
             indexer: Indexer::new(folder, options),
@@ -56,6 +61,7 @@ impl<V: PostingValue> BOWIndexBuilder<V> {
     }
 
     /// Get a mutable reference to the analyzer (if present).
+    #[cfg(feature = "analysis")]
     pub fn analyzer_mut(&mut self) -> Option<&mut TextAnalyzer> {
         self.analyzer.as_mut()
     }
@@ -127,6 +133,7 @@ impl<V: PostingValue> BOWIndexBuilder<V> {
     /// grows vocabulary, and records doc length automatically.
     ///
     /// Returns the document length.
+    #[cfg(feature = "analysis")]
     pub fn add_text(&mut self, docid: DocId, text: &str) -> Result<u32, std::io::Error> {
         let analyzer = self
             .analyzer
@@ -192,6 +199,7 @@ impl<V: PostingValue> BOWIndexBuilder<V> {
     /// are GIL-bound.
     ///
     /// Documents must be sorted by ascending docid within the batch.
+    #[cfg(feature = "analysis")]
     pub fn add_texts_batch(&mut self, documents: &[(DocId, &str)]) -> Result<(), std::io::Error> {
         let analyzer = self
             .analyzer
@@ -287,6 +295,7 @@ impl<V: PostingValue> BOWIndexBuilder<V> {
     /// Analyze a query text using the builder's analyzer.
     ///
     /// Returns term index -> TF mapping. Does NOT grow vocabulary.
+    #[cfg(feature = "analysis")]
     pub fn analyze_query(&self, text: &str) -> std::collections::HashMap<TermIndex, f32> {
         self.analyzer
             .as_ref()
@@ -306,6 +315,7 @@ impl<V: PostingValue> BOWIndexBuilder<V> {
         let doc_meta = DocMetadata::from_lengths(self.doc_lengths);
         doc_meta.save(&self.folder)?;
 
+        #[cfg(feature = "analysis")]
         if let Some(analyzer) = &self.analyzer {
             analyzer.save_vocab(&self.folder)?;
         }
@@ -343,7 +353,7 @@ fn convert_f32_to_v<V: PostingValue>(v: f32) -> V {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "analysis"))]
 mod bow_stop_word_tests {
     use super::*;
     use crate::vocab::analyzer::TextAnalyzer;

@@ -4,19 +4,26 @@
 //! - Document analysis grows the vocabulary as new terms are encountered
 //! - Query analysis does NOT grow the vocabulary (unknown terms are skipped)
 
+#[cfg(feature = "analysis")]
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "analysis")]
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "analysis")]
 use unicode_segmentation::UnicodeSegmentation;
 
+#[cfg(feature = "analysis")]
 use crate::base::TermIndex;
 
+#[cfg(feature = "analysis")]
 use super::stemmer::Stemmer;
+#[cfg(feature = "analysis")]
 use super::Vocabulary;
 
 /// Stem each stop word so it can be matched against already-stemmed tokens.
 /// See [`TextAnalyzer::stemmed_stop_words`] for why this exists.
+#[cfg(feature = "analysis")]
 fn stem_stop_words(stemmer: &dyn Stemmer, stop_words: &[&str]) -> HashSet<String> {
     stop_words
         .iter()
@@ -30,6 +37,7 @@ fn stem_stop_words(stemmer: &dyn Stemmer, stop_words: &[&str]) -> HashSet<String
 /// the one declared first -- see the `Lexer::Lexer()` constructor in PISA's
 /// `src/tokenizer.cpp`). Declaration order there is Abbreviature,
 /// Possessive, Term, so that's the tiebreak order here too.
+#[cfg(feature = "analysis")]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum PisaTokenKind {
     Abbreviature,
@@ -65,6 +73,7 @@ enum PisaTokenKind {
 /// doesn't call out a lowercasing step -- see the analyzer module's
 /// pipeline-comparison notes) since [`TextAnalyzer`] always indexes
 /// lowercased text regardless of tokenizer.
+#[cfg(feature = "analysis")]
 fn pisa_tokenize(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
@@ -253,6 +262,7 @@ pub enum Tokenizer {
     Lucene,
 }
 
+#[cfg(feature = "analysis")]
 impl Tokenizer {
     /// Tokenizer used when none is requested explicitly: `LuceneEnglish`
     /// for English, `Icu` for languages written without spaces, `Standard`
@@ -292,6 +302,7 @@ impl std::str::FromStr for Tokenizer {
 /// see [`super::icu`]). Segments are kept, like `unicode_words`, when they
 /// contain an alphanumeric character: ICU4X's own word type is not usable
 /// for that, as it tags some Devanagari words (e.g. "जा") as non-words.
+#[cfg(feature = "analysis")]
 fn icu_words<'t>(
     segmenter: icu_segmenter::WordSegmenterBorrowed<'_>,
     text: &'t str,
@@ -311,6 +322,7 @@ fn icu_words<'t>(
 }
 
 /// The ICU word segmenter if `tokenizer` needs it
+#[cfg(feature = "analysis")]
 fn icu_segmenter_for(
     tokenizer: Tokenizer,
 ) -> std::io::Result<Option<icu_segmenter::WordSegmenterBorrowed<'static>>> {
@@ -421,6 +433,17 @@ impl Default for AnalyzerConfig {
 }
 
 impl AnalyzerConfig {
+    /// Loads the analyzer config (`analyzer.cbor`) from an index's files,
+    /// `None` if there is none (no analyzer was configured) or it cannot be
+    /// read.
+    pub fn try_load_from(files: &dyn crate::storage::IndexFiles) -> Option<AnalyzerConfig> {
+        if !files.exists("analyzer.cbor") {
+            return None;
+        }
+        let file = files.open("analyzer.cbor").ok()?;
+        ciborium::de::from_reader(file).ok()
+    }
+
     /// The tokenizer variant actually in effect, falling back to the
     /// legacy `english_possessive_filter` bool for indices built before
     /// `tokenizer` existed (that bool predates [`Tokenizer::PisaEnglish`],
@@ -444,6 +467,7 @@ impl AnalyzerConfig {
 /// [`Self::is_post_stem_stop_word`]) -- matching Lucene or Terrier requires
 /// only the pre-stem check, and an arbitrary custom list runs both, for
 /// backward compatibility.
+#[cfg(feature = "analysis")]
 pub struct TextAnalyzer {
     vocab: Vocabulary,
     stemmer: Box<dyn Stemmer>,
@@ -482,6 +506,7 @@ pub struct TextAnalyzer {
     config: AnalyzerConfig,
 }
 
+#[cfg(feature = "analysis")]
 impl TextAnalyzer {
     /// Create a new analyzer with the given stemmer (no stop words).
     pub fn new(stemmer: Box<dyn Stemmer>) -> Self {
@@ -978,11 +1003,7 @@ impl TextAnalyzer {
     /// Load the analyzer config from an index's files, `None` if there is
     /// no (readable) `analyzer.cbor`.
     pub fn try_load_config_from(files: &dyn crate::storage::IndexFiles) -> Option<AnalyzerConfig> {
-        if !files.exists("analyzer.cbor") {
-            return None;
-        }
-        let file = files.open("analyzer.cbor").ok()?;
-        ciborium::de::from_reader(file).ok()
+        AnalyzerConfig::try_load_from(files)
     }
 
     /// Load analyzer config if available, otherwise return default.
@@ -992,18 +1013,11 @@ impl TextAnalyzer {
 
     /// Load analyzer config from an index's files, or return default.
     pub fn load_config_from(files: &dyn crate::storage::IndexFiles) -> AnalyzerConfig {
-        if files.exists("analyzer.cbor") {
-            if let Ok(file) = files.open("analyzer.cbor") {
-                if let Ok(config) = ciborium::de::from_reader(file) {
-                    return config;
-                }
-            }
-        }
-        AnalyzerConfig::default()
+        AnalyzerConfig::try_load_from(files).unwrap_or_default()
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "analysis"))]
 mod tests {
     use super::*;
     use crate::vocab::stemmer::NoStemmer;
@@ -1268,7 +1282,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "analysis"))]
 mod stop_word_filter_mode_tests {
     use super::*;
     use crate::vocab::stemmer::{SnowballStemmer, Stemmer};
@@ -1402,7 +1416,7 @@ mod stop_word_filter_mode_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "analysis"))]
 mod tokenizer_compat_tests {
     use super::*;
 
@@ -1433,7 +1447,7 @@ mod tokenizer_compat_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "analysis"))]
 mod stop_words_family_compat_tests {
     use super::*;
 

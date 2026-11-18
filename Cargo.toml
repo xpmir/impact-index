@@ -20,7 +20,17 @@ test = false
 [features]
 # Everything a native build has always had; the WASM build
 # (`--no-default-features`, impact-index-wasm) leaves these out.
-default = ["python", "mmap", "parallel", "progress", "zstd", "bmp"]
+default = [
+    "python",
+    "mmap",
+    "parallel",
+    "progress",
+    "zstd",
+    "bmp",
+    "analysis",
+    "analysis-download",
+    "analysis-cjk",
+]
 # Python bindings (src/py)
 python = [
     "dep:pyo3",
@@ -33,6 +43,9 @@ python = [
     "progress",
     "zstd",
     "bmp",
+    "analysis",
+    "analysis-download",
+    "analysis-cjk",
 ]
 # Memory-mapped index and document store files
 mmap = ["dep:memmap2"]
@@ -42,6 +55,22 @@ parallel = ["dep:rayon"]
 progress = ["dep:indicatif"]
 # zstd (C library): document store and builder checkpoints
 zstd = ["dep:zstd"]
+# Text analyzers (src/vocab: tokenizers, stemmers, stop words, Lucene
+# analyzers, ICU4X word segmentation); pure Rust. Without it, only
+# pre-tokenized (term id) indexing and search.
+analysis = [
+    "dep:rust-stemmers",
+    "dep:unicode-segmentation",
+    "dep:icu_segmenter",
+    "dep:icu_provider",
+    "dep:icu_provider_blob",
+]
+# On-demand downloads of analysis data (ICU4X segmentation data, Lindera
+# dictionaries) into the cache directory; native only (network, rustls/ring).
+# Without it, the data paths must be set explicitly.
+analysis-download = ["analysis", "dep:ureq", "dep:dirs", "dep:sha2"]
+# Japanese / Korean morphological analysis (Lindera)
+analysis-cjk = ["analysis", "analysis-download", "dep:lindera", "dep:zip"]
 # Conversion to Block-Max Pruning indexes
 bmp = ["dep:bmp", "dep:protobuf", "progress"]
 extension-module = ["python", "pyo3/extension-module"]
@@ -84,6 +113,10 @@ required-features = ["mmap"]
 
 # [[bench.dependencies.helpers]]
 # path = "libs/helpers"
+
+[[example]]
+name = "lucene_analyze"
+required-features = ["analysis-cjk"]
 
 [[test]]
 name = "index"
@@ -130,20 +163,20 @@ vectorium = { git = "https://github.com/TusKANNy/vectorium", rev = "39e016c", op
 half = { version = "2", features = ["serde", "bytemuck"] }
 rayon = { version = "1", optional = true }
 bitpacking = "0.9"
-rust-stemmers = "1.2"
-unicode-segmentation = "1.12"
+rust-stemmers = { version = "1.2", optional = true }
+unicode-segmentation = { version = "1.12", optional = true }
 # Word segmentation; the dictionaries (~3 MB) are not built in but loaded
 # from the official ICU4X data blob, downloaded on demand (src/vocab/icu.rs)
-icu_segmenter = { version = "~2.4", default-features = false, features = ["compiled_data", "serde"] }
-icu_provider = { version = "2", features = ["sync"] }
-icu_provider_blob = { version = "2", features = ["alloc"] }
-sha2 = "0.10"
+icu_segmenter = { version = "~2.4", default-features = false, features = ["compiled_data", "serde"], optional = true }
+icu_provider = { version = "2", features = ["sync"], optional = true }
+icu_provider_blob = { version = "2", features = ["alloc"], optional = true }
+sha2 = { version = "0.10", optional = true }
 # Japanese / Korean morphological analysis (dictionaries loaded at runtime)
-lindera = { version = "6.2", default-features = false }
+lindera = { version = "6.2", default-features = false, optional = true }
 # Downloading the Lindera dictionaries (into the OS cache directory)
-ureq = "2"
-zip = { version = "2", default-features = false, features = ["deflate"] }
-dirs = "5"
+ureq = { version = "2", optional = true }
+zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+dirs = { version = "5", optional = true }
 protobuf = { version = "^2.27", optional = true }
 # FST for term map (same as BMP uses)
 fst = "0.4.7"

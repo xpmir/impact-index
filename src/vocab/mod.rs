@@ -3,12 +3,22 @@
 //! Provides [`Vocabulary`] for bidirectional term <-> [`TermIndex`] mapping.
 //! Uses FST for compact on-disk storage (~26 MB for 2.6M terms).
 
+//!
+//! The text analyzers (feature `analysis`) live in the submodules;
+//! [`analyzer::AnalyzerConfig`], stored with indexes, is always available.
+
 pub mod analyzer;
+#[cfg(feature = "analysis")]
 pub mod icu;
+#[cfg(feature = "analysis")]
 pub mod language;
+#[cfg(feature = "analysis")]
 pub mod lucene;
+#[cfg(feature = "analysis")]
 pub mod lucene_porter;
+#[cfg(feature = "analysis")]
 pub mod stemmer;
+#[cfg(feature = "analysis")]
 pub mod stopwords;
 
 use std::collections::HashMap;
@@ -17,6 +27,20 @@ use std::io::BufWriter;
 use std::path::Path;
 
 use crate::base::TermIndex;
+
+/// Cache directory of downloaded analysis data (ICU4X segmentation data,
+/// morphological dictionaries): `$IMPACT_INDEX_CACHE`, or `impact-index` in
+/// the OS cache directory (e.g. `~/.cache` on Linux, `~/Library/Caches` on
+/// macOS)
+#[cfg(feature = "analysis-download")]
+pub fn cache_dir() -> std::path::PathBuf {
+    match std::env::var_os("IMPACT_INDEX_CACHE") {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => dirs::cache_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("impact-index"),
+    }
+}
 
 /// Bidirectional mapping between string terms and [`TermIndex`].
 ///

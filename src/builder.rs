@@ -774,7 +774,7 @@ impl<V: PostingValue> SparseBuilderIndex<V> {
         // No `analyzer.cbor` = no analyzer was configured (an analyzer with
         // no stemmer nor stop words, e.g. for languages without either, is
         // still an analyzer)
-        let analyzer_config = crate::vocab::analyzer::TextAnalyzer::try_load_config_from(files);
+        let analyzer_config = crate::vocab::analyzer::AnalyzerConfig::try_load_from(files);
 
         let positions_buffer = if files.exists("positions.dat") {
             Some(files.buffer("positions.dat", in_memory)?)

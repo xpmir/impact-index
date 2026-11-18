@@ -47,8 +47,10 @@ When bumping the nightly, update `rust-toolchain.toml` and the
 
 ### WASM (`wasm/`, crate `impact-index-wasm`)
 Depends on the root crate with `--no-default-features` (features `python`,
-`mmap`, `parallel`, `progress`, `zstd`, `bmp` are the native-only parts; all
-on by default). `sucds` is 64-bit only: `src/compress/elias_fano.rs` is a
+`mmap`, `parallel`, `progress`, `zstd`, `bmp`, `analysis`,
+`analysis-download`, `analysis-cjk` are left out; all on by default and
+implied by `python`). `analysis` (pure Rust) also builds for WASM;
+`analysis-download` (ureq/ring) does not. `sucds` is 64-bit only: `src/compress/elias_fano.rs` is a
 byte-compatible Elias-Fano codec used on 32-bit targets.
 ```bash
 rustup target add wasm32-unknown-unknown

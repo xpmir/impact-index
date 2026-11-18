@@ -2392,7 +2392,7 @@ impl IndexLoader for CompressedIndexLoader {
 
         // Auto-detect auxiliary components
         let doc_meta = crate::docmeta::DocMetadata::load_from(files).ok();
-        let analyzer_config = crate::vocab::analyzer::TextAnalyzer::try_load_config_from(files);
+        let analyzer_config = crate::vocab::analyzer::AnalyzerConfig::try_load_from(files);
 
         let reorder_map = crate::transforms::reorder::ReorderMap::load_from(files).ok();
 

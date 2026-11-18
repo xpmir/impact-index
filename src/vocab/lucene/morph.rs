@@ -5,12 +5,17 @@
 //! Lindera dictionary (e.g. the unzipped `lindera-ipadic-<version>.zip` release
 //! asset).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(feature = "analysis-cjk")]
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
+#[cfg(feature = "analysis-cjk")]
 use lindera::dictionary::load_fs_dictionary;
+#[cfg(feature = "analysis-cjk")]
 use lindera::mode::{Mode, Penalty};
+#[cfg(feature = "analysis-cjk")]
 use lindera::segmenter::Segmenter;
 
 /// Morphological dictionaries
@@ -40,6 +45,7 @@ impl MorphDictionary {
 }
 
 /// Kuromoji's default `stoptags.txt` (Lucene 10.5.0)
+#[cfg(feature = "analysis-cjk")]
 const JA_STOP_TAGS: &[&str] = &[
     "接続詞",
     "助詞",
@@ -71,6 +77,7 @@ const JA_STOP_TAGS: &[&str] = &[
 ];
 
 /// `KoreanPartOfSpeechStopFilter.DEFAULT_STOP_TAGS` (Lucene 10.5.0)
+#[cfg(feature = "analysis-cjk")]
 const KO_STOP_TAGS: &[&str] = &[
     "EP", "EF", "EC", "ETN", "ETM", "IC", "JKS", "JKC", "JKG", "JKO", "JKB", "JKV", "JKQ", "JX",
     "JC", "MAG", "MAJ", "MM", "SP", "SSC", "SSO", "SC", "SE", "XPN", "XSA", "XSN", "XSV", "UNA",
@@ -80,6 +87,7 @@ const KO_STOP_TAGS: &[&str] = &[
 /// Kuromoji/Nori `isPunctuation`: Java general categories Z*, Cc, Cf, P*, S*
 /// -- i.e. not a letter, mark or number (approximated without category
 /// tables: alphanumeric characters and combining marks are kept)
+#[cfg(feature = "analysis-cjk")]
 fn is_punctuation(ch: char) -> bool {
     !(ch.is_alphanumeric()
         || matches!(ch as u32,
@@ -91,20 +99,12 @@ fn is_punctuation(ch: char) -> bool {
 /// Lindera's)
 pub const LINDERA_VERSION: &str = "6.2.0";
 
-/// Cache directory of downloaded dictionaries: `$IMPACT_INDEX_CACHE`, or
-/// `impact-index` in the OS cache directory (e.g. `~/.cache` on Linux,
-/// `~/Library/Caches` on macOS)
-pub fn cache_dir() -> PathBuf {
-    match std::env::var_os("IMPACT_INDEX_CACHE") {
-        Some(dir) => PathBuf::from(dir),
-        None => dirs::cache_dir()
-            .unwrap_or_else(std::env::temp_dir)
-            .join("impact-index"),
-    }
-}
+#[cfg(feature = "analysis-download")]
+pub use crate::vocab::cache_dir;
 
 /// Returns the directory of a dictionary in the cache, downloading it (the
 /// prebuilt Lindera release asset) if needed
+#[cfg(feature = "analysis-cjk")]
 pub fn download_dictionary(dictionary: MorphDictionary) -> std::io::Result<PathBuf> {
     use std::io::{Error, ErrorKind};
     let root = cache_dir().join(format!("lindera-{}", LINDERA_VERSION));
@@ -157,6 +157,7 @@ pub fn download_dictionary(dictionary: MorphDictionary) -> std::io::Result<PathB
     Ok(target)
 }
 
+#[cfg(feature = "analysis-cjk")]
 fn tempfile_dir(root: &Path) -> std::io::Result<PathBuf> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -183,6 +184,7 @@ pub fn dictionary_path(dictionary: MorphDictionary) -> Option<PathBuf> {
 }
 
 /// Splits `s` where characters change from punctuation to non-punctuation
+#[cfg(feature = "analysis-cjk")]
 fn split_punctuation(s: &str) -> Vec<&str> {
     let mut pieces = Vec::new();
     let mut start = 0;
@@ -201,6 +203,7 @@ fn split_punctuation(s: &str) -> Vec<&str> {
     pieces
 }
 
+#[cfg(feature = "analysis-cjk")]
 pub struct Morphology {
     dictionary: MorphDictionary,
     path: String,
@@ -209,9 +212,11 @@ pub struct Morphology {
 }
 
 /// Loaded dictionaries, shared by all analyzers (keyed by path)
+#[cfg(feature = "analysis-cjk")]
 static LOADED: LazyLock<Mutex<Vec<(MorphDictionary, String, Arc<Morphology>)>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
+#[cfg(feature = "analysis-cjk")]
 impl Morphology {
     /// Loads (or reuses) the dictionary at `path`
     pub fn load(dictionary: MorphDictionary, path: &Path) -> std::io::Result<Arc<Morphology>> {
@@ -357,5 +362,49 @@ impl Morphology {
             "*" => out.push(surface),
             reading => out.push(reading.to_string()),
         }
+    }
+}
+
+#[cfg(not(feature = "analysis-cjk"))]
+fn without_cjk() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Japanese and Korean analysis needs impact-index built with the \
+         `analysis-cjk` feature",
+    )
+}
+
+/// Downloading dictionaries needs the `analysis-cjk` feature
+#[cfg(not(feature = "analysis-cjk"))]
+pub fn download_dictionary(_dictionary: MorphDictionary) -> std::io::Result<PathBuf> {
+    Err(without_cjk())
+}
+
+/// Morphological analyzer; without the `analysis-cjk` feature, it cannot be
+/// loaded
+#[cfg(not(feature = "analysis-cjk"))]
+pub struct Morphology {
+    dictionary: MorphDictionary,
+    path: String,
+}
+
+#[cfg(not(feature = "analysis-cjk"))]
+impl Morphology {
+    /// Always fails (built without the `analysis-cjk` feature)
+    pub fn load(_dictionary: MorphDictionary, _path: &Path) -> std::io::Result<Arc<Morphology>> {
+        Err(without_cjk())
+    }
+
+    pub fn dictionary(&self) -> MorphDictionary {
+        self.dictionary
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Never called: a `Morphology` cannot be created without `analysis-cjk`
+    pub fn tokens(&self, _text: &str) -> Vec<String> {
+        unreachable!("no morphological analysis without the analysis-cjk feature")
     }
 }
