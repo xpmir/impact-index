@@ -32,10 +32,13 @@ use impact_index::index::SparseIndex;
 use impact_index::search::filter::{DocBitSet, Exclude};
 use impact_index::search::maxscore::{search_maxscore_filtered, MaxScoreOptions};
 use impact_index::search::segments::{segment_size, Segment, SegmentedSearch};
-use impact_index::storage::{MemoryFiles, MemoryOutput};
+use impact_index::storage::{IndexOutput, MemoryFiles, MemoryOutput};
 use js_sys::{Array, Map, Object, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+
+mod io;
+use io::JsOutput;
 
 #[cfg(target_family = "wasm")]
 extern "C" {
@@ -490,10 +493,23 @@ impl Builder {
         self.indexer.num_postings()
     }
 
-    /// Compresses the index and returns its files (a `Map` from file name
-    /// to `Uint8Array`), to be stored by the caller and given to
-    /// `Index.load`
-    pub fn finish(&mut self) -> Result<Map, JsError> {
+    /// Compresses the index. Without `output`, returns its files (a `Map`
+    /// from file name to `Uint8Array`), to be stored by the caller and given
+    /// to `Index.load`. With `output = {create(name), write(name, bytes),
+    /// close(name), chunkSize}` (only `write` required), streams the files
+    /// instead, by pieces of at most `chunkSize` bytes (1 MiB): they never
+    /// sit whole in the WASM memory. The callbacks are synchronous and their
+    /// return value ignored (queue asynchronous writes, and wait for the
+    /// queue before using the files); `bytes` is a copy, safe to keep. An
+    /// exception in a callback aborts `finish` with that error.
+    #[wasm_bindgen(unchecked_return_type = "Map<string, Uint8Array> | undefined")]
+    pub fn finish(
+        &mut self,
+        #[wasm_bindgen(
+            unchecked_param_type = "{create?(name: string): void, write(name: string, bytes: Uint8Array): void, close?(name: string): void, chunkSize?: number}"
+        )]
+        output: Option<JsValue>,
+    ) -> Result<JsValue, JsError> {
         if self.indexer.num_postings() == 0 {
             return Err(JsError::new("no postings to index"));
         }
@@ -501,6 +517,29 @@ impl Builder {
         #[cfg(target_family = "wasm")]
         impact_index::manifest::set_unix_time((js_sys::Date::now() / 1000.) as u64);
 
+        match output.filter(|o| !o.is_undefined() && !o.is_null()) {
+            Some(output) => {
+                self.compress_to(&JsOutput::new(&output)?)?;
+                Ok(JsValue::UNDEFINED)
+            }
+            None => {
+                let out = MemoryOutput::new();
+                self.compress_to(&out)?;
+                Ok(files_map(&out.into_files()).into())
+            }
+        }
+    }
+
+    /// Number of impacts clamped to the quantisation range by `finish`
+    /// (fixed or reference range only); if too many, start a new reference
+    #[wasm_bindgen(getter, js_name = clampedImpacts)]
+    pub fn clamped_impacts(&self) -> Option<f64> {
+        self.clamped.map(|n| n as f64)
+    }
+}
+
+impl Builder {
+    fn compress_to<O: IndexOutput>(&mut self, out: &O) -> Result<(), JsError> {
         let doc_ids_compressor_factory: Box<dyn DocIdCompressorFactory> = match self.docids.as_str()
         {
             "ef" => Box::new(EliasFanoCompressor {}),
@@ -511,7 +550,7 @@ impl Builder {
             None => Box::new(Identity {}),
             Some(nbits) => Box::new(RangedQuantizerFactory {
                 nbits,
-                range: self.range.clone(),
+                range: self.range,
                 codec: QuantizerCodec::BitPacked,
             }),
         };
@@ -521,20 +560,11 @@ impl Builder {
             impacts_compressor_factory,
             positions_codec: None,
         };
-        let out = MemoryOutput::new();
         let report = transform
-            .compress_to(&out, &self.indexer)
+            .compress_to(out, &self.indexer)
             .map_err(js_error)?;
         self.clamped = Some(report.clamped_impacts);
-
-        Ok(files_map(&out.into_files()))
-    }
-
-    /// Number of impacts clamped to the quantisation range by `finish`
-    /// (fixed or reference range only); if too many, start a new reference
-    #[wasm_bindgen(getter, js_name = clampedImpacts)]
-    pub fn clamped_impacts(&self) -> Option<f64> {
-        self.clamped.map(|n| n as f64)
+        Ok(())
     }
 }
 

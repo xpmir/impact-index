@@ -2063,20 +2063,16 @@ impl CompressionTransform {
                 .progress_chars("=> "),
         );
 
-        let mut impact_writer = out
-            .create("impacts.dat")
-            .expect("Could not create the values file");
-
-        let mut docid_writer = out
-            .create("docids.dat")
-            .expect("Could not create the document IDs file");
+        let mut impact_writer = out.create("impacts.dat")?;
+        let mut docid_writer = out.create("docids.dat")?;
 
         // Only created when the source has positions -- an index without
         // positions never gets a `positions.dat` at all.
-        let mut positions_writer: Option<O::Writer> = has_positions.then(|| {
-            out.create("positions.dat")
-                .expect("Could not create the positions file")
-        });
+        let mut positions_writer: Option<O::Writer> = if has_positions {
+            Some(out.create("positions.dat")?)
+        } else {
+            None
+        };
 
         let mut terms_info = Vec::with_capacity(index.len());
         let mut docid_offset: u64 = 0;

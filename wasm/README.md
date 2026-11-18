@@ -21,6 +21,7 @@ const builder = new Builder({ range: { min: 0, max: 3 } });
 builder.add(0, new Uint32Array([12, 40]), new Float32Array([0.8, 1.5]));
 builder.add(1, new Uint32Array([3, 12]), new Float32Array([2.1, 0.2]));
 const files = builder.finish(); // Map: file name -> Uint8Array
+// or stream them out: builder.finish({ write(name, bytes) { ... } })
 
 // Load (from a Map or a plain object) and search
 const index = Index.load(files);

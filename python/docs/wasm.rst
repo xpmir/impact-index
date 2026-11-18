@@ -77,6 +77,28 @@ Indexing and search
   another index (see :ref:`incremental`); by default, the range of the
   indexed impacts.
 
+Streamed output
+~~~~~~~~~~~~~~~
+
+``builder.finish(output)`` hands the files to callbacks instead of
+returning them, in pieces of at most ``chunkSize`` bytes (1 MiB by
+default), so they never sit whole in the WASM memory:
+
+.. code-block:: javascript
+
+    builder.finish({
+        create(name) { /* optional: open the file */ },
+        write(name, bytes) { queue.push([name, bytes]); },  // bytes: a copy
+        close(name) { /* optional */ },
+        chunkSize: 1 << 20,
+    });
+    await drain(queue);  // e.g. IOUtils writes, in order
+
+The callbacks are synchronous and their return value is ignored: queue
+asynchronous writes, and wait for the queue before loading the index or
+writing anything that refers to it. An exception thrown by a callback aborts
+``finish`` with that error; the builder can be finished again.
+
 ``Index.load`` accepts any compressed or split index, and forward indexes,
 with file names relative to the index directory (e.g. ``inner/docids.dat``
 for a split index). Search uses MaxScore. Document ids are returned as a

@@ -124,6 +124,49 @@ if (fixture.docs) {
     compare(`rebuilt #${i}`, Array.from(r.docids, (d, j) => [d, r.scores[j]]), fixture.expected.compressed[i]);
   });
 
+  // Streamed output (callbacks): same files, in pieces of at most chunkSize
+  for (const chunkSize of [undefined, 1000, 7]) {
+    const streamed = new Map();
+    const events = [];
+    let largest = 0;
+    const out = builder.finish({
+      chunkSize,
+      create(name) { events.push(`create ${name}`); streamed.set(name, []); },
+      write(name, bytes) { largest = Math.max(largest, bytes.length); streamed.get(name).push(bytes); },
+      close(name) { events.push(`close ${name}`); },
+    });
+    const joined = (parts) => {
+      const all = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+      let offset = 0;
+      for (const p of parts) { all.set(p, offset); offset += p.length; }
+      return all;
+    };
+    const same = out === undefined && names(streamed) === names(built) &&
+      [...built].every(([name, bytes]) => name === "manifest.json" || joined(streamed.get(name)).every((b, i) => b === bytes[i]) && joined(streamed.get(name)).length === bytes.length) &&
+      events.filter((e) => e.startsWith("close")).length === built.size &&
+      (chunkSize === undefined || largest <= chunkSize);
+    if (!same) {
+      failures++;
+      console.error(`streamed output (chunkSize ${chunkSize}) differs`, events, largest);
+    }
+  }
+  // A callback exception aborts finish, as an error; the builder still works
+  try {
+    builder.finish({ write(name) { if (name === "docids.dat") throw new Error("disk full"); } });
+    failures++;
+    console.error("write exception ignored");
+  } catch (e) {
+    if (!e.message.includes("disk full")) {
+      failures++;
+      console.error("unexpected error", e.message);
+    }
+  }
+  try {
+    builder.finish({});
+    failures++;
+  } catch (e) {}
+  if (builder.finish().size !== built.size) failures++;
+
   // A segment quantised like the first one
   const segment = new Builder({ range: compressed.quantizer() });
   segment.add(0, new Uint32Array([1, 2]), new Float32Array([0.5, 3.5]));
