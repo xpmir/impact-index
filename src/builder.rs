@@ -1361,18 +1361,73 @@ impl<V: PostingValue> Len for SparseBuilderIndex<V> {
 *
 */
 
+/// Postings of one term in a [`MemoryIndexer`]: document id gaps as LEB128
+/// varints (the first from 0) and impact values, ~6 bytes per posting
+/// instead of 16 for a `TermImpact`.
+#[derive(Default)]
+struct MemoryPostings {
+    gaps: Vec<u8>,
+    values: Vec<ImpactValue>,
+    last_docid: DocId,
+}
+
+/// Grows `v` by ~25% when full, instead of doubling as `Vec::push` does:
+/// keeps the unused capacity, i.e. the build memory overhead, small
+fn reserve_compact<T>(v: &mut Vec<T>, additional: usize) {
+    if v.capacity() - v.len() < additional {
+        v.reserve_exact(additional.max(v.len() / 4).max(4));
+    }
+}
+
+impl MemoryPostings {
+    fn push(&mut self, docid: DocId, value: ImpactValue) {
+        let mut gap = docid - self.last_docid;
+        reserve_compact(&mut self.gaps, 10);
+        loop {
+            let byte = (gap & 0x7f) as u8;
+            gap >>= 7;
+            if gap == 0 {
+                self.gaps.push(byte);
+                break;
+            }
+            self.gaps.push(byte | 0x80);
+        }
+        reserve_compact(&mut self.values, 1);
+        self.values.push(value);
+        self.last_docid = docid;
+    }
+
+    fn iter(&self) -> impl Iterator<Item = TermImpact> + '_ {
+        let mut bytes = self.gaps.iter();
+        let mut docid = 0;
+        self.values.iter().map(move |&value| {
+            let mut shift = 0;
+            loop {
+                let byte = *bytes.next().expect("one gap per value");
+                docid += ((byte & 0x7f) as DocId) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+            }
+            TermImpact { docid, value }
+        })
+    }
+}
+
 /// A forward index built in memory, for collections that fit in RAM and
 /// targets without a file system (WASM). Compress it into an index with
 /// [`crate::compress::CompressionTransform::compress_to`].
 #[derive(Default)]
 pub struct MemoryIndexer {
     /// Postings of each term, by increasing document id
-    postings: Vec<Vec<TermImpact>>,
+    postings: Vec<MemoryPostings>,
     /// Maximum impact of each term
     max_values: Vec<ImpactValue>,
     last_docid: Option<DocId>,
     /// Largest document id with postings
     max_doc_id: DocId,
+    num_postings: usize,
 }
 
 impl MemoryIndexer {
@@ -1414,24 +1469,25 @@ impl MemoryIndexer {
 
         if let Some(&max_term) = sorted.last() {
             if max_term >= self.postings.len() {
-                self.postings.resize_with(max_term + 1, Vec::new);
+                self.postings.resize_with(max_term + 1, Default::default);
                 self.max_values.resize(max_term + 1, 0.);
             }
         }
         for (&term, &value) in terms.iter().zip(values) {
-            self.postings[term].push(TermImpact { docid, value });
+            self.postings[term].push(docid, value);
             self.max_values[term] = self.max_values[term].max(value);
         }
         if !terms.is_empty() {
             self.max_doc_id = docid;
         }
+        self.num_postings += terms.len();
         self.last_docid = Some(docid);
         Ok(())
     }
 
     /// Number of postings
     pub fn num_postings(&self) -> usize {
-        self.postings.iter().map(Vec::len).sum()
+        self.num_postings
     }
 }
 
@@ -1450,7 +1506,7 @@ impl SparseIndexInformation for MemoryIndexer {
 
 impl crate::index::SparseIndexView for MemoryIndexer {
     fn iterator<'a>(&'a self, term_ix: TermIndex) -> Box<dyn Iterator<Item = TermImpact> + 'a> {
-        Box::new(self.postings[term_ix].iter().copied())
+        Box::new(self.postings[term_ix].iter())
     }
 
     fn max_doc_id(&self) -> DocId {

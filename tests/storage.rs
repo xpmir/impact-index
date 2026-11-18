@@ -352,3 +352,40 @@ fn test_memory_indexer_rejects_invalid_documents() {
     memory.add(4, &[7], &[1.]).unwrap();
     assert_eq!(memory.num_postings(), 3);
 }
+
+#[test]
+fn test_memory_indexer_docid_gaps() {
+    use impact_index::index::SparseIndexView;
+    // Gaps of every varint length, from document 0 up to u64::MAX
+    let docids: Vec<DocId> = vec![
+        0,
+        1,
+        127,
+        128,
+        255,
+        1 << 14,
+        (1 << 21) + 3,
+        1 << 32,
+        (1 << 35) + 1,
+        u64::MAX - 1,
+        u64::MAX,
+    ];
+    let mut memory = MemoryIndexer::new();
+    for (i, &docid) in docids.iter().enumerate() {
+        memory
+            .add(docid, &[0, 1 + i % 2], &[1., i as f32 + 1.])
+            .unwrap();
+    }
+    let all: Vec<DocId> = memory.iterator(0).map(|p| p.docid).collect();
+    assert_eq!(all, docids);
+    let odd: Vec<(DocId, f32)> = memory.iterator(2).map(|p| (p.docid, p.value)).collect();
+    let expected: Vec<(DocId, f32)> = docids
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % 2 == 1)
+        .map(|(i, &d)| (d, i as f32 + 1.))
+        .collect();
+    assert_eq!(odd, expected);
+    assert_eq!(memory.num_postings(), 2 * docids.len());
+    assert_eq!(memory.max_doc_id(), u64::MAX);
+}

@@ -141,6 +141,8 @@ Limits
   mapping), so memory grows with the index size: plan for the size of the
   index files plus some 30 MB. On 200k synthetic documents (45 MB index),
   a top-100 search takes 1-3 ms in Node.js.
+- ``Builder`` keeps the postings in memory until ``finish``, at about 8
+  bytes per posting (10M postings: ~80 MB), plus the compressed files.
 - Not available in WASM: BM25 / text indexing, positions and structured
   queries, document contents (key-only stores work), BMP and Seismic, and
   builder checkpoints.
