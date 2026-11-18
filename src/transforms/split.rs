@@ -335,6 +335,12 @@ impl SparseIndex for SplitIndex {
         self.inner.prefetch(&inner_terms)
     }
 
+    fn term_postings(&self, term: crate::base::TermIndex) -> usize {
+        (0..self.splits)
+            .map(|j| self.inner.term_postings(term * self.splits + j))
+            .sum()
+    }
+
     fn reorder_map(&self) -> Option<&Vec<DocId>> {
         self.inner.reorder_map()
     }

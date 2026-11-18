@@ -75,6 +75,11 @@ analysis = [
 analysis-download = ["analysis", "dep:ureq", "dep:dirs", "dep:sha2"]
 # Japanese / Korean morphological analysis (Lindera)
 analysis-cjk = ["analysis", "analysis-download", "dep:lindera", "dep:zip"]
+# Indexes opened through a `storage::ReaderFiles` decode the block table
+# (`index.bin`) term by term, cached with the postings, instead of all of it
+# when opening (used by the WASM build). Off by default: iterators then hold
+# a shared handle on their blocks instead of borrowing them.
+lazy-pages = []
 # Conversion to Block-Max Pruning indexes
 bmp = ["dep:bmp", "dep:protobuf", "progress"]
 extension-module = ["python", "pyo3/extension-module"]

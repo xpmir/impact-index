@@ -39,11 +39,14 @@ pub mod elias_fano;
 pub mod impact;
 pub mod positions;
 
+#[cfg(feature = "lazy-pages")]
+mod lazy;
+
 //
 // ---- Compressed index global information  ---
 //
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct TermBlockInformation {
     /// Position within the document ID stream
     pub docid_position_range: (u64, u64),
@@ -516,18 +519,8 @@ impl CompressedIndexInformation {
     /// [`migrate_compressed_v4_to_v5`] for v4), and only for the sake of
     /// migrating them away.
     pub fn read_binary(reader: &mut dyn std::io::Read) -> std::io::Result<Self> {
-        use byteorder::{LittleEndian, ReadBytesExt};
-
-        let magic = reader.read_u32::<LittleEndian>()?;
-        if magic != COMPRESSED_INDEX_MAGIC {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Not a compressed index binary file",
-            ));
-        }
-        let version = reader.read_u32::<LittleEndian>()?;
-        crate::manifest::check_format_version(version, COMPRESSED_INDEX_VERSION)?;
-        Self::read_binary_impl(reader, COMPRESSED_INDEX_VERSION)
+        let version = Self::read_binary_version(reader)?;
+        Self::read_binary_impl(reader, version)
     }
 
     /// Shared body of [`Self::read_binary`] and [`migrate_compressed_v4_to_v5`],
@@ -539,6 +532,25 @@ impl CompressedIndexInformation {
     /// programming error (callers must have already checked), not a
     /// reachable on-disk state.
     fn read_binary_impl(reader: &mut dyn std::io::Read, version: u32) -> std::io::Result<Self> {
+        let (num_terms, mut information) = Self::read_binary_header(reader, version)?;
+
+        // Read terms and blocks (VInt + delta encoded)
+        information.terms.reserve_exact(num_terms);
+        let mut positions = BlockPositions::default();
+        for _ in 0..num_terms {
+            information
+                .terms
+                .push(read_term_binary(reader, version, &mut positions)?);
+        }
+        Ok(information)
+    }
+
+    /// Reads the number of terms and the compressors (after the magic
+    /// number and version); the returned information has no terms
+    fn read_binary_header(
+        reader: &mut dyn std::io::Read,
+        version: u32,
+    ) -> std::io::Result<(usize, Self)> {
         use byteorder::{LittleEndian, ReadBytesExt};
 
         let num_terms = reader.read_u32::<LittleEndian>()? as usize;
@@ -562,85 +574,140 @@ impl CompressedIndexInformation {
             (doc_ids, values, None)
         };
 
-        // Read terms and blocks (VInt + delta encoded)
-        let mut terms = Vec::with_capacity(num_terms);
-        let mut docid_pos: u64 = 0;
-        let mut impact_pos: u64 = 0;
-        let mut positions_pos: u64 = 0;
-
-        for _ in 0..num_terms {
-            let num_blocks = read_vint(reader)? as usize;
-            let max_value = reader.read_f32::<LittleEndian>()?;
-            let max_doc_id = read_vint(reader)?;
-            let length = read_vint(reader)? as usize;
-            let min_block_val = reader.read_f32::<LittleEndian>()?;
-            let range = max_value - min_block_val;
-
-            let mut pages = Vec::with_capacity(num_blocks);
-            let mut prev_doc_id: u64 = 0;
-            for _ in 0..num_blocks {
-                let docid_len = read_vint(reader)?;
-                let impact_len = read_vint(reader)?;
-                let block_length = read_vint(reader)? as usize;
-                // Dequantize 1-byte max_value
-                let mut q_byte = [0u8; 1];
-                reader.read_exact(&mut q_byte)?;
-                let block_max_value = min_block_val + (q_byte[0] as f32 / 255.0) * range;
-                let min_doc_id = prev_doc_id + read_vint(reader)?;
-                let block_max_doc_id = min_doc_id + read_vint(reader)?;
-                prev_doc_id = block_max_doc_id;
-                let min_doc_length = reader.read_u16::<LittleEndian>()?;
-
-                let (positions_position_range, num_positions) = if version >= 5 {
-                    let positions_len = read_vint(reader)?;
-                    let num_positions = read_vint(reader)? as u32;
-                    let range = (positions_pos, positions_pos + positions_len);
-                    positions_pos += positions_len;
-                    (range, num_positions)
-                } else {
-                    ((0u64, 0u64), 0u32)
-                };
-
-                pages.push(TermBlockInformation {
-                    docid_position_range: (docid_pos, docid_pos + docid_len),
-                    impact_position_range: (impact_pos, impact_pos + impact_len),
-                    length: block_length,
-                    max_value: block_max_value,
-                    min_doc_id,
-                    max_doc_id: block_max_doc_id,
-                    min_doc_length,
-                    positions_position_range,
-                    num_positions,
-                });
-
-                docid_pos += docid_len;
-                impact_pos += impact_len;
-            }
-
-            // Per-term min_dl (P1a) is always *derived* from the blocks,
-            // never stored independently -- see `TermBlocksInformation::min_dl`.
-            let min_dl = pages
-                .iter()
-                .map(|p| p.min_doc_length as u32)
-                .min()
-                .unwrap_or(0);
-
-            terms.push(TermBlocksInformation {
-                pages,
-                max_value,
-                max_doc_id,
-                length,
-                min_dl,
-            });
-        }
-
-        Ok(CompressedIndexInformation {
-            terms,
-            doc_ids_compressor,
-            values_compressor,
-            positions_compressor,
-        })
+        Ok((
+            num_terms,
+            CompressedIndexInformation {
+                terms: Vec::new(),
+                doc_ids_compressor,
+                values_compressor,
+                positions_compressor,
+            },
+        ))
     }
+
+    /// Checks the magic number and version of `index.bin`
+    fn read_binary_version(reader: &mut dyn std::io::Read) -> std::io::Result<u32> {
+        use byteorder::{LittleEndian, ReadBytesExt};
+
+        let magic = reader.read_u32::<LittleEndian>()?;
+        if magic != COMPRESSED_INDEX_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Not a compressed index binary file",
+            ));
+        }
+        let version = reader.read_u32::<LittleEndian>()?;
+        crate::manifest::check_format_version(version, COMPRESSED_INDEX_VERSION)?;
+        Ok(COMPRESSED_INDEX_VERSION)
+    }
+}
+
+/// Running positions in the posting streams while reading `index.bin`
+#[derive(Default, Clone, Copy)]
+struct BlockPositions {
+    docid: u64,
+    impact: u64,
+    positions: u64,
+}
+
+/// Per-term header of a binary (v4 / v5) `index.bin` term record
+struct TermHeader {
+    num_blocks: usize,
+    max_value: ImpactValue,
+    max_doc_id: DocId,
+    length: usize,
+    min_block_val: ImpactValue,
+}
+
+fn read_term_header(reader: &mut dyn std::io::Read) -> std::io::Result<TermHeader> {
+    use byteorder::{LittleEndian, ReadBytesExt};
+    Ok(TermHeader {
+        num_blocks: read_vint(reader)? as usize,
+        max_value: reader.read_f32::<LittleEndian>()?,
+        max_doc_id: read_vint(reader)?,
+        length: read_vint(reader)? as usize,
+        min_block_val: reader.read_f32::<LittleEndian>()?,
+    })
+}
+
+/// Reads the blocks of a term record (after its header), calling `f` on
+/// each, and advances `positions`
+fn read_term_blocks(
+    reader: &mut dyn std::io::Read,
+    version: u32,
+    header: &TermHeader,
+    positions: &mut BlockPositions,
+    mut f: impl FnMut(TermBlockInformation),
+) -> std::io::Result<()> {
+    use byteorder::{LittleEndian, ReadBytesExt};
+    let range = header.max_value - header.min_block_val;
+    let mut prev_doc_id: u64 = 0;
+    for _ in 0..header.num_blocks {
+        let docid_len = read_vint(reader)?;
+        let impact_len = read_vint(reader)?;
+        let block_length = read_vint(reader)? as usize;
+        // Dequantize 1-byte max_value
+        let mut q_byte = [0u8; 1];
+        reader.read_exact(&mut q_byte)?;
+        let block_max_value = header.min_block_val + (q_byte[0] as f32 / 255.0) * range;
+        let min_doc_id = prev_doc_id + read_vint(reader)?;
+        let block_max_doc_id = min_doc_id + read_vint(reader)?;
+        prev_doc_id = block_max_doc_id;
+        let min_doc_length = reader.read_u16::<LittleEndian>()?;
+
+        let (positions_position_range, num_positions) = if version >= 5 {
+            let positions_len = read_vint(reader)?;
+            let num_positions = read_vint(reader)? as u32;
+            let range = (positions.positions, positions.positions + positions_len);
+            positions.positions += positions_len;
+            (range, num_positions)
+        } else {
+            ((0u64, 0u64), 0u32)
+        };
+
+        f(TermBlockInformation {
+            docid_position_range: (positions.docid, positions.docid + docid_len),
+            impact_position_range: (positions.impact, positions.impact + impact_len),
+            length: block_length,
+            max_value: block_max_value,
+            min_doc_id,
+            max_doc_id: block_max_doc_id,
+            min_doc_length,
+            positions_position_range,
+            num_positions,
+        });
+
+        positions.docid += docid_len;
+        positions.impact += impact_len;
+    }
+    Ok(())
+}
+
+/// Reads one term record of a binary (v4 / v5) `index.bin`
+fn read_term_binary(
+    reader: &mut dyn std::io::Read,
+    version: u32,
+    positions: &mut BlockPositions,
+) -> std::io::Result<TermBlocksInformation> {
+    let header = read_term_header(reader)?;
+    let mut pages = Vec::with_capacity(header.num_blocks);
+    read_term_blocks(reader, version, &header, positions, |page| pages.push(page))?;
+
+    // Per-term min_dl (P1a) is always *derived* from the blocks,
+    // never stored independently -- see `TermBlocksInformation::min_dl`.
+    let min_dl = pages
+        .iter()
+        .map(|p| p.min_doc_length as u32)
+        .min()
+        .unwrap_or(0);
+
+    Ok(TermBlocksInformation {
+        pages,
+        max_value: header.max_value,
+        max_doc_id: header.max_doc_id,
+        length: header.length,
+        min_dl,
+    })
 }
 
 /// Reads the pre-P1a (v3) binary layout: identical to
@@ -1040,17 +1107,132 @@ pub struct CompressedIndex {
     /// Document-id reorder map (`new_docid -> original_docid`), auto-loaded
     /// if present (i.e. this index was produced by `ReorderTransform`).
     reorder_map: Option<Vec<DocId>>,
+
+    /// Block table decoded term by term, for an index read through a
+    /// `storage::ReaderFiles` (then, `information.terms` is empty)
+    #[cfg(feature = "lazy-pages")]
+    lazy: Option<lazy::LazyBlocks>,
+}
+
+/// Term-level statistics of a [`CompressedIndex`]
+#[derive(Clone, Copy)]
+struct TermStats {
+    max_value: ImpactValue,
+    max_doc_id: DocId,
+    length: usize,
+    min_dl: u32,
+}
+
+impl TermStats {
+    fn of(info: &TermBlocksInformation) -> Self {
+        Self {
+            max_value: info.max_value,
+            max_doc_id: info.max_doc_id,
+            length: info.length,
+            min_dl: info.min_dl,
+        }
+    }
+}
+
+impl CompressedIndex {
+    /// The blocks of a term (none if out of range)
+    #[cfg(not(feature = "lazy-pages"))]
+    #[inline]
+    fn block_iter(&self, term_index: TermIndex) -> BlockIter<'_> {
+        match self.information.terms.get(term_index) {
+            Some(info) => Box::new(info.pages.iter()),
+            None => Box::new([].iter()),
+        }
+    }
+
+    #[cfg(feature = "lazy-pages")]
+    fn block_iter(&self, term_index: TermIndex) -> BlockIter<'_> {
+        match &self.lazy {
+            Some(lazy) => lazy.block_iter(term_index),
+            None => lazy::BlockIter::borrowed(
+                self.information
+                    .terms
+                    .get(term_index)
+                    .map_or(&[][..], |info| &info.pages[..]),
+            ),
+        }
+    }
+
+    /// Statistics of a term (panics if out of range)
+    #[cfg(not(feature = "lazy-pages"))]
+    #[inline]
+    fn term_stats(&self, term_index: TermIndex) -> TermStats {
+        TermStats::of(&self.information.terms[term_index])
+    }
+
+    #[cfg(feature = "lazy-pages")]
+    fn term_stats(&self, term_index: TermIndex) -> TermStats {
+        match &self.lazy {
+            Some(lazy) => lazy.term_stats(term_index),
+            None => TermStats::of(&self.information.terms[term_index]),
+        }
+    }
+
+    /// Number of terms
+    #[cfg(not(feature = "lazy-pages"))]
+    #[inline]
+    fn num_terms(&self) -> usize {
+        self.information.terms.len()
+    }
+
+    #[cfg(feature = "lazy-pages")]
+    fn num_terms(&self) -> usize {
+        match &self.lazy {
+            Some(lazy) => lazy.len(),
+            None => self.information.terms.len(),
+        }
+    }
 }
 
 //
 // ---- Iterators over compressed block indices
 
+/// Blocks of a term, as walked by [`CompressedIndexIterator`]: borrowed
+/// from the block table
+#[cfg(not(feature = "lazy-pages"))]
+type BlockIter<'a> = Box<std::slice::Iter<'a, TermBlockInformation>>;
+#[cfg(not(feature = "lazy-pages"))]
+type CurrentBlock<'a> = Option<&'a TermBlockInformation>;
+
+/// Blocks of a term, as walked by [`CompressedIndexIterator`]: borrowed,
+/// or shared with the cache of a lazily read index (see [`lazy`])
+#[cfg(feature = "lazy-pages")]
+type BlockIter<'a> = lazy::BlockIter<'a>;
+#[cfg(feature = "lazy-pages")]
+type CurrentBlock<'a> = Option<TermBlockInformation>;
+
+/// The current block of a [`CompressedIndexIterator`], borrowed from the
+/// field alone (so that the decoding buffers can be borrowed mutably)
+trait CurrentBlockRef {
+    fn get(&self) -> Option<&TermBlockInformation>;
+}
+
+impl CurrentBlockRef for Option<&TermBlockInformation> {
+    #[inline(always)]
+    fn get(&self) -> Option<&TermBlockInformation> {
+        *self
+    }
+}
+
+#[cfg(feature = "lazy-pages")]
+impl CurrentBlockRef for Option<TermBlockInformation> {
+    #[inline(always)]
+    fn get(&self) -> Option<&TermBlockInformation> {
+        self.as_ref()
+    }
+}
+
 pub struct CompressedIndexIterator<'a> {
     /// Iterator over page information
-    info_iter: Box<std::slice::Iter<'a, TermBlockInformation>>,
+    info_iter: BlockIter<'a>,
 
-    /// Current info
-    info: Option<&'a TermBlockInformation>,
+    /// Current info (read through [`CurrentBlockRef::get`])
+    info: CurrentBlock<'a>,
 
     /// Reusable buffer for decoded doc IDs, stored as `u32` OFFSETS from the
     /// current block's `min_doc_id` (P5). All current codecs (BitPacking,
@@ -1097,11 +1279,7 @@ pub struct CompressedIndexIterator<'a> {
 
 impl<'a> CompressedIndexIterator<'a> {
     fn new<'c: 'a>(index: &'c CompressedIndex, term_index: TermIndex) -> Self {
-        let mut iter = if term_index < index.information.terms.len() {
-            Box::new(index.information.terms[term_index].pages.iter())
-        } else {
-            Box::new([].iter())
-        };
+        let mut iter = index.block_iter(term_index);
 
         let info = iter.next();
 
@@ -1125,7 +1303,7 @@ impl<'a> CompressedIndexIterator<'a> {
     /// Does NOT decode the block — that happens lazily.
     fn move_iterator(&mut self, min_doc_id: DocId) -> bool {
         // Loop until the condition is met
-        while let Some(info) = self.info {
+        while let Some(info) = self.info.get() {
             if info.max_doc_id >= min_doc_id {
                 debug!(
                     "[{}] Moving iterator OK - max(doc_id) = {} >= {}",
@@ -1137,7 +1315,7 @@ impl<'a> CompressedIndexIterator<'a> {
             // Go to the next block
             self.next_block();
 
-            if let Some(info) = self.info {
+            if let Some(info) = self.info.get() {
                 debug!("[{}] Read the next block (move): {}", self.term_index, info);
             } else {
                 debug!("[{}] EOF for blocks (move)", self.term_index);
@@ -1151,7 +1329,7 @@ impl<'a> CompressedIndexIterator<'a> {
     /// Fast path: if the buffer supports direct byte access (in-memory),
     /// pass raw &[u8] slices to avoid Box<dyn Slice> heap allocations.
     fn decode_block(&mut self) {
-        if let Some(info) = self.info {
+        if let Some(info) = self.info.get() {
             // Try fast path: direct byte access (no Box allocation)
             let docid_bytes = self.sparse_index.docid_buffer.as_bytes();
             let impact_bytes = self.sparse_index.impact_buffer.as_bytes();
@@ -1282,7 +1460,7 @@ impl<'a> CompressedIndexIterator<'a> {
         if self.positions_loaded {
             return;
         }
-        let info = self.info.expect("block should be loaded");
+        let info = self.info.get().expect("block should be loaded");
 
         let positions_buffer = self
             .sparse_index
@@ -1373,7 +1551,7 @@ impl<'a> Iterator for CompressedIndexIterator<'a> {
         self.ensure_block_loaded();
 
         if self.index < self.docids.len() {
-            let min_doc_id = self.info.expect("block should be loaded").min_doc_id;
+            let min_doc_id = self.info.get().expect("block should be loaded").min_doc_id;
             let impact = TermImpact {
                 docid: min_doc_id + self.docids[self.index] as DocId,
                 value: self.impacts[self.index],
@@ -1437,7 +1615,7 @@ struct CompressedBlockTermImpactIterator<'a> {
 
 impl<'a> CompressedBlockTermImpactIterator<'a> {
     fn new(index: &'a CompressedIndex, term_index: TermIndex) -> Self {
-        let info = &index.information.terms[term_index];
+        let info = index.term_stats(term_index);
         Self {
             iterator: RefCell::new(CompressedIndexIterator::new(index, term_index)),
             current_min_docid: 0,
@@ -1478,7 +1656,7 @@ impl<'a> BlockTermImpactIterator for CompressedBlockTermImpactIterator<'a> {
         let iterator = self.iterator.get_mut();
         if iterator.move_iterator(min_doc_id) {
             // Cache block metadata (avoids RefCell borrow in tight loops)
-            let info = iterator.info.expect("Iterator has block");
+            let info = iterator.info.get().expect("Iterator has block");
             self.cached_block_min_doc_id = info.min_doc_id;
             self.cached_block_max_doc_id = info.max_doc_id;
             self.cached_block_max_value = info.max_value;
@@ -1514,7 +1692,7 @@ impl<'a> BlockTermImpactIterator for CompressedBlockTermImpactIterator<'a> {
             let mut iterator = self.iterator.borrow_mut();
             iterator.ensure_block_loaded();
 
-            let info = iterator.info.expect("Iterator has block");
+            let info = iterator.info.get().expect("Iterator has block");
             let min_offset = min_docid.saturating_sub(info.min_doc_id) as u32;
             let start = iterator.index;
             let pos = iterator.gallop_geq(start, min_offset).unwrap_or_else(|| {
@@ -1619,7 +1797,7 @@ impl<'a> BlockTermImpactIterator for CompressedBlockTermImpactIterator<'a> {
 impl CompressedIndex {
     /// Number of postings for a term (used as BM25's document frequency).
     pub(crate) fn term_length(&self, term_index: TermIndex) -> u64 {
-        self.information.terms[term_index].length as u64
+        self.term_stats(term_index).length as u64
     }
 
     /// Builds a monomorphized, scored cursor over a term's postings (P3):
@@ -1688,7 +1866,7 @@ const SCORE_CHUNK_SIZE: usize = 32;
 
 impl<'a, S: ScoringFunction> CompressedScoringCursor<'a, S> {
     fn new(index: &'a CompressedIndex, term_index: TermIndex, scorer: S) -> Self {
-        let info = &index.information.terms[term_index];
+        let info = index.term_stats(term_index);
         // Term-level bound tightened with the term's own min_dl (P1a).
         let max_value = scorer.max_score_with_dl(info.max_value, info.min_dl);
         Self {
@@ -1714,7 +1892,7 @@ impl<'a, S: ScoringFunction> CompressedScoringCursor<'a, S> {
     /// of the block) starting at `start_pos`.
     #[inline]
     fn fill_chunk(&mut self, start_pos: usize) {
-        let info = self.iterator.info.expect("block should be loaded");
+        let info = self.iterator.info.get().expect("block should be loaded");
         let end = (start_pos + SCORE_CHUNK_SIZE).min(self.iterator.docids.len());
         let n = end - start_pos;
         self.scorer.score_chunk(
@@ -1758,7 +1936,7 @@ impl<'a, S: ScoringFunction> TermCursor for CompressedScoringCursor<'a, S> {
         let prev_block_min_doc_id = self.cached_block_min_doc_id;
 
         if self.iterator.move_iterator(min_doc_id) {
-            let info = self.iterator.info.expect("Iterator has block");
+            let info = self.iterator.info.get().expect("Iterator has block");
             self.cached_block_min_doc_id = info.min_doc_id;
             self.cached_block_max_doc_id = info.max_doc_id;
             // Block-level bound tightened with this block's own min_dl (P1a).
@@ -1784,7 +1962,7 @@ impl<'a, S: ScoringFunction> TermCursor for CompressedScoringCursor<'a, S> {
         if !self.has_current || self.current_docid < min_docid {
             self.iterator.ensure_block_loaded();
 
-            let info = self.iterator.info.expect("Iterator has block");
+            let info = self.iterator.info.get().expect("Iterator has block");
             let min_offset = min_docid.saturating_sub(info.min_doc_id) as u32;
             let start = self.iterator.index;
             let pos = self
@@ -1851,10 +2029,23 @@ impl<'a, S: ScoringFunction> TermCursor for CompressedScoringCursor<'a, S> {
 impl SparseIndex for CompressedIndex {
     fn prefetch(&self, terms: &[TermIndex]) -> std::io::Result<()> {
         for &term in terms {
-            let Some(info) = self.information.terms.get(term) else {
-                continue;
+            #[cfg(feature = "lazy-pages")]
+            let pages = match &self.lazy {
+                Some(lazy) => match lazy.pages(term)? {
+                    Some(pages) => pages,
+                    None => continue,
+                },
+                None => match self.information.terms.get(term) {
+                    Some(info) => lazy::Pages::Borrowed(&info.pages),
+                    None => continue,
+                },
             };
-            if let (Some(first), Some(last)) = (info.pages.first(), info.pages.last()) {
+            #[cfg(not(feature = "lazy-pages"))]
+            let pages = match self.information.terms.get(term) {
+                Some(info) => &info.pages,
+                None => continue,
+            };
+            if let (Some(first), Some(last)) = (pages.first(), pages.last()) {
                 self.docid_buffer.prefetch(
                     first.docid_position_range.0 as usize,
                     last.docid_position_range.1 as usize,
@@ -1881,7 +2072,22 @@ impl SparseIndex for CompressedIndex {
         Box::new(CompressedBlockTermImpactIterator::new(self, term_index))
     }
 
+    fn term_postings(&self, term: TermIndex) -> usize {
+        #[cfg(feature = "lazy-pages")]
+        if let Some(lazy) = &self.lazy {
+            return lazy.term_postings(term);
+        }
+        self.information
+            .terms
+            .get(term)
+            .map_or(0, |info| info.length)
+    }
+
     fn max_doc_id(&self) -> DocId {
+        #[cfg(feature = "lazy-pages")]
+        if let Some(lazy) = &self.lazy {
+            return lazy.max_doc_id();
+        }
         self.information
             .terms
             .iter()
@@ -1938,13 +2144,13 @@ impl SparseIndex for CompressedIndex {
 
 impl SparseIndexInformation for CompressedIndex {
     fn value_range(&self, term_ix: TermIndex) -> (ImpactValue, ImpactValue) {
-        return (0., self.information.terms[term_ix].max_value);
+        return (0., self.term_stats(term_ix).max_value);
     }
 }
 
 impl Len for CompressedIndex {
     fn len(&self) -> usize {
-        self.information.terms.len()
+        self.num_terms()
     }
 }
 
@@ -2405,6 +2611,21 @@ struct CompressedIndexLoader {
     information: CompressedIndexInformation,
 }
 
+impl CompressedIndexLoader {
+    /// The block table: from the binary metadata (`index.bin`, compact) if
+    /// there, or else from the CBOR metadata (`self`)
+    fn read_information(
+        self,
+        files: &dyn IndexFiles,
+    ) -> std::io::Result<CompressedIndexInformation> {
+        if files.exists("index.bin") {
+            CompressedIndexInformation::read_binary(&mut files.open("index.bin")?)
+        } else {
+            Ok(self.information)
+        }
+    }
+}
+
 #[typetag::serde]
 impl IndexLoader for CompressedIndexLoader {
     /// Loads a block-based index. Prefers binary metadata (index.bin) if available.
@@ -2413,12 +2634,18 @@ impl IndexLoader for CompressedIndexLoader {
         files: &dyn IndexFiles,
         in_memory: bool,
     ) -> std::io::Result<Box<dyn SparseIndex>> {
-        // Try loading binary metadata (compact), fall back to CBOR (from self)
-        let information = if files.exists("index.bin") {
-            CompressedIndexInformation::read_binary(&mut files.open("index.bin")?)?
-        } else {
-            self.information
+        // A lazily read index decodes its block table term by term
+        #[cfg(feature = "lazy-pages")]
+        let (information, lazy) = match files.range_cache() {
+            Some(cache) if files.exists("index.bin") => {
+                let (information, lazy) =
+                    lazy::LazyBlocks::read(files.read_all("index.bin")?, cache.clone())?;
+                (information, Some(lazy))
+            }
+            _ => (Self::read_information(*self, files)?, None),
         };
+        #[cfg(not(feature = "lazy-pages"))]
+        let information = Self::read_information(*self, files)?;
 
         // Auto-detect auxiliary components
         let doc_meta = crate::docmeta::DocMetadata::load_from(files).ok();
@@ -2445,6 +2672,8 @@ impl IndexLoader for CompressedIndexLoader {
             doc_meta,
             analyzer_config,
             reorder_map,
+            #[cfg(feature = "lazy-pages")]
+            lazy,
         }))
     }
 }

@@ -319,6 +319,10 @@ impl SparseIndex for ScoredIndex {
         self.inner.prefetch(terms)
     }
 
+    fn term_postings(&self, term: TermIndex) -> usize {
+        self.inner.term_postings(term)
+    }
+
     fn block_iterator(&self, term_ix: TermIndex) -> Box<dyn BlockTermImpactIterator + '_> {
         if term_ix >= self.inner.len() {
             let inner_iter = self.inner.block_iterator(term_ix);

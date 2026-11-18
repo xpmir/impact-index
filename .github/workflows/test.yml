@@ -20,6 +20,8 @@ jobs:
         submodules: 'true'
     - run: rustup toolchain install nightly-2026-09-20 --profile minimal --component rustfmt,clippy
     - run: cargo test --features seismic
+    # The block table decoded by term (on in the WASM build), natively
+    - run: cargo test --features lazy-pages
     # Only the clippy.toml lints: file copies must go through src/utils/fs.rs
     - run: cargo clippy --all-targets --features seismic -- -A clippy::all -D clippy::disallowed_methods
 

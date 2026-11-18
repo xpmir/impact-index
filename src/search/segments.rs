@@ -50,9 +50,7 @@ pub struct SegmentScoredDocument {
 
 /// Total number of postings of `index`, which orders segment searches.
 pub fn segment_size(index: &dyn SparseIndex) -> usize {
-    (0..index.len())
-        .map(|t| index.block_iterator(t).length())
-        .sum()
+    (0..index.len()).map(|t| index.term_postings(t)).sum()
 }
 
 /// One segment: an index and the filter applied to it.

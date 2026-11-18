@@ -507,6 +507,25 @@ fn check_lazy_index(files: MemoryFiles) {
     let lazy =
         load_index_from_files(&ReaderFiles::new(reader.clone(), cache.clone()), true).unwrap();
 
+    // Index-level statistics, without reading postings nor decoding blocks
+    use impact_index::search::segments::segment_size;
+    let reads = reader.reads.load(Ordering::SeqCst);
+    assert_eq!(
+        SparseIndex::max_doc_id(&*lazy),
+        SparseIndex::max_doc_id(&*reference)
+    );
+    assert_eq!(segment_size(&*lazy), segment_size(&*reference));
+    for term in [
+        0,
+        reference.len() - 1,
+        reference.len(),
+        reference.len() + 10,
+    ] {
+        assert_eq!(lazy.term_postings(term), reference.term_postings(term));
+    }
+    assert_eq!(reader.reads.load(Ordering::SeqCst), reads);
+    assert_eq!(cache.bytes(), 0);
+
     let mut rng = Rng(17);
     for _ in 0..200 {
         let terms: Vec<TermIndex> = (0..4)
@@ -577,4 +596,95 @@ fn test_lazy_split_index() {
     .process(out.path(), &index)
     .unwrap();
     check_lazy_index(read_dir(out.path()));
+}
+
+/// The blocks of a lazily read index are decoded when a query uses them,
+/// cached with the postings, and evicted with them, even while an iterator
+/// still walks them
+#[cfg(feature = "lazy-pages")]
+#[test]
+fn test_lazy_blocks_evicted() {
+    use impact_index::storage::{RangeCache, ReaderFiles};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    let mut data = test_index();
+    let index = data.indexer.to_index(true);
+    let out = TempDir::new().unwrap();
+    compression().process(out.path(), &index).unwrap();
+    let files = read_dir(out.path());
+    let reference = load_index_from_files(&files, true).unwrap();
+    let reader = Arc::new(TestReader {
+        files,
+        reads: Default::default(),
+        fail: Default::default(),
+    });
+    let cache = Arc::new(RangeCache::new(0));
+    let lazy =
+        load_index_from_files(&ReaderFiles::new(reader.clone(), cache.clone()), true).unwrap();
+    assert_eq!(cache.bytes(), 0, "nothing decoded nor read when opening");
+    let reads = reader.reads.load(Ordering::SeqCst);
+
+    let term = (0..reference.len())
+        .max_by_key(|&t| reference.block_iterator(t).length())
+        .unwrap();
+    // Term statistics decode the blocks, without reading postings
+    cache.start_query();
+    assert_eq!(lazy.value_range(term), reference.value_range(term));
+    let decoded = cache.bytes();
+    assert!(decoded > 0);
+    assert_eq!(reader.reads.load(Ordering::SeqCst), reads);
+    lazy.prefetch(&[term]).unwrap();
+    assert!(cache.bytes() > decoded);
+    let mut iterator = lazy.block_iterator(term);
+
+    // Evicting everything, while the iterator still holds the blocks
+    cache.start_query();
+    cache.evict();
+    assert_eq!(cache.bytes(), 0);
+    check_same_index(
+        reference.block_iterator(term).as_mut(),
+        iterator.as_mut(),
+        0.,
+    );
+}
+
+/// Blocks read during a search (not prefetched), then their whole term
+/// prefetched: the cache holds the term once, not its blocks on top
+#[test]
+fn test_lazy_cache_nested_ranges() {
+    use impact_index::storage::{RangeCache, ReaderFiles};
+    use std::sync::Arc;
+
+    let mut data = test_index();
+    let index = data.indexer.to_index(true);
+    let out = TempDir::new().unwrap();
+    compression().process(out.path(), &index).unwrap();
+    let open = || {
+        let reader = Arc::new(TestReader {
+            files: read_dir(out.path()),
+            reads: Default::default(),
+            fail: Default::default(),
+        });
+        let cache = Arc::new(RangeCache::new(1 << 30));
+        let index = load_index_from_files(&ReaderFiles::new(reader, cache.clone()), true).unwrap();
+        (index, cache)
+    };
+    let (reference, _) = open();
+    let term = (0..reference.len())
+        .max_by_key(|&t| reference.term_postings(t))
+        .unwrap();
+
+    let (whole, whole_cache) = open();
+    whole_cache.start_query();
+    whole.prefetch(&[term]).unwrap();
+
+    let (blocks, blocks_cache) = open();
+    blocks_cache.start_query();
+    let mut iterator = blocks.block_iterator(term);
+    while iterator.next().is_some() {}
+    let read_by_block = blocks_cache.bytes();
+    assert!(read_by_block > 0);
+    blocks.prefetch(&[term]).unwrap();
+    assert_eq!(blocks_cache.bytes(), whole_cache.bytes());
 }

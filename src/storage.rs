@@ -8,6 +8,7 @@
 //! write through an [`IndexOutput`]: a directory ([`DirOutput`]) or memory
 //! ([`MemoryOutput`]).
 
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -40,6 +41,12 @@ pub trait IndexFiles: Send + Sync {
     fn describe(&self, name: &str) -> String;
 
     /// Reads the whole file `name`
+    /// The cache of lazily read files ([`ReaderFiles`]), where loaders can
+    /// also keep data decoded from them
+    fn range_cache(&self) -> Option<&Arc<RangeCache>> {
+        None
+    }
+
     fn read_all(&self, name: &str) -> io::Result<Vec<u8>> {
         let mut data = Vec::new();
         self.open(name)?.read_to_end(&mut data)?;
@@ -214,6 +221,10 @@ impl IndexFiles for SubFiles<'_> {
     fn describe(&self, name: &str) -> String {
         self.parent.describe(&self.path(name))
     }
+
+    fn range_cache(&self) -> Option<&Arc<RangeCache>> {
+        self.parent.range_cache()
+    }
 }
 
 /// Where the files of one index directory are written. Generic rather than
@@ -323,10 +334,27 @@ struct CachedRange {
     query: u64,
 }
 
+/// A cached object decoded from index files (e.g. the blocks of a term)
+struct CachedObject {
+    data: Arc<dyn Any + Send + Sync>,
+    size: usize,
+    /// Query during which the object was last used
+    query: u64,
+}
+
+/// What [`RangeCache::evict`] removes
+enum CacheKey {
+    Range(String, u64),
+    Object(u64, usize),
+}
+
 #[derive(Default)]
 struct CacheState {
     /// File name → start → range
     files: HashMap<String, BTreeMap<u64, CachedRange>>,
+    /// (owner, key) → object
+    objects: HashMap<(u64, usize), CachedObject>,
+    owners: u64,
     bytes: usize,
     query: u64,
     reads: u64,
@@ -353,31 +381,79 @@ impl RangeCache {
         self.state.lock().unwrap().query += 1;
     }
 
-    /// Evicts ranges of earlier queries, least recently used first, until
-    /// the cache fits in its capacity
+    /// Evicts ranges and objects of earlier queries, least recently used
+    /// first, until the cache fits in its capacity. Sorts all the entries
+    /// of earlier queries: fine for thousands of entries, a real LRU list
+    /// would be needed for much larger caches.
     pub fn evict(&self) {
         let mut state = self.state.lock().unwrap();
         if state.bytes <= self.capacity {
             return;
         }
         let current = state.query;
-        let mut old: Vec<(u64, String, u64, usize)> = state
-            .files
+        let ranges = state.files.iter().flat_map(|(name, ranges)| {
+            ranges
+                .iter()
+                .filter(|(_, r)| r.query < current)
+                .map(move |(&start, r)| {
+                    (r.query, CacheKey::Range(name.clone(), start), r.data.len())
+                })
+        });
+        let objects = state
+            .objects
             .iter()
-            .flat_map(|(name, ranges)| {
-                ranges
-                    .iter()
-                    .filter(|(_, r)| r.query < current)
-                    .map(move |(&start, r)| (r.query, name.clone(), start, r.data.len()))
-            })
-            .collect();
-        old.sort_unstable();
-        for (_, name, start, size) in old {
+            .filter(|(_, o)| o.query < current)
+            .map(|(&(owner, key), o)| (o.query, CacheKey::Object(owner, key), o.size));
+        let mut old: Vec<(u64, CacheKey, usize)> = ranges.chain(objects).collect();
+        old.sort_unstable_by_key(|(query, _, _)| *query);
+        for (_, key, size) in old {
             if state.bytes <= self.capacity {
                 break;
             }
-            state.files.get_mut(&name).unwrap().remove(&start);
+            match key {
+                CacheKey::Range(name, start) => {
+                    state.files.get_mut(&name).unwrap().remove(&start);
+                }
+                CacheKey::Object(owner, key) => {
+                    state.objects.remove(&(owner, key));
+                }
+            }
             state.bytes -= size;
+        }
+    }
+
+    /// A new owner id, for [`Self::get_object`] and [`Self::insert_object`]
+    pub fn new_owner(&self) -> u64 {
+        let mut state = self.state.lock().unwrap();
+        state.owners += 1;
+        state.owners
+    }
+
+    /// The object `key` of `owner`, marked as used
+    pub fn get_object(&self, owner: u64, key: usize) -> Option<Arc<dyn Any + Send + Sync>> {
+        let mut state = self.state.lock().unwrap();
+        let query = state.query;
+        let object = state.objects.get_mut(&(owner, key))?;
+        object.query = query;
+        Some(object.data.clone())
+    }
+
+    /// Caches the object `key` of `owner`, counted as `size` bytes
+    pub fn insert_object(
+        &self,
+        owner: u64,
+        key: usize,
+        data: Arc<dyn Any + Send + Sync>,
+        size: usize,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        let query = state.query;
+        state.bytes += size;
+        if let Some(old) = state
+            .objects
+            .insert((owner, key), CachedObject { data, size, query })
+        {
+            state.bytes -= old.size;
         }
     }
 
@@ -402,24 +478,38 @@ impl RangeCache {
         })
     }
 
+    /// Caches a range, replacing the cached ranges it contains (e.g. the
+    /// blocks of a term read during a search, before the term is prefetched
+    /// whole), so that their bytes are not held twice. Ranges that only
+    /// overlap the new one are kept: reads are per term or per block, so
+    /// ranges are either nested or disjoint.
     fn insert(&self, name: &str, start: u64, data: Vec<u8>) -> Arc<Vec<u8>> {
         let data = Arc::new(data);
+        let end = start + data.len() as u64;
         let mut state = self.state.lock().unwrap();
         let query = state.query;
-        state.bytes += data.len();
-        let range = CachedRange {
-            end: start + data.len() as u64,
-            data: data.clone(),
-            query,
-        };
-        if let Some(old) = state
-            .files
-            .entry(name.to_string())
-            .or_default()
-            .insert(start, range)
-        {
-            state.bytes -= old.data.len();
+        let ranges = state.files.entry(name.to_string()).or_default();
+        let contained: Vec<u64> = ranges
+            .range(start..end.max(start + 1))
+            .filter(|(_, r)| r.end <= end)
+            .map(|(&s, _)| s)
+            .collect();
+        let mut freed = 0;
+        for s in contained {
+            freed += ranges.remove(&s).unwrap().data.len();
         }
+        // A longer range at the same start is replaced too
+        if let Some(old) = ranges.insert(
+            start,
+            CachedRange {
+                end,
+                data: data.clone(),
+                query,
+            },
+        ) {
+            freed += old.data.len();
+        }
+        state.bytes = state.bytes - freed + data.len();
         data
     }
 
@@ -519,6 +609,10 @@ impl IndexFiles for ReaderFiles {
 
     fn describe(&self, name: &str) -> String {
         name.to_string()
+    }
+
+    fn range_cache(&self) -> Option<&Arc<RangeCache>> {
+        Some(&self.cache)
     }
 }
 

@@ -49,7 +49,10 @@ When bumping the nightly, update `rust-toolchain.toml` and the
 Depends on the root crate with `--no-default-features` (features `python`,
 `mmap`, `parallel`, `progress`, `zstd`, `bmp`, `analysis`,
 `analysis-download`, `analysis-cjk` are left out; all on by default and
-implied by `python`). `analysis` (pure Rust) also builds for WASM;
+implied by `python`) and with `lazy-pages` (off by default: `index.bin`
+decoded per term for indexes read through `storage::ReaderFiles`; the
+iterators then share their blocks with the cache instead of borrowing
+them, so test it with `cargo test --features lazy-pages`). `analysis` (pure Rust) also builds for WASM;
 `analysis-download` (ureq/ring) does not. `sucds` is 64-bit only: `src/compress/elias_fano.rs` is a
 byte-compatible Elias-Fano codec used on 32-bit targets.
 ```bash

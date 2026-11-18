@@ -168,10 +168,15 @@ cache size.
 Each search first reads the lists it needs, so a read error (e.g. a deleted
 file) is thrown by ``search``, and the index can be searched again once the
 file is back. Compressed and split indexes (including positions) are read
-lazily; ``SegmentedIndex`` accepts lazy and loaded segments alike. On 10M
-postings (12.8 MB of files), ``open`` takes 9 MB of WASM memory (the term
-and block table) against 21 MB for ``load``, and a 30-term query 0.34 ms
-instead of 0.23 ms (Node.js, files in the OS cache).
+lazily; ``SegmentedIndex`` accepts lazy and loaded segments alike.
+
+The block table (``index.bin``, a few percent of the index) stays as read:
+the blocks of a term are decoded when a query uses it, and cached (and
+evicted) with its posting lists. On 10M postings (12.8 MB of files, 1.5 MB
+of ``index.bin``), ``open`` takes 2.9 MB of WASM memory against 21 MB for
+``load``, and a 30-term query 0.35 ms instead of 0.22 ms (Node.js, files in
+the OS cache); after 200 queries with an 8 MiB cache, the WASM memory is
+8.3 MB.
 
 Incremental indexing
 --------------------
@@ -247,8 +252,8 @@ Limits
 Rust features
 -------------
 
-The WASM crate depends on ``impact-index`` without its default features.
-They can also be disabled in other Rust projects:
+The WASM crate depends on ``impact-index`` without its default features,
+and with ``lazy-pages``. They can also be disabled in other Rust projects:
 
 ``python``
     Python bindings
@@ -263,6 +268,11 @@ They can also be disabled in other Rust projects:
     is a C library); key-only stores do not need it
 ``bmp``
     conversion to BMP indexes and CIFF export
+``lazy-pages`` (off by default)
+    indexes read through a ranged reader (``storage::ReaderFiles``, as
+    ``Index.open``) decode their block table term by term, cached with the
+    posting lists; on in the WASM build. Without it, such indexes decode
+    the whole table when opened
 ``analysis``
     text analyzers (tokenizers, stemmers, stop words, Lucene analyzers,
     ICU4X word segmentation); pure Rust, it also builds for WASM, but the

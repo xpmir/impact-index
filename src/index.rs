@@ -412,6 +412,14 @@ pub trait SparseIndex: Send + Sync + SparseIndexView + AsSparseIndexView {
         false
     }
 
+    /// Number of postings of a term (0 if out of range). The default
+    /// creates the term's iterator; indexes override it when they can
+    /// answer without (e.g. without decoding the blocks of a lazily read
+    /// index).
+    fn term_postings(&self, term: TermIndex) -> usize {
+        self.block_iterator(term).length()
+    }
+
     /// Loads the postings of `terms` ahead of a search, for an index whose
     /// files are read lazily ([`crate::storage::ReaderFiles`]): read errors
     /// surface here, as errors, instead of during the search. Does nothing
