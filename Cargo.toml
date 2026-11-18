@@ -15,7 +15,6 @@ exclude = ["BMP/python"]
 name = "impact_index"
 crate-type = ["cdylib", "rlib"]
 bench = false
-test = false
 
 [features]
 # Everything a native build has always had; the WASM build
@@ -135,7 +134,7 @@ pyo3-async-runtimes = { version = "0.28", features = ["attributes", "tokio-runti
 pyo3-log = { version = "0.13", optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 numpy = { version = "0.28", optional = true }
-ndarray = { version = "0.15.4", features = [ "serde" ] }
+ndarray = { version = "0.16", features = [ "serde" ] }
 serde = { version = "^1.0", features = ["derive"] }
 simple-error = "0.2.3"
 typetag = "0.2"

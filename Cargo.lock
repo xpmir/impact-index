@@ -1343,7 +1343,7 @@ version = "0.0.1"
 dependencies = [
  "impact-index",
  "log",
- "ndarray 0.15.6",
+ "ndarray",
  "ntest",
  "rand 0.8.5",
  "rand_distr",
@@ -1590,7 +1590,7 @@ dependencies = [
  "lindera",
  "log",
  "memmap2 0.5.8",
- "ndarray 0.15.6",
+ "ndarray",
  "ntest",
  "numpy",
  "ouroboros",
@@ -2089,20 +2089,6 @@ dependencies = [
 
 [[package]]
 name = "ndarray"
-version = "0.15.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adb12d4e967ec485a5f71c6311fe28158e9d6f4bc4a447b474184d0f91a8fa32"
-dependencies = [
- "matrixmultiply",
- "num-complex",
- "num-integer",
- "num-traits",
- "rawpointer",
- "serde",
-]
-
-[[package]]
-name = "ndarray"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "882ed72dce9365842bf196bdeedf5055305f11fc8c03dee7bb0194a6cad34841"
@@ -2114,6 +2100,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "rawpointer",
+ "serde",
 ]
 
 [[package]]
@@ -2123,7 +2110,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b313788c468c49141a9d9b6131fc15f403e6ef4e8446a0b2e18f664ddb278a9"
 dependencies = [
  "byteorder",
- "ndarray 0.16.1",
+ "ndarray",
  "num-complex",
  "num-traits",
  "py_literal",
@@ -2295,7 +2282,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "778da78c64ddc928ebf5ad9df5edf0789410ff3bdbf3619aed51cd789a6af1e2"
 dependencies = [
  "libc",
- "ndarray 0.15.6",
+ "ndarray",
  "num-complex",
  "num-integer",
  "num-traits",
@@ -4121,7 +4108,7 @@ dependencies = [
  "half 2.7.1",
  "itertools 0.14.0",
  "matrixmultiply",
- "ndarray 0.16.1",
+ "ndarray",
  "ndarray-npy",
  "num-traits",
  "rand 0.8.5",
