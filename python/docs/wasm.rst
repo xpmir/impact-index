@@ -99,6 +99,39 @@ asynchronous writes, and wait for the queue before loading the index or
 writing anything that refers to it. An exception thrown by a callback aborts
 ``finish`` with that error; the builder can be finished again.
 
+Spilling builder
+~~~~~~~~~~~~~~~~
+
+By default, ``Builder`` keeps every posting in the WASM memory until
+``finish`` (about 8 bytes each). With the ``spill`` option, postings over a
+memory budget go to a scratch file of the caller's, appended to through
+``write``, and are read back by ``finish``:
+
+.. code-block:: javascript
+
+    const builder = new Builder({
+        range: { min: 0, max: 3 },
+        spill: {
+            budget: 16 << 20,               // bytes of postings (64 MiB)
+            write(bytes) { queue.push(bytes); },  // append, in order
+        },
+    });
+    // ... builder.add(...) ...
+    await drain(queue);  // every spill write must be done
+    builder.finish(output, (offset, length) => readSync(scratch, offset, length));
+    // then delete the scratch file
+
+When the postings exceed ``budget``, the largest posting lists are appended
+to the scratch file until half the budget remains. ``finish`` reads them
+back term by term, through read-ahead buffers that also fit in ``budget``,
+so a 16 MiB budget costs a few dozen reads for 10M postings. The WASM memory
+still reaches about twice the budget (allocator slack, per-term data), plus
+what ``finish`` needs for the term table. ``builder.memoryBytes`` and
+``builder.spilledBytes`` give the current sizes.
+
+An exception in ``write`` leaves the builder unusable (the scratch file is
+incomplete): later calls fail, and the index must be built again.
+
 ``Index.load`` accepts any compressed or split index, and forward indexes,
 with file names relative to the index directory (e.g. ``inner/docids.dat``
 for a split index). Search uses MaxScore. Document ids are returned as a
@@ -164,7 +197,9 @@ Limits
   index files plus some 30 MB. On 200k synthetic documents (45 MB index),
   a top-100 search takes 1-3 ms in Node.js.
 - ``Builder`` keeps the postings in memory until ``finish``, at about 8
-  bytes per posting (10M postings: ~80 MB), plus the compressed files.
+  bytes per posting (10M postings: ~80 MB), plus the compressed files,
+  unless the postings are spilled (``spill`` option) and the files streamed
+  (``finish(output)``).
 - Not available in WASM: BM25 / text indexing, positions and structured
   queries, document contents (key-only stores work), BMP and Seismic, and
   builder checkpoints.

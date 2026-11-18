@@ -167,6 +167,55 @@ if (fixture.docs) {
   } catch (e) {}
   if (builder.finish().size !== built.size) failures++;
 
+  // Spilling builder: postings over the budget go to a scratch stream,
+  // read back by finish; same files
+  {
+    const parts = [];
+    let scratchSize = 0;
+    const spilling = new Builder({
+      docids: "ef", nbits: 8, range: { min: 0, max: 3 }, blockSize: 128,
+      spill: { budget: 100_000, write(bytes) { parts.push(bytes); scratchSize += bytes.length; } },
+    });
+    let maxMemory = 0;
+    fixture.docs.forEach(([terms, values], docid) => {
+      spilling.add(docid, new Uint32Array(terms), new Float32Array(values));
+      maxMemory = Math.max(maxMemory, spilling.memoryBytes);
+    });
+    const scratch = new Uint8Array(scratchSize);
+    let offset = 0;
+    for (const p of parts) { scratch.set(p, offset); offset += p.length; }
+    let reads = 0;
+    try {
+      spilling.finish();
+      failures++;
+      console.error("finish without readSpill accepted");
+    } catch (e) {}
+    const files = spilling.finish(undefined, (offset, length) => { reads++; return scratch.slice(offset, offset + length); });
+    console.log(`spilling build: ${(scratchSize / 2 ** 20).toFixed(1)} MB spilled, ${reads} reads, max ${maxMemory} bytes in memory`);
+    if (scratchSize !== spilling.spilledBytes || maxMemory > 100_000 + 10_000 ||
+        names(files) !== names(built) || [...built].some(([n, b]) => n !== "manifest.json" && (files.get(n).length !== b.length || files.get(n).some((x, i) => x !== b[i])))) {
+      failures++;
+      console.error("spilling build differs", scratchSize, spilling.spilledBytes, maxMemory);
+    }
+    // Read errors surface as exceptions
+    for (const bad of [() => { throw new Error("gone"); }, () => new Uint8Array(3), () => "x"]) {
+      try {
+        spilling.finish(undefined, bad);
+        failures++;
+        console.error("bad readSpill accepted");
+      } catch (e) {}
+    }
+    // A write error leaves the builder unusable (scratch stream incomplete)
+    const broken = new Builder({ spill: { budget: 0, write() { throw new Error("disk full"); } } });
+    try { broken.add(0, new Uint32Array([1]), new Float32Array([1])); failures++; } catch (e) {}
+    try {
+      broken.add(1, new Uint32Array([1]), new Float32Array([1]));
+      failures++;
+    } catch (e) {
+      if (!e.message.includes("unusable")) { failures++; console.error(e.message); }
+    }
+  }
+
   // A segment quantised like the first one
   const segment = new Builder({ range: compressed.quantizer() });
   segment.add(0, new Uint32Array([1, 2]), new Float32Array([0.5, 3.5]));

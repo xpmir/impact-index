@@ -49,6 +49,7 @@ pub mod docmeta;
 pub mod docstore;
 pub mod index;
 pub mod manifest;
+pub mod memory_indexer;
 pub mod query;
 pub mod scoring;
 pub mod search;

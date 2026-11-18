@@ -28,17 +28,17 @@ use impact_index::compress::{
 };
 use impact_index::docstore::keys::KeyStoreBuilder as KeyStoreBuilderInner;
 use impact_index::docstore::store::{ContentAccess, DocumentStore as StoreInner};
-use impact_index::index::SparseIndex;
+use impact_index::index::{SparseIndex, SparseIndexView};
 use impact_index::search::filter::{DocBitSet, Exclude};
 use impact_index::search::maxscore::{search_maxscore_filtered, MaxScoreOptions};
 use impact_index::search::segments::{segment_size, Segment, SegmentedSearch};
-use impact_index::storage::{IndexOutput, MemoryFiles, MemoryOutput};
+use impact_index::storage::{MemoryFiles, MemoryOutput};
 use js_sys::{Array, Map, Object, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
 mod io;
-use io::JsOutput;
+use io::{JsOutput, JsSpillReader, JsSpillWriter};
 
 #[cfg(target_family = "wasm")]
 extern "C" {
@@ -401,6 +401,10 @@ pub struct Builder {
     nbits: Option<u32>,
     range: QuantizationRange,
     clamped: Option<u64>,
+    /// Spill memory budget (bytes) and scratch stream writer
+    spill: Option<(usize, js_sys::Function)>,
+    /// Set when spilling failed: the scratch stream is then unusable
+    broken: Option<String>,
 }
 
 #[wasm_bindgen]
@@ -415,6 +419,11 @@ impl Builder {
     ///   exactly comparable across indexes built with the same range), or a
     ///   `Quantizer` of another index (to build segments comparable with
     ///   it); by default, the range of the indexed impacts
+    /// - `spill`: `{budget, write(bytes)}`, to bound the memory used by
+    ///   postings: when they exceed `budget` bytes (64 MiB), the largest
+    ///   posting lists are moved to the end of a scratch stream through
+    ///   `write` (synchronous, append-only, `bytes` a copy), down to half the
+    ///   budget; `finish` then needs `readSpill` to read them back
     #[wasm_bindgen(constructor)]
     pub fn new(options: JsValue) -> Result<Builder, JsError> {
         let block_size = number_option(&options, "blockSize")?.unwrap_or(128.) as usize;
@@ -469,6 +478,18 @@ impl Builder {
                 }
             }
         };
+        let spill = match option(&options, "spill")? {
+            None => None,
+            Some(spill) => {
+                let budget = number_option(&spill, "budget")?.unwrap_or((64 << 20) as f64);
+                if budget.is_nan() || budget < 0. {
+                    return Err(JsError::new("spill.budget must be a number of bytes"));
+                }
+                let write = io::method(&spill, "write")?
+                    .ok_or_else(|| JsError::new("spill needs a write(bytes) method"))?;
+                Some((budget as usize, write))
+            }
+        };
         Ok(Builder {
             indexer: MemoryIndexer::new(),
             block_size,
@@ -476,15 +497,46 @@ impl Builder {
             nbits,
             range,
             clamped: None,
+            spill,
+            broken: None,
         })
     }
 
     /// Adds a document; document ids must be increasing
     pub fn add(&mut self, docid: u32, terms: &[u32], weights: &[f32]) -> Result<(), JsError> {
+        self.check_usable()?;
         let terms: Vec<TermIndex> = terms.iter().map(|&t| t as TermIndex).collect();
         self.indexer
             .add(docid as u64, &terms, weights)
-            .map_err(js_error)
+            .map_err(js_error)?;
+        if let Some((budget, write)) = &self.spill {
+            if self.indexer.memory_bytes() > *budget {
+                let mut out =
+                    std::io::BufWriter::with_capacity(1 << 20, JsSpillWriter(write.clone()));
+                let result = self
+                    .indexer
+                    .spill(budget / 2, &mut out)
+                    .and_then(|_| std::io::Write::flush(&mut out));
+                if let Err(e) = result {
+                    let message = format!("spilling failed, the builder is unusable: {e}");
+                    self.broken = Some(message.clone());
+                    return Err(JsError::new(&message));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Bytes of postings held in the WASM memory (spilled ones excluded)
+    #[wasm_bindgen(getter, js_name = memoryBytes)]
+    pub fn memory_bytes(&self) -> f64 {
+        self.indexer.memory_bytes() as f64
+    }
+
+    /// Bytes written to the scratch stream (see the `spill` option)
+    #[wasm_bindgen(getter, js_name = spilledBytes)]
+    pub fn spilled_bytes(&self) -> f64 {
+        self.indexer.spilled_bytes() as f64
     }
 
     /// Number of postings added so far
@@ -502,6 +554,10 @@ impl Builder {
     /// return value ignored (queue asynchronous writes, and wait for the
     /// queue before using the files); `bytes` is a copy, safe to keep. An
     /// exception in a callback aborts `finish` with that error.
+    ///
+    /// If postings were spilled (`spill` option), `readSpill(offset,
+    /// length)` must return those bytes of the scratch stream, synchronously
+    /// (all spill writes must have completed).
     #[wasm_bindgen(unchecked_return_type = "Map<string, Uint8Array> | undefined")]
     pub fn finish(
         &mut self,
@@ -509,7 +565,10 @@ impl Builder {
             unchecked_param_type = "{create?(name: string): void, write(name: string, bytes: Uint8Array): void, close?(name: string): void, chunkSize?: number}"
         )]
         output: Option<JsValue>,
+        #[wasm_bindgen(js_name = readSpill, unchecked_param_type = "(offset: number, length: number) => Uint8Array")]
+        read_spill: Option<js_sys::Function>,
     ) -> Result<JsValue, JsError> {
+        self.check_usable()?;
         if self.indexer.num_postings() == 0 {
             return Err(JsError::new("no postings to index"));
         }
@@ -517,17 +576,42 @@ impl Builder {
         #[cfg(target_family = "wasm")]
         impact_index::manifest::set_unix_time((js_sys::Date::now() / 1000.) as u64);
 
-        match output.filter(|o| !o.is_undefined() && !o.is_null()) {
+        let reader = match (self.indexer.is_spilled(), read_spill) {
+            (false, _) => None,
+            (true, Some(read)) => Some(JsSpillReader(read)),
+            (true, None) => {
+                return Err(JsError::new(
+                    "postings were spilled: finish needs readSpill(offset, length)",
+                ))
+            }
+        };
+        // Read-ahead within the spill budget, the memory the caller allowed
+        let read_ahead = self.spill.as_ref().map_or(0, |(budget, _)| *budget);
+        let spilled = reader
+            .as_ref()
+            .map(|r| self.indexer.with_spill(r, read_ahead));
+        let index: &dyn SparseIndexView = match &spilled {
+            Some(spilled) => spilled,
+            None => &self.indexer,
+        };
+        let transform = self.transform();
+        let (files, report) = match output.filter(|o| !o.is_undefined() && !o.is_null()) {
             Some(output) => {
-                self.compress_to(&JsOutput::new(&output)?)?;
-                Ok(JsValue::UNDEFINED)
+                let out = JsOutput::new(&output)?;
+                (JsValue::UNDEFINED, transform.compress_to(&out, index))
             }
             None => {
                 let out = MemoryOutput::new();
-                self.compress_to(&out)?;
-                Ok(files_map(&out.into_files()).into())
+                let report = transform.compress_to(&out, index);
+                (files_map(&out.into_files()).into(), report)
             }
+        };
+        // A read error first: it explains any other
+        if let Some(spilled) = &spilled {
+            spilled.check().map_err(js_error)?;
         }
+        self.clamped = Some(report.map_err(js_error)?.clamped_impacts);
+        Ok(files)
     }
 
     /// Number of impacts clamped to the quantisation range by `finish`
@@ -539,7 +623,14 @@ impl Builder {
 }
 
 impl Builder {
-    fn compress_to<O: IndexOutput>(&mut self, out: &O) -> Result<(), JsError> {
+    fn check_usable(&self) -> Result<(), JsError> {
+        match &self.broken {
+            Some(message) => Err(JsError::new(message)),
+            None => Ok(()),
+        }
+    }
+
+    fn transform(&self) -> CompressionTransform {
         let doc_ids_compressor_factory: Box<dyn DocIdCompressorFactory> = match self.docids.as_str()
         {
             "ef" => Box::new(EliasFanoCompressor {}),
@@ -554,17 +645,12 @@ impl Builder {
                 codec: QuantizerCodec::BitPacked,
             }),
         };
-        let transform = CompressionTransform {
+        CompressionTransform {
             max_block_size: self.block_size,
             doc_ids_compressor_factory,
             impacts_compressor_factory,
             positions_codec: None,
-        };
-        let report = transform
-            .compress_to(out, &self.indexer)
-            .map_err(js_error)?;
-        self.clamped = Some(report.clamped_impacts);
-        Ok(())
+        }
     }
 }
 

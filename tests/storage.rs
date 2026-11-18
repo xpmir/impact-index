@@ -389,3 +389,81 @@ fn test_memory_indexer_docid_gaps() {
     assert_eq!(memory.num_postings(), 2 * docids.len());
     assert_eq!(memory.max_doc_id(), u64::MAX);
 }
+
+/// Compressed files of `index`, without the manifest (creation time)
+fn compressed_files(
+    index: &dyn impact_index::index::SparseIndexView,
+) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+    let transform = CompressionTransform {
+        max_block_size: 32,
+        doc_ids_compressor_factory: Box::new(PForCompressor {}),
+        impacts_compressor_factory: Box::new(RangedQuantizerFactory {
+            nbits: 8,
+            range: QuantizationRange::PerIndex,
+            codec: QuantizerCodec::BitPacked,
+        }),
+        positions_codec: None,
+    };
+    let out = MemoryOutput::new();
+    transform.compress_to(&out, index)?;
+    let files = out.into_files();
+    let mut result: Vec<(String, Vec<u8>)> = files
+        .names()
+        .filter(|n| *n != "manifest.json")
+        .map(|n| (n.to_string(), files.get_bytes(n).unwrap().to_vec()))
+        .collect();
+    result.sort();
+    Ok(result)
+}
+
+#[test]
+fn test_memory_indexer_spill() {
+    let mut rng = Rng(5);
+    let docs = random_docs(&mut rng, 3000);
+    let mut reference = MemoryIndexer::new();
+    for (docid, terms, values) in &docs {
+        reference.add(*docid, terms, values).unwrap();
+    }
+    let expected = compressed_files(&reference).unwrap();
+
+    // Spilling down to `target` whenever over `budget`, as the WASM builder
+    for (budget, target) in [(0, 0), (500, 250), (20_000, 10_000), (1 << 30, 0)] {
+        let mut memory = MemoryIndexer::new();
+        let mut scratch: Vec<u8> = Vec::new();
+        let mut max_memory = 0;
+        for (docid, terms, values) in &docs {
+            memory.add(*docid, terms, values).unwrap();
+            if memory.memory_bytes() > budget {
+                memory.spill(target, &mut scratch).unwrap();
+                assert!(memory.memory_bytes() <= target);
+            }
+            max_memory = max_memory.max(memory.memory_bytes());
+        }
+        if budget == 1 << 30 {
+            memory.spill(0, &mut scratch).unwrap();
+        }
+        assert!(memory.is_spilled());
+        assert_eq!(memory.spilled_bytes(), scratch.len() as u64);
+        assert_eq!(memory.num_postings(), reference.num_postings());
+        for read_ahead in [0, 100, 5000, 1 << 30] {
+            let spilled = memory.with_spill(&scratch, read_ahead);
+            assert!(
+                compressed_files(&spilled).unwrap() == expected,
+                "budget {budget}, read ahead {read_ahead}"
+            );
+            spilled.check().unwrap();
+        }
+
+        // Read errors are reported, not panics
+        for bad in [
+            scratch[..scratch.len() / 2].to_vec(),
+            scratch.iter().map(|_| 0x80).collect(),
+        ] {
+            for read_ahead in [0, 5000] {
+                let spilled = memory.with_spill(&bad, read_ahead);
+                let _ = compressed_files(&spilled);
+                assert!(spilled.check().is_err(), "budget {budget}");
+            }
+        }
+    }
+}

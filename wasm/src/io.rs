@@ -149,3 +149,42 @@ impl IndexOutput for JsOutput {
         name.to_string()
     }
 }
+
+/// Appends to the caller's scratch stream through `write(bytes)` (a copy)
+pub(crate) struct JsSpillWriter(pub(crate) Function);
+
+impl Write for JsSpillWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .call1(&JsValue::NULL, &Uint8Array::from(buf))
+            .map_err(|e| js_io_error("spill", "write", &e))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Reads the scratch stream back through `read(offset, length)`
+pub(crate) struct JsSpillReader(pub(crate) Function);
+
+// wasm32-unknown-unknown without atomics is single-threaded: the JS
+// function is never shared between threads
+unsafe impl Sync for JsSpillReader {}
+
+impl impact_index::memory_indexer::SpillReader for JsSpillReader {
+    fn read(&self, offset: u64, length: usize) -> io::Result<Vec<u8>> {
+        let bytes = self
+            .0
+            .call2(
+                &JsValue::NULL,
+                &JsValue::from_f64(offset as f64),
+                &JsValue::from_f64(length as f64),
+            )
+            .map_err(|e| js_io_error("spill", "read", &e))?
+            .dyn_into::<Uint8Array>()
+            .map_err(|_| io::Error::other("spill: read must return a Uint8Array"))?;
+        Ok(bytes.to_vec())
+    }
+}
