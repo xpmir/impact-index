@@ -251,17 +251,32 @@ pub struct Index {
     cache: Option<Arc<RangeCache>>,
 }
 
-/// Reads the postings of `terms` ahead of a search, for an index read
-/// lazily: read errors surface here, as exceptions
-fn prefetch(
-    index: &dyn SparseIndex,
-    cache: &Option<Arc<RangeCache>>,
+/// Reads the postings of `terms` ahead of a search, for the indexes read
+/// lazily: read errors surface here, as exceptions. Each cache starts a
+/// single query, so that the data prefetched for one index is not evicted
+/// for another index sharing its cache (e.g. a segment pushed twice).
+fn prefetch<'a>(
+    indexes: impl IntoIterator<Item = (&'a dyn SparseIndex, &'a Option<Arc<RangeCache>>)>,
     terms: &HashMap<TermIndex, ImpactValue>,
 ) -> Result<(), JsError> {
-    if let Some(cache) = cache {
-        let terms: Vec<TermIndex> = terms.keys().copied().collect();
+    let lazy: Vec<(&dyn SparseIndex, &Arc<RangeCache>)> = indexes
+        .into_iter()
+        .filter_map(|(index, cache)| Some((index, cache.as_ref()?)))
+        .collect();
+    let mut caches: Vec<&Arc<RangeCache>> = Vec::new();
+    for &(_, cache) in &lazy {
+        if !caches.iter().any(|c| Arc::ptr_eq(c, cache)) {
+            caches.push(cache);
+        }
+    }
+    let terms: Vec<TermIndex> = terms.keys().copied().collect();
+    for cache in &caches {
         cache.start_query();
+    }
+    for (index, _) in lazy {
         index.prefetch(&terms).map_err(js_error)?;
+    }
+    for cache in caches {
         cache.evict();
     }
     Ok(())
@@ -341,7 +356,7 @@ impl Index {
         deleted: Option<DocSet>,
     ) -> Result<SearchResults, JsError> {
         let query = query(terms, weights)?;
-        prefetch(&*self.inner, &self.cache, &query)?;
+        prefetch([(&*self.inner, &self.cache)], &query)?;
         let deleted = deleted.map(|d| d.inner);
         let results = search_maxscore_filtered(
             &*self.inner,
@@ -413,9 +428,13 @@ impl SegmentedIndex {
         k: usize,
     ) -> Result<SearchResults, JsError> {
         let query = query(terms, weights)?;
-        for (index, cache) in self.indexes.iter().zip(&self.caches) {
-            prefetch(&**index, cache, &query)?;
-        }
+        prefetch(
+            self.indexes
+                .iter()
+                .zip(&self.caches)
+                .map(|(index, cache)| (&**index, cache)),
+            &query,
+        )?;
         let segments = self
             .indexes
             .iter()
