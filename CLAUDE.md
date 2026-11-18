@@ -59,6 +59,12 @@ wasm/tests/check.sh   # WASM vs native results and builds (needs node)
 ```
 `wasm-bindgen-cli` must match the `wasm-bindgen` version in `Cargo.lock`.
 
+### ICU4X segmentation data
+The dictionaries of the `icu` tokenizer / Thai analyzer are not built in
+(they would add ~3 MB): `src/vocab/icu.rs` downloads the official ICU4X
+`full.postcard` release asset on demand. When bumping `icu_segmenter`, bump
+`ICU4X_VERSION` and `SHA256` there together (digest on the release page).
+
 ### Python Bindings (BMP)
 ```bash
 # Build and install (from BMP/python directory)

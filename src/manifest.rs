@@ -369,23 +369,6 @@ pub fn detect_index_kind(path: &Path) -> IndexKind {
     }
 }
 
-/// Recursively copies a directory tree. Used by [`update_index`] when
-/// migrating into a separate destination rather than in place.
-fn copy_dir_all(src: &Path, dst: &Path) -> io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let dst_path = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_all(&entry.path(), &dst_path)?;
-        } else {
-            std::fs::copy(entry.path(), dst_path)?;
-        }
-    }
-    Ok(())
-}
-
 /// v0 (legacy / absent manifest) -> v1.
 ///
 /// v1 is the format every reader in this build already understands, so
@@ -503,7 +486,7 @@ fn migrate_v2_to_v3(path: &Path) -> io::Result<()> {
 pub fn update_index(path: &Path, dest: Option<&Path>) -> io::Result<PathBuf> {
     let target: PathBuf = match dest {
         Some(d) if d != path => {
-            copy_dir_all(path, d)?;
+            crate::utils::fs::copy_dir_all(path, d)?;
             d.to_path_buf()
         }
         Some(d) => d.to_path_buf(),

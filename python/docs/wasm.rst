@@ -129,8 +129,10 @@ Limits
 - Not available in WASM: BM25 / text indexing, positions and structured
   queries, document contents (key-only stores work), BMP and Seismic, and
   builder checkpoints.
-- Licence: GPL-2.0-or-later, like the rest of the library; a WASM bundle
-  that includes it must be distributed under the GPL.
+- Licence: MIT OR Apache-2.0, like the rest of the library (the npm
+  package ships ``LICENSE-MIT``, ``LICENSE-APACHE`` and ``NOTICE``). The
+  Lucene-derived analysis code, Apache-2.0 only, is not part of the WASM
+  build.
 
 Rust features
 -------------

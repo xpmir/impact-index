@@ -8,7 +8,7 @@ Supports both neural IR models with floating-point impact scores and traditional
 
 ## Features
 
-- **BM25 bag-of-words indexing** with built-in tokenization, stemming (Snowball), and stop words: Lucene-family lists (17 languages) or Terrier's own, much longer list (English only) — see [Stop Words](#stop-words)
+- **BM25 bag-of-words indexing** with built-in tokenization, Pyserini-aligned analyzers for other languages than English (`pipeline="pyserini", language=...`: ports of the Lucene analyzers Anserini uses, e.g. for the MIRACL languages), stemming (Snowball), and stop words: Lucene-family lists (23 languages) or Terrier's own, much longer list (English only) — see [Stop Words](#stop-words)
 - **Block-Max MaxScore and BMW (Block-Max WAND)** search with early termination
 - **SIMD bitpacking compression** (BitPacker4x) with quantized impacts and reusable block buffers
 - **One-liner compression**: `index.compress("/path/to/output")`
@@ -156,7 +156,16 @@ results = scored.search_wand_query(
 )
 for doc in results:
     print(f"Document {doc.docid}: {doc.score:.4f}")
+
+# Batch: parsed up front, then searched in parallel with the GIL released
+batch = scored.search_maxscore_query_many(
+    ["#combine:0=2:1=1(quick fox)", {"syn": [3, 7]}, 42], top_k=10
+)
 ```
+
+`search_wand_query_many`/`search_maxscore_query_many` return one result list
+per query, in order; a query that fails to parse raises a `ValueError`
+naming its position.
 
 Scoring follows Terrier 5. Every operator is scored as one virtual term:
 - `#syn`: tf = sum of the children's tfs, df = sum of their dfs.
@@ -216,6 +225,15 @@ impact_index.Index.update("/path/to/index", "/dest")   # or to a copy
 
 Indices without a manifest (built before versioning existed) load
 normally and are stamped on first load.
+
+## Network Filesystems (NFS)
+
+Compressing, reordering or migrating an index copies files. On Linux, the
+native copy turns into a server-side copy on NFS v4.2, which some servers
+never complete (the process hangs in `nfs42_proc_copy`). By default
+(`auto`), impact-index copies through a user-space buffer on network
+filesystems; force a mode with `impact_index.set_copy_mode("buffered")` (or
+`"native"`, `"auto"`), or with `IMPACT_INDEX_COPY_MODE=buffered`.
 
 ## Neural IR (Impact Scores)
 
@@ -338,7 +356,7 @@ for the API and the Rust features.
 
 Two built-in stop word *families*, selectable independently of stemmer/language:
 
-- **`"lucene"`** (default): short, per-language lists matching Lucene's language analyzers. 17 languages: arabic, danish, dutch, english, finnish, french, german, greek, hungarian, italian, norwegian, portuguese, romanian, russian, spanish, swedish, turkish.
+- **`"lucene"`** (default): short, per-language lists matching Lucene's language analyzers. 23 languages: arabic, bengali, danish, dutch, english, finnish, french, german, greek, hindi, hungarian, indonesian, italian, norwegian, persian, portuguese, romanian, russian, spanish, swedish, telugu, thai, turkish (ISO 639-1 codes are accepted too).
 - **`"terrier"`**: Terrier's own, much longer list (`org.terrier.terms.Stopwords`, 733 words for English) — what PISA and Terrier 5 use by default. **English only** — other languages raise an error rather than silently substituting something else.
 
 ```python
@@ -366,3 +384,19 @@ builder = impact_index.BOWIndexBuilder(
 Full documentation including guides on compression, BMP search, and the document store:
 
 **https://impact-index.readthedocs.io/en/latest/index.html**
+
+## License
+
+Licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE)
+or the [MIT license](LICENSE-MIT), at your option. Versions up to 1.9.3 were
+released under the GPL-2.0-or-later.
+
+Code ported from Apache Lucene (stemmers, analyzers, stop word lists) is
+under the Apache License 2.0 only, and Terrier's English stop word list under
+the MPL-2.0; see [NOTICE](NOTICE). The vendored `BMP/` crate keeps its own
+Apache-2.0 licence.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this project by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.

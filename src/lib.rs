@@ -62,3 +62,5 @@ pub mod vocab;
 #[cfg(all(feature = "python", not(doctest)))]
 pub mod py;
 mod utils;
+
+pub use utils::fs::{copy_mode, set_copy_mode, CopyMode, COPY_MODE_ENV};

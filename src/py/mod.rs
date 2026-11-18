@@ -8,8 +8,8 @@ use pyo3::{
     Bound, Py, PyAny, PyRef, PyResult, Python,
 };
 
+use rayon::prelude::*;
 use std::collections::HashMap;
-use std::future::IntoFuture;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -278,12 +278,82 @@ fn build_query_node(obj: &Bound<'_, PyAny>) -> PyResult<QueryNode> {
 /// [`QueryNode`], resolving matchop text against `index`'s `TextAnalyzer`
 /// when `query` is a string.
 fn query_node_from_py(obj: &Bound<'_, PyAny>, index: &dyn SparseIndex) -> PyResult<QueryNode> {
+    query_node_from_py_cached(obj, index, &mut None)
+}
+
+/// [`query_node_from_py`], reusing (or filling) `analyzer` so a batch of
+/// matchop strings loads the index's `TextAnalyzer` once.
+fn query_node_from_py_cached(
+    obj: &Bound<'_, PyAny>,
+    index: &dyn SparseIndex,
+    analyzer: &mut Option<Arc<TextAnalyzer>>,
+) -> PyResult<QueryNode> {
     if let Ok(text) = obj.extract::<String>() {
-        let analyzer = load_matchop_analyzer(index)?;
+        let analyzer = match analyzer {
+            Some(a) => a.clone(),
+            None => analyzer.insert(load_matchop_analyzer(index)?).clone(),
+        };
         let resolve = |tok: &str| analyzer.resolve_query_token(tok);
         return query::parse_matchop_with(&text, &resolve).map_err(map_query_error);
     }
     build_query_node(obj)
+}
+
+/// Re-raises `err` (same exception type, original as `__cause__`) with the
+/// position of the offending query in a batch prefixed to its message.
+fn with_query_position(py: Python<'_>, position: usize, err: pyo3::PyErr) -> pyo3::PyErr {
+    let wrapped = pyo3::PyErr::from_type(
+        err.get_type(py),
+        format!("query {position}: {}", err.value(py)),
+    );
+    wrapped.set_cause(py, Some(err));
+    wrapped
+}
+
+/// Structured-query batch search shared by `Index` and `ScoredIndex`:
+/// every query is converted to a [`QueryNode`] while holding the GIL, then
+/// all are searched with [`par_search_detached`]. Results keep the query
+/// order; a query that fails to convert or to evaluate raises, naming its
+/// position in `queries`.
+fn search_query_many_py(
+    py: Python<'_>,
+    index: &dyn SparseIndex,
+    queries: Vec<Bound<'_, PyAny>>,
+    top_k: usize,
+    search_fn: QuerySearchFn,
+) -> PyResult<Vec<Vec<PyScoredDocument>>> {
+    let mut analyzer = None;
+    let nodes = queries
+        .iter()
+        .enumerate()
+        .map(|(i, q)| {
+            query_node_from_py_cached(q, index, &mut analyzer)
+                .map_err(|e| with_query_position(py, i, e))
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    par_search_detached(py, &nodes, |node| search_fn(index, node, top_k))
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            r.map(to_py_scored)
+                .map_err(|e| with_query_position(py, i, map_query_error(e)))
+        })
+        .collect()
+}
+
+/// Type alias for structured-query search functions.
+type QuerySearchFn = fn(
+    index: &dyn SparseIndex,
+    query: &QueryNode,
+    top_k: usize,
+) -> Result<Vec<crate::search::ScoredDocument>, QueryError>;
+
+fn query_maxscore_default(
+    index: &dyn SparseIndex,
+    query: &QueryNode,
+    top_k: usize,
+) -> Result<Vec<crate::search::ScoredDocument>, QueryError> {
+    query::search_maxscore_query(index, query, top_k, MaxScoreOptions::default())
 }
 
 /// A single term impact: a (document ID, impact value) pair.
@@ -523,54 +593,79 @@ pub struct PySparseIndex {
     clamped_impacts: Option<u64>,
 }
 
-impl PySparseIndex {
-    fn _search(
-        &self,
-        py: Python<'_>,
-        py_query: &Bound<'_, PyDict>,
-        top_k: usize,
-        search_fn: SearchFn,
-    ) -> PyResult<Py<PyAny>> {
-        let query: HashMap<usize, ImpactValue> = py_query.extract()?;
-        let results = search_fn(&**self.index, &query, top_k);
+/// Search shared by `Index` and `ScoredIndex` (GIL released during the
+/// search, so concurrent Python threads run in parallel).
+fn search_py(
+    py: Python<'_>,
+    index: &dyn SparseIndex,
+    py_query: &Bound<'_, PyDict>,
+    top_k: usize,
+    search_fn: SearchFn,
+) -> PyResult<Vec<PyScoredDocument>> {
+    let query: HashMap<usize, ImpactValue> = py_query.extract()?;
+    let results = py.detach(|| search_fn(index, &query, top_k));
+    Ok(to_py_scored(results))
+}
 
-        let v: Vec<PyScoredDocument> = results
-            .iter()
-            .map(|r| PyScoredDocument {
-                docid: r.docid,
-                score: r.score,
-            })
-            .collect();
-        Ok(pyo3::IntoPyObject::into_pyobject(v, py)?.into())
-    }
+/// Batch search shared by `Index` and `ScoredIndex`: the queries run on the
+/// rayon thread pool with the GIL released; results keep the query order.
+fn search_many_py(
+    py: Python<'_>,
+    index: &dyn SparseIndex,
+    queries: Vec<HashMap<usize, ImpactValue>>,
+    top_k: usize,
+    search_fn: SearchFn,
+) -> PyResult<Vec<Vec<PyScoredDocument>>> {
+    let results = par_search_detached(py, &queries, |query| search_fn(index, query, top_k));
+    Ok(results.into_iter().map(to_py_scored).collect())
+}
 
-    fn _aio_search<'a>(
-        &self,
-        py: Python<'a>,
-        py_query: &Bound<'_, PyDict>,
-        top_k: usize,
-        search_fn: SearchFn,
-    ) -> PyResult<Bound<'a, PyAny>> {
-        let index = self.index.clone();
+/// Runs `search` over every query on the rayon thread pool with the GIL
+/// released, keeping the query order (shared by the `_many` methods).
+fn par_search_detached<Q: Sync, R: Send>(
+    py: Python<'_>,
+    queries: &[Q],
+    search: impl Fn(&Q) -> R + Sync + Send,
+) -> Vec<R> {
+    py.detach(|| queries.par_iter().map(search).collect())
+}
 
-        let query: HashMap<usize, ImpactValue> = py_query.extract()?;
+/// Async search shared by `Index` and `ScoredIndex` (runs on tokio's
+/// blocking pool so the search does not stall the async workers).
+fn aio_search_py<'a>(
+    py: Python<'a>,
+    index: Arc<Box<dyn SparseIndex>>,
+    py_query: &Bound<'_, PyDict>,
+    top_k: usize,
+    search_fn: SearchFn,
+) -> PyResult<Bound<'a, PyAny>> {
+    let query: HashMap<usize, ImpactValue> = py_query.extract()?;
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let results = task::spawn_blocking(move || search_fn(&**index, &query, top_k))
+            .await
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("search task failed: {e}"))
+            })?;
+        Ok(to_py_scored(results))
+    })
+}
 
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let results = task::spawn(async move { search_fn(&**index, &query, top_k) })
-                .into_future()
-                .await
-                .expect("Error while searching");
-
-            let v: Vec<PyScoredDocument> = results
-                .iter()
-                .map(|r| PyScoredDocument {
-                    docid: r.docid,
-                    score: r.score,
-                })
-                .collect();
-            Ok(v)
+fn to_py_scored(results: Vec<crate::search::ScoredDocument>) -> Vec<PyScoredDocument> {
+    results
+        .into_iter()
+        .map(|r| PyScoredDocument {
+            docid: r.docid,
+            score: r.score,
         })
-    }
+        .collect()
+}
+
+fn maxscore_default(
+    index: &dyn SparseIndex,
+    query: &HashMap<TermIndex, ImpactValue>,
+    top_k: usize,
+) -> Vec<crate::search::ScoredDocument> {
+    search_maxscore(index, query, top_k, MaxScoreOptions::default())
 }
 
 #[cfg_attr(feature = "stub-gen", gen_stub_pymethods)]
@@ -596,31 +691,50 @@ impl PySparseIndex {
         py: Python<'_>,
         py_query: &Bound<'_, PyDict>,
         top_k: usize,
-    ) -> PyResult<Py<PyAny>> {
-        self._search(py, py_query, top_k, search_wand)
+    ) -> PyResult<Vec<PyScoredDocument>> {
+        search_py(py, &**self.index, py_query, top_k, search_wand)
     }
 
-    /// Search using the WAND algorithm.
+    /// Search using the WAND algorithm (GIL released).
     fn search_wand(
         &self,
         py: Python<'_>,
         py_query: &Bound<'_, PyDict>,
         top_k: usize,
-    ) -> PyResult<Py<PyAny>> {
-        self._search(py, py_query, top_k, search_wand)
+    ) -> PyResult<Vec<PyScoredDocument>> {
+        search_py(py, &**self.index, py_query, top_k, search_wand)
     }
 
-    /// Search using the MaxScore algorithm.
+    /// Search using the MaxScore algorithm (GIL released).
     fn search_maxscore(
         &self,
         py: Python<'_>,
         py_query: &Bound<'_, PyDict>,
         top_k: usize,
-    ) -> PyResult<Py<PyAny>> {
-        self._search(py, py_query, top_k, |index, query, top_k| {
-            let options = MaxScoreOptions::default();
-            search_maxscore(index, query, top_k, options)
-        })
+    ) -> PyResult<Vec<PyScoredDocument>> {
+        search_py(py, &**self.index, py_query, top_k, maxscore_default)
+    }
+
+    /// Search a batch of queries with WAND, in parallel on a Rust thread
+    /// pool with the GIL released. Returns one result list per query, in
+    /// the order of ``queries``.
+    fn search_wand_many(
+        &self,
+        py: Python<'_>,
+        queries: Vec<HashMap<usize, ImpactValue>>,
+        top_k: usize,
+    ) -> PyResult<Vec<Vec<PyScoredDocument>>> {
+        search_many_py(py, &**self.index, queries, top_k, search_wand)
+    }
+
+    /// Search a batch of queries with MaxScore (see ``search_wand_many``).
+    fn search_maxscore_many(
+        &self,
+        py: Python<'_>,
+        queries: Vec<HashMap<usize, ImpactValue>>,
+        top_k: usize,
+    ) -> PyResult<Vec<Vec<PyScoredDocument>>> {
+        search_many_py(py, &**self.index, queries, top_k, maxscore_default)
     }
 
     /// Search using MaxScore, skipping filtered documents.
@@ -683,7 +797,7 @@ impl PySparseIndex {
         py_query: &Bound<'_, PyDict>,
         top_k: usize,
     ) -> PyResult<Bound<'a, PyAny>> {
-        self._aio_search(py, py_query, top_k, search_wand)
+        aio_search_py(py, self.index.clone(), py_query, top_k, search_wand)
     }
 
     /// Async version of search_maxscore.
@@ -693,10 +807,7 @@ impl PySparseIndex {
         py_query: &Bound<'_, PyDict>,
         top_k: usize,
     ) -> PyResult<Bound<'a, PyAny>> {
-        self._aio_search(py, py_query, top_k, |index, query, top_k| {
-            let options = MaxScoreOptions::default();
-            search_maxscore(index, query, top_k, options)
-        })
+        aio_search_py(py, self.index.clone(), py_query, top_k, maxscore_default)
     }
 
     /// Convert the index into BMP format.
@@ -1032,6 +1143,34 @@ impl PySparseIndex {
             })
             .collect();
         Ok(pyo3::IntoPyObject::into_pyobject(v, py)?.into())
+    }
+
+    /// Search a batch of structured queries with WAND, in parallel on a
+    /// Rust thread pool with the GIL released. Each query may take any form
+    /// accepted by ``search_wand_query`` (forms can be mixed); queries are
+    /// parsed before the GIL is released. Returns one result list per query,
+    /// in the order of ``queries``. A query that fails to parse or evaluate
+    /// raises (the message starts with ``query <position>:``); one that
+    /// matches nothing (e.g. only unknown words or stop words) yields an
+    /// empty list, as with ``search_wand_query``.
+    fn search_wand_query_many(
+        &self,
+        py: Python<'_>,
+        queries: Vec<Bound<'_, PyAny>>,
+        top_k: usize,
+    ) -> PyResult<Vec<Vec<PyScoredDocument>>> {
+        search_query_many_py(py, &**self.index, queries, top_k, query::search_wand_query)
+    }
+
+    /// Search a batch of structured queries with MaxScore (see
+    /// ``search_wand_query_many``).
+    fn search_maxscore_query_many(
+        &self,
+        py: Python<'_>,
+        queries: Vec<Bound<'_, PyAny>>,
+        top_k: usize,
+    ) -> PyResult<Vec<Vec<PyScoredDocument>>> {
+        search_query_many_py(py, &**self.index, queries, top_k, query_maxscore_default)
     }
 }
 
@@ -2082,49 +2221,69 @@ pub struct PyScoredIndex {
     index: Arc<Box<dyn SparseIndex>>,
 }
 
-impl PyScoredIndex {
-    fn _search(
-        &self,
-        py: Python<'_>,
-        py_query: &Bound<'_, PyDict>,
-        top_k: usize,
-        search_fn: SearchFn,
-    ) -> PyResult<Py<PyAny>> {
-        let query: HashMap<usize, ImpactValue> = py_query.extract()?;
-        let results = search_fn(&**self.index, &query, top_k);
-        let v: Vec<PyScoredDocument> = results
-            .iter()
-            .map(|r| PyScoredDocument {
-                docid: r.docid,
-                score: r.score,
-            })
-            .collect();
-        Ok(pyo3::IntoPyObject::into_pyobject(v, py)?.into())
-    }
-}
-
 #[cfg_attr(feature = "stub-gen", gen_stub_pymethods)]
 #[pymethods]
 impl PyScoredIndex {
+    /// Search using the WAND algorithm (GIL released).
     fn search_wand(
         &self,
         py: Python<'_>,
         py_query: &Bound<'_, PyDict>,
         top_k: usize,
-    ) -> PyResult<Py<PyAny>> {
-        self._search(py, py_query, top_k, search_wand)
+    ) -> PyResult<Vec<PyScoredDocument>> {
+        search_py(py, &**self.index, py_query, top_k, search_wand)
     }
 
+    /// Search using the MaxScore algorithm (GIL released).
     fn search_maxscore(
         &self,
         py: Python<'_>,
         py_query: &Bound<'_, PyDict>,
         top_k: usize,
-    ) -> PyResult<Py<PyAny>> {
-        self._search(py, py_query, top_k, |index, query, top_k| {
-            let options = MaxScoreOptions::default();
-            search_maxscore(index, query, top_k, options)
-        })
+    ) -> PyResult<Vec<PyScoredDocument>> {
+        search_py(py, &**self.index, py_query, top_k, maxscore_default)
+    }
+
+    /// Search a batch of queries with WAND, in parallel on a Rust thread
+    /// pool with the GIL released. Returns one result list per query, in
+    /// the order of ``queries``.
+    fn search_wand_many(
+        &self,
+        py: Python<'_>,
+        queries: Vec<HashMap<usize, ImpactValue>>,
+        top_k: usize,
+    ) -> PyResult<Vec<Vec<PyScoredDocument>>> {
+        search_many_py(py, &**self.index, queries, top_k, search_wand)
+    }
+
+    /// Search a batch of queries with MaxScore (see ``search_wand_many``).
+    fn search_maxscore_many(
+        &self,
+        py: Python<'_>,
+        queries: Vec<HashMap<usize, ImpactValue>>,
+        top_k: usize,
+    ) -> PyResult<Vec<Vec<PyScoredDocument>>> {
+        search_many_py(py, &**self.index, queries, top_k, maxscore_default)
+    }
+
+    /// Async version of search_wand.
+    fn aio_search_wand<'a>(
+        &self,
+        py: Python<'a>,
+        py_query: &Bound<'_, PyDict>,
+        top_k: usize,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        aio_search_py(py, self.index.clone(), py_query, top_k, search_wand)
+    }
+
+    /// Async version of search_maxscore.
+    fn aio_search_maxscore<'a>(
+        &self,
+        py: Python<'a>,
+        py_query: &Bound<'_, PyDict>,
+        top_k: usize,
+    ) -> PyResult<Bound<'a, PyAny>> {
+        aio_search_py(py, self.index.clone(), py_query, top_k, maxscore_default)
     }
 
     /// Search using WAND over a structured (matchop-style) query. See
@@ -2168,6 +2327,29 @@ impl PyScoredIndex {
             })
             .collect();
         Ok(pyo3::IntoPyObject::into_pyobject(v, py)?.into())
+    }
+
+    /// Search a batch of structured queries with WAND, in parallel on a
+    /// Rust thread pool with the GIL released. See
+    /// ``Index.search_wand_query_many``.
+    fn search_wand_query_many(
+        &self,
+        py: Python<'_>,
+        queries: Vec<Bound<'_, PyAny>>,
+        top_k: usize,
+    ) -> PyResult<Vec<Vec<PyScoredDocument>>> {
+        search_query_many_py(py, &**self.index, queries, top_k, query::search_wand_query)
+    }
+
+    /// Search a batch of structured queries with MaxScore (see
+    /// ``search_wand_query_many``).
+    fn search_maxscore_query_many(
+        &self,
+        py: Python<'_>,
+        queries: Vec<Bound<'_, PyAny>>,
+        top_k: usize,
+    ) -> PyResult<Vec<Vec<PyScoredDocument>>> {
+        search_query_many_py(py, &**self.index, queries, top_k, query_maxscore_default)
     }
 
     /// Search using MaxScore, skipping filtered documents. See
@@ -2394,6 +2576,111 @@ enum BOWBuilderEnum {
 // gen_stub_pymethods skipped: PyArray1<usize> not supported
 // https://github.com/Jij-Inc/pyo3-stub-gen/issues/97
 // gen_stub_pymethods skipped: (Self, Parent) return in #[new] unsupported
+/// Text analyzer replicating the Lucene analyzer Anserini/Pyserini uses for a
+/// (non-English) language, see `crate::vocab::lucene`
+fn lucene_analyzer(
+    lang: &str,
+    stop_words: Option<&Bound<'_, PyAny>>,
+    dictionary: Option<&str>,
+    position_gaps: bool,
+) -> PyResult<TextAnalyzer> {
+    use crate::vocab::analyzer::{AnalyzerConfig, StopWordFilterMode, Tokenizer};
+    use crate::vocab::lucene::{LuceneChain, LuceneLanguage, LuceneStemmer};
+    let language = LuceneLanguage::resolve(lang)
+        .map_err(pyo3::exceptions::PyValueError::new_err)?
+        .expect("not English");
+    let chain = LuceneChain::load(language, dictionary)
+        .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+    let defaults = || -> Vec<String> {
+        language
+            .default_stop_words(lang)
+            .into_iter()
+            .map(String::from)
+            .collect()
+    };
+    // Stop words: the analyzer's (default or True), none (False), or a list
+    let words: Vec<String> = match stop_words {
+        None => defaults(),
+        Some(obj) => match obj.extract::<bool>() {
+            Ok(true) => defaults(),
+            Ok(false) => Vec::new(),
+            Err(_) => obj.extract::<Vec<String>>().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err(
+                    "with pipeline=\"pyserini\", stop_words must be a bool or a list of strings",
+                )
+            })?,
+        },
+    };
+    let refs: Vec<&str> = words.iter().map(|w| w.as_str()).collect();
+    let stemmer = Box::new(LuceneStemmer::new(language));
+    let mut analyzer = if refs.is_empty() {
+        TextAnalyzer::new(stemmer)
+    } else {
+        TextAnalyzer::with_stop_words(stemmer, &refs)
+    };
+    // Lucene's StopFilter: one check, before the filters that follow it
+    analyzer.set_stop_words_filter_mode(StopWordFilterMode::PreStem);
+    let dictionary_path = chain.dictionary_path();
+    analyzer.set_lucene_chain(chain);
+    analyzer.set_config(AnalyzerConfig {
+        stemmer: "lucene".to_string(),
+        language: lang.to_string(),
+        stop_words: !words.is_empty(),
+        stop_words_list: words,
+        stop_words_family: None,
+        stop_words_filter_mode: StopWordFilterMode::PreStem,
+        query_stop_words_list: Vec::new(),
+        english_possessive_filter: false,
+        tokenizer: Tokenizer::Lucene,
+        position_gaps,
+        dictionary: dictionary_path,
+    });
+    Ok(analyzer)
+}
+
+impl PyBOWIndexBuilder {
+    fn from_analyzer(
+        path: &Path,
+        builder_options: &BuilderOptions,
+        dtype_str: &str,
+        analyzer: Option<TextAnalyzer>,
+        positions: bool,
+    ) -> PyResult<Self> {
+        let builder_options = builder_options.clone();
+        let inner = match (dtype_str, analyzer) {
+            ("int32" | "i32", None) => {
+                BOWBuilderEnum::I32(BOWIndexBuilder::new(path, &builder_options))
+            }
+            ("int32" | "i32", Some(a)) => {
+                BOWBuilderEnum::I32(BOWIndexBuilder::with_analyzer(path, &builder_options, a))
+            }
+            ("int64" | "i64", None) => {
+                BOWBuilderEnum::I64(BOWIndexBuilder::new(path, &builder_options))
+            }
+            ("int64" | "i64", Some(a)) => {
+                BOWBuilderEnum::I64(BOWIndexBuilder::with_analyzer(path, &builder_options, a))
+            }
+            ("float32" | "f32", None) => {
+                BOWBuilderEnum::F32(BOWIndexBuilder::new(path, &builder_options))
+            }
+            ("float32" | "f32", Some(a)) => {
+                BOWBuilderEnum::F32(BOWIndexBuilder::with_analyzer(path, &builder_options, a))
+            }
+            (other, _) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unknown dtype '{}' for BOWIndexBuilder, expected int32, int64, or float32",
+                    other
+                )));
+            }
+        };
+
+        Ok(Self {
+            inner: Arc::new(Mutex::new(Some(inner))),
+            positions,
+        })
+    }
+}
+
 #[pymethods]
 impl PyBOWIndexBuilder {
     /// Create a new BOWIndexBuilder.
@@ -2408,7 +2695,11 @@ impl PyBOWIndexBuilder {
     ///         them:
     ///         - ``"pyserini"`` (default) matches Lucene/Pyserini
     ///           (``LuceneEnglish`` tokenizer, Lucene's ~33-word list,
-    ///           checked pre-stem, Porter stemmer).
+    ///           checked pre-stem, Porter stemmer). For other languages,
+    ///           the Lucene analyzer Anserini uses for ``-language``
+    ///           (e.g. ``FrenchAnalyzer``, ``CJKAnalyzer`` for Chinese,
+    ///           ``WhitespaceAnalyzer`` for Swahili) with its default stop
+    ///           words, unless ``stemmer`` or ``tokenizer`` is given.
     ///         - ``"terrier"`` matches real Terrier 5's own behavior:
     ///           PISA's tokenizer (see ``Tokenizer.pisa_english`` -- the
     ///           closest available approximation to Terrier 5's own Java
@@ -2440,11 +2731,15 @@ impl PyBOWIndexBuilder {
     ///         ``pipeline="terrier", stemmer="porter"`` keeps Terrier's
     ///         tokenizer/stop-word timing/list but swaps in the Porter
     ///         stemmer.
-    ///     stemmer: Stemmer to use ("snowball", "porter", or None).
-    ///         Defaults to the pipeline's own stemmer.
-    ///     language: Language for the stemmer (default: "english").
+    ///     stemmer: Stemmer to use ("snowball", "porter", "none" for text
+    ///         analysis without stemming, or None for no text analysis at
+    ///         all, i.e. terms given to ``add``). Defaults to the pipeline's
+    ///         own stemmer.
+    ///     language: Language for the stemmer, stop words and default
+    ///         tokenizer, as a name or ISO 639-1 code (default: "english").
     ///     stop_words: Stop words to filter. One of:
     ///         - a list of strings (used verbatim);
+    ///         - ``False`` for no stop words;
     ///         - ``True`` (alias for ``"lucene"``, for backward compatibility);
     ///         - ``"lucene"`` or ``"terrier"`` (case-insensitive) to use the
     ///           built-in list for that family and ``language``. Terrier only
@@ -2472,8 +2767,19 @@ impl PyBOWIndexBuilder {
     ///         ``#uwN``. Default: ``False`` for the ``"terrier"`` and
     ///         ``"terrier-pisa"`` pipelines, ``True`` otherwise. Only
     ///         matters with ``positions=True``.
+    ///     tokenizer: Word splitting: ``"standard"`` (UAX#29),
+    ///         ``"lucene-english"`` (UAX#29 + possessive removal),
+    ///         ``"pisa-english"``, or ``"icu"`` (UAX#29 + dictionary-based
+    ///         segmentation of Chinese, Japanese, Thai, Lao, Khmer and
+    ///         Burmese). Defaults to the pipeline's tokenizer for English,
+    ///         ``"lucene-english"`` for English without pipeline, ``"icu"``
+    ///         for the languages above and ``"standard"`` otherwise.
+    ///     dictionary: Directory of the morphological dictionary needed by
+    ///         ``pipeline="pyserini"`` for Japanese (``ipadic``) and Korean
+    ///         (``ko-dic``); downloaded into the cache if not given (see
+    ///         ``download_dictionary``).
     #[new]
-    #[pyo3(signature = (folder, options=None, dtype=None, pipeline=None, stemmer=None, language=None, stop_words=None, positions=false, position_gaps=None))]
+    #[pyo3(signature = (folder, options=None, dtype=None, pipeline=None, stemmer=None, language=None, stop_words=None, positions=false, position_gaps=None, tokenizer=None, dictionary=None))]
     fn new(
         folder: &str,
         options: Option<&PyBuilderOptions>,
@@ -2484,6 +2790,8 @@ impl PyBOWIndexBuilder {
         stop_words: Option<&Bound<'_, PyAny>>,
         positions: bool,
         position_gaps: Option<bool>,
+        tokenizer: Option<&str>,
+        dictionary: Option<&str>,
     ) -> PyResult<Self> {
         let mut builder_options = match options {
             Some(o) => o.0.clone(),
@@ -2492,7 +2800,14 @@ impl PyBOWIndexBuilder {
         builder_options.positions = positions;
         let path = Path::new(folder);
         let dtype_str = dtype.unwrap_or("int32");
-        let lang = language.unwrap_or("english");
+        let lang_name = crate::vocab::language::normalize_language(language.unwrap_or("english"));
+        let lang = lang_name.as_str();
+        let explicit_tokenizer = tokenizer
+            .map(|t| {
+                t.parse::<crate::vocab::analyzer::Tokenizer>()
+                    .map_err(pyo3::exceptions::PyValueError::new_err)
+            })
+            .transpose()?;
 
         // `pipeline` is the *only* knob that names another IR system: it
         // bundles that system's own tokenizer, stop-word-filter timing, and
@@ -2581,10 +2896,29 @@ impl PyBOWIndexBuilder {
             })
             .transpose()?;
 
+        let explicit_stemmer = stemmer;
         let stemmer = stemmer.or_else(|| pipeline_defaults.as_ref().map(|pd| pd.stemmer));
         let position_gaps = position_gaps
             .or_else(|| pipeline_defaults.as_ref().map(|pd| pd.position_gaps))
             .unwrap_or(true);
+
+        // Pyserini for another language than English: the Lucene analyzer
+        // Anserini uses for it (unless a stemmer or tokenizer is given)
+        let is_pyserini = pipeline.is_some_and(|p| p.eq_ignore_ascii_case("pyserini"));
+        if is_pyserini
+            && lang != "english"
+            && explicit_stemmer.is_none()
+            && explicit_tokenizer.is_none()
+        {
+            let analyzer = lucene_analyzer(lang, stop_words, dictionary, position_gaps)?;
+            return Self::from_analyzer(
+                path,
+                &builder_options,
+                dtype_str,
+                Some(analyzer),
+                positions,
+            );
+        }
 
         // Resolve stop words: True/"lucene"/"terrier" = built-in family list,
         // list = explicit, None = no stop words (or, with a `pipeline`, that
@@ -2614,6 +2948,8 @@ impl PyBOWIndexBuilder {
                     None => Vec::new(),
                 }
             }
+            // False: no stop words
+            Some(obj) if matches!(obj.extract::<bool>(), Ok(false)) => Vec::new(),
             Some(obj) => {
                 if let Ok(true) = obj.extract::<bool>() {
                     // True: alias for "lucene", by design -- this is the
@@ -2704,7 +3040,7 @@ impl PyBOWIndexBuilder {
         let make_analyzer = |stemmer_name: &str,
                              stemmer_box: Box<dyn crate::vocab::stemmer::Stemmer>,
                              tokenizer: crate::vocab::analyzer::Tokenizer|
-         -> TextAnalyzer {
+         -> PyResult<TextAnalyzer> {
             let mut a = if stop_word_refs.is_empty() {
                 TextAnalyzer::new(stemmer_box)
             } else {
@@ -2712,7 +3048,8 @@ impl PyBOWIndexBuilder {
             };
             a.set_stop_words_filter_mode(filter_mode);
             a.set_query_stop_words(&query_stop_word_refs);
-            a.set_tokenizer(tokenizer);
+            a.set_tokenizer(tokenizer)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
             // Store config for later retrieval. `stop_words_list` preserves
             // the *exact* list used here (not just whether one was given) so
             // `PyTextAnalyzer::from_index` can reconstruct the real custom
@@ -2730,20 +3067,24 @@ impl PyBOWIndexBuilder {
                     == crate::vocab::analyzer::Tokenizer::LuceneEnglish,
                 tokenizer,
                 position_gaps,
+                dictionary: None,
             });
-            a
+            Ok(a)
         };
 
         let is_english = lang == "english";
-        // A pipeline's tokenizer is meant for English text (like
-        // `LuceneEnglish` already was); other languages fall back to plain
-        // `Standard` splitting, same as before `pipeline` existed.
+        // An explicit `tokenizer` always wins. Otherwise, a pipeline's
+        // tokenizer is meant for English text (like `LuceneEnglish` already
+        // was); other languages fall back to their default tokenizer
+        // (`Icu` for languages written without spaces, plain `Standard`
+        // splitting otherwise, same as before `pipeline` existed).
         let pipeline_tokenizer = |english_capable: bool| -> crate::vocab::analyzer::Tokenizer {
-            match &pipeline_defaults {
-                Some(pd) if english_capable => pd.tokenizer,
-                Some(_) => crate::vocab::analyzer::Tokenizer::Standard,
-                None if english_capable => crate::vocab::analyzer::Tokenizer::LuceneEnglish,
-                None => crate::vocab::analyzer::Tokenizer::Standard,
+            use crate::vocab::analyzer::Tokenizer;
+            match (explicit_tokenizer, &pipeline_defaults) {
+                (Some(t), _) => t,
+                (None, Some(pd)) if english_capable => pd.tokenizer,
+                (None, None) if english_capable => Tokenizer::LuceneEnglish,
+                (None, _) => Tokenizer::default_for_language(lang),
             }
         };
 
@@ -2756,53 +3097,31 @@ impl PyBOWIndexBuilder {
                     "snowball",
                     Box::new(s),
                     pipeline_tokenizer(is_english),
-                ))
+                )?)
             }
             Some("porter") => Some(make_analyzer(
                 "porter",
                 Box::new(PorterStemmer::new()),
                 pipeline_tokenizer(true),
-            )),
-            Some("none") | None => None,
+            )?),
+            // An analyzer without stemming, for languages without a
+            // stemmer
+            Some("none") => Some(make_analyzer(
+                "none",
+                Box::new(crate::vocab::stemmer::NoStemmer),
+                pipeline_tokenizer(is_english),
+            )?),
+            // No analyzer at all (terms are added with `add`)
+            None => None,
             Some(other) => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Unknown stemmer '{}', expected 'snowball', 'porter', or None",
+                    "Unknown stemmer '{}', expected 'snowball', 'porter', 'none', or None",
                     other
                 )));
             }
         };
 
-        let inner = match (dtype_str, analyzer) {
-            ("int32" | "i32", None) => {
-                BOWBuilderEnum::I32(BOWIndexBuilder::new(path, &builder_options))
-            }
-            ("int32" | "i32", Some(a)) => {
-                BOWBuilderEnum::I32(BOWIndexBuilder::with_analyzer(path, &builder_options, a))
-            }
-            ("int64" | "i64", None) => {
-                BOWBuilderEnum::I64(BOWIndexBuilder::new(path, &builder_options))
-            }
-            ("int64" | "i64", Some(a)) => {
-                BOWBuilderEnum::I64(BOWIndexBuilder::with_analyzer(path, &builder_options, a))
-            }
-            ("float32" | "f32", None) => {
-                BOWBuilderEnum::F32(BOWIndexBuilder::new(path, &builder_options))
-            }
-            ("float32" | "f32", Some(a)) => {
-                BOWBuilderEnum::F32(BOWIndexBuilder::with_analyzer(path, &builder_options, a))
-            }
-            (other, _) => {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "Unknown dtype '{}' for BOWIndexBuilder, expected int32, int64, or float32",
-                    other
-                )));
-            }
-        };
-
-        Ok(Self {
-            inner: Arc::new(Mutex::new(Some(inner))),
-            positions,
-        })
+        Self::from_analyzer(path, &builder_options, dtype_str, analyzer, positions)
     }
 
     fn add(
@@ -3033,6 +3352,16 @@ impl PyTextAnalyzer {
                 Box::new(s)
             }
             "porter" => Box::new(PorterStemmer::new()),
+            "lucene" => {
+                let language = crate::vocab::lucene::LuceneLanguage::for_language(&config.language)
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyValueError::new_err(format!(
+                            "No Lucene analyzer for language '{}'",
+                            config.language
+                        ))
+                    })?;
+                Box::new(crate::vocab::lucene::LuceneStemmer::new(language))
+            }
             _ => Box::new(crate::vocab::stemmer::NoStemmer),
         };
 
@@ -3087,7 +3416,9 @@ impl PyTextAnalyzer {
         let tokenizer = config.effective_tokenizer();
         let query_stop_words = config.query_stop_words_list.clone();
         analyzer.set_config(config);
-        analyzer.set_tokenizer(tokenizer);
+        analyzer
+            .set_tokenizer(tokenizer)
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
         analyzer.set_stop_words_filter_mode(filter_mode);
         let query_stop_word_refs: Vec<&str> = query_stop_words.iter().map(|s| s.as_str()).collect();
         analyzer.set_query_stop_words(&query_stop_word_refs);
@@ -3150,6 +3481,37 @@ fn impact_index(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyTextAnalyzer>()?;
 
     // Functions
+    /// Sets how index files are copied (e.g. by ``compress``, ``reorder`` or
+    /// index migrations), for the whole process.
+    ///
+    /// Args:
+    ///     mode: ``"auto"`` (default: copies through a user-space buffer when
+    ///         the source or destination is on a network filesystem such as
+    ///         NFS, Linux only; native copy otherwise), ``"buffered"``
+    ///         (always a user-space copy) or ``"native"`` (always the OS
+    ///         copy, i.e. ``copy_file_range`` on Linux).
+    ///
+    /// The native copy on NFS v4.2 asks the server to copy, which some
+    /// servers never complete (the process hangs in ``nfs42_proc_copy``).
+    /// Without a call, the mode comes from ``$IMPACT_INDEX_COPY_MODE``.
+    #[pyfn(module)]
+    #[pyo3(name = "set_copy_mode")]
+    fn py_set_copy_mode(mode: &str) -> PyResult<()> {
+        let mode = mode
+            .parse::<crate::CopyMode>()
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+        crate::set_copy_mode(mode);
+        Ok(())
+    }
+
+    /// Returns the current file copy mode (``"auto"``, ``"buffered"`` or
+    /// ``"native"``), see :func:`set_copy_mode`.
+    #[pyfn(module)]
+    #[pyo3(name = "copy_mode")]
+    fn py_copy_mode() -> &'static str {
+        crate::copy_mode().name()
+    }
+
     /// Get the built-in stop word list for a language and family.
     ///
     /// Args:
@@ -3176,7 +3538,104 @@ fn impact_index(_py: Python, module: &Bound<'_, PyModule>) -> PyResult<()> {
             })
     }
 
+    /// Downloads (if not already there) a dictionary, and returns its path:
+    /// ``"icu"`` (the ICU4X data used by the ``"icu"`` tokenizer and the
+    /// Lucene Thai analyzer), or a morphological dictionary used by the
+    /// Japanese (``"ipadic"``) and Korean (``"ko-dic"``) Lucene analyzers.
+    /// Dictionaries are stored in ``$IMPACT_INDEX_CACHE`` or the OS cache
+    /// directory (``~/.cache/impact-index`` on Linux).
+    #[pyfn(module)]
+    #[pyo3(name = "download_dictionary")]
+    fn py_download_dictionary(name: &str) -> PyResult<String> {
+        let path = match parse_dictionary(name)? {
+            Dictionary::Icu => crate::vocab::icu::download_data(),
+            Dictionary::Morph(dict) => crate::vocab::lucene::morph::download_dictionary(dict),
+        };
+        path.map(|p| p.to_string_lossy().to_string())
+            .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))
+    }
+
+    /// Downloads the resources needed to analyze text in ``language`` with
+    /// ``pipeline`` (so that indexing can then run without network access,
+    /// e.g. on cluster nodes sharing the cache directory), and returns their
+    /// paths. Resources are dictionaries: the ICU4X data for languages
+    /// written without spaces (Chinese, Japanese, Thai, Lao, Khmer, Burmese)
+    /// without pipeline, or for Thai with ``pipeline="pyserini"``; the
+    /// morphological dictionaries of the Japanese and Korean Lucene
+    /// analyzers (``pipeline="pyserini"``).
+    #[pyfn(module)]
+    #[pyo3(name = "prepare_analyzer")]
+    #[pyo3(signature = (language, pipeline=None))]
+    fn py_prepare_analyzer(language: &str, pipeline: Option<&str>) -> PyResult<Vec<String>> {
+        use crate::vocab::analyzer::Tokenizer;
+        use crate::vocab::lucene::LuceneLanguage;
+        let io_err = |e: std::io::Error| pyo3::exceptions::PyIOError::new_err(e.to_string());
+        let path = |p: PathBuf| p.to_string_lossy().to_string();
+        if !pipeline.is_some_and(|p| p.eq_ignore_ascii_case("pyserini")) {
+            return if Tokenizer::default_for_language(language) == Tokenizer::Icu {
+                Ok(vec![path(
+                    crate::vocab::icu::download_data().map_err(io_err)?,
+                )])
+            } else {
+                Ok(Vec::new())
+            };
+        }
+        let Some(lucene) =
+            LuceneLanguage::resolve(language).map_err(pyo3::exceptions::PyValueError::new_err)?
+        else {
+            return Ok(Vec::new());
+        };
+        let mut paths = Vec::new();
+        if lucene == LuceneLanguage::Thai {
+            paths.push(path(crate::vocab::icu::download_data().map_err(io_err)?));
+        }
+        if let Some(dict) = lucene.dictionary() {
+            paths.push(path(
+                crate::vocab::lucene::morph::download_dictionary(dict).map_err(io_err)?,
+            ));
+        }
+        Ok(paths)
+    }
+
+    /// Sets the path of a dictionary instead of the cache: the ICU4X data
+    /// file (``"icu"``, to be called before any ICU tokenization), or the
+    /// directory of a morphological dictionary (``"ipadic"`` or
+    /// ``"ko-dic"``), overriding the one recorded in indices (e.g. for an
+    /// index built on another machine).
+    #[pyfn(module)]
+    #[pyo3(name = "set_dictionary_path")]
+    fn py_set_dictionary_path(name: &str, path: &str) -> PyResult<()> {
+        match parse_dictionary(name)? {
+            Dictionary::Icu => crate::vocab::icu::set_data_path(PathBuf::from(path)),
+            Dictionary::Morph(dict) => {
+                crate::vocab::lucene::morph::set_dictionary_path(dict, PathBuf::from(path))
+            }
+        }
+        Ok(())
+    }
+
     Ok(())
+}
+
+/// Dictionaries that can be downloaded / located from Python
+enum Dictionary {
+    /// ICU4X segmentation data (see [`crate::vocab::icu`])
+    Icu,
+    Morph(crate::vocab::lucene::morph::MorphDictionary),
+}
+
+fn parse_dictionary(name: &str) -> PyResult<Dictionary> {
+    if name.eq_ignore_ascii_case("icu") {
+        return Ok(Dictionary::Icu);
+    }
+    crate::vocab::lucene::morph::MorphDictionary::from_name(name)
+        .map(Dictionary::Morph)
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "Unknown dictionary '{}', expected 'icu', 'ipadic' or 'ko-dic'",
+                name
+            ))
+        })
 }
 
 #[cfg(feature = "stub-gen")]

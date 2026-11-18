@@ -4,6 +4,9 @@
 //! Uses FST for compact on-disk storage (~26 MB for 2.6M terms).
 
 pub mod analyzer;
+pub mod icu;
+pub mod language;
+pub mod lucene;
 pub mod lucene_porter;
 pub mod stemmer;
 pub mod stopwords;

@@ -234,6 +234,12 @@ pub enum StopWordFilterMode {
 /// Snowball/Terrier-stopwords with `LuceneEnglish` (as impact-index did
 /// before this variant existed) silently mismatches PISA/Terrier on a large
 /// fraction of the collection's vocabulary, not just on possessives.
+///
+/// `Icu` follows UAX#29 too, but segments runs of scripts written without
+/// spaces (Han, Kana, Thai, Lao, Khmer, Burmese) into dictionary words with
+/// ICU4X's word segmenter, the way Lucene's ICU-based tokenizers do --
+/// `Standard` would turn them into one token per character. Default for
+/// those languages (see [`Tokenizer::default_for_language`]).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum Tokenizer {
@@ -241,6 +247,77 @@ pub enum Tokenizer {
     Standard,
     LuceneEnglish,
     PisaEnglish,
+    Icu,
+    /// A Lucene language analyzer (see [`super::lucene`]), selected by the
+    /// config's language -- set with [`TextAnalyzer::set_lucene_chain`]
+    Lucene,
+}
+
+impl Tokenizer {
+    /// Tokenizer used when none is requested explicitly: `LuceneEnglish`
+    /// for English, `Icu` for languages written without spaces, `Standard`
+    /// otherwise.
+    pub fn default_for_language(language: &str) -> Self {
+        let lang = super::language::normalize_language(language);
+        if lang == "english" {
+            Tokenizer::LuceneEnglish
+        } else if super::language::needs_word_segmentation(&lang) {
+            Tokenizer::Icu
+        } else {
+            Tokenizer::Standard
+        }
+    }
+}
+
+impl std::str::FromStr for Tokenizer {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().replace('_', "-").as_str() {
+            "standard" => Ok(Tokenizer::Standard),
+            "lucene-english" => Ok(Tokenizer::LuceneEnglish),
+            "pisa-english" => Ok(Tokenizer::PisaEnglish),
+            "icu" => Ok(Tokenizer::Icu),
+            other => Err(format!(
+                "Unknown tokenizer '{}', expected 'standard', 'lucene-english', \
+                 'pisa-english' or 'icu'",
+                other
+            )),
+        }
+    }
+}
+
+/// Words of `text` per ICU4X's dictionary-based word segmenter (UAX#29
+/// extended with dictionary segmentation of Han/Kana/Thai/Lao/Khmer/Burmese,
+/// see [`super::icu`]). Segments are kept, like `unicode_words`, when they
+/// contain an alphanumeric character: ICU4X's own word type is not usable
+/// for that, as it tags some Devanagari words (e.g. "जा") as non-words.
+fn icu_words<'t>(
+    segmenter: icu_segmenter::WordSegmenterBorrowed<'_>,
+    text: &'t str,
+) -> Vec<&'t str> {
+    let mut words = Vec::new();
+    let mut last = 0;
+    for boundary in segmenter.segment_str(text) {
+        if boundary > last {
+            let segment = &text[last..boundary];
+            if segment.chars().any(char::is_alphanumeric) {
+                words.push(segment);
+            }
+            last = boundary;
+        }
+    }
+    words
+}
+
+/// The ICU word segmenter if `tokenizer` needs it
+fn icu_segmenter_for(
+    tokenizer: Tokenizer,
+) -> std::io::Result<Option<icu_segmenter::WordSegmenterBorrowed<'static>>> {
+    match tokenizer {
+        Tokenizer::Icu => super::icu::word_segmenter().map(Some),
+        _ => Ok(None),
+    }
 }
 
 /// Analyzer configuration, serialized with the index for reproducibility.
@@ -314,6 +391,11 @@ pub struct AnalyzerConfig {
     /// field existed were built with gaps.
     #[serde(default = "default_true")]
     pub position_gaps: bool,
+    /// Path of the morphological dictionary used to build the index (Lucene
+    /// Japanese/Korean analyzers), used when reloading the analyzer unless
+    /// overridden with [`super::lucene::morph::set_dictionary_path`]
+    #[serde(default)]
+    pub dictionary: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -333,6 +415,7 @@ impl Default for AnalyzerConfig {
             english_possessive_filter: false,
             tokenizer: Tokenizer::Standard,
             position_gaps: true,
+            dictionary: None,
         }
     }
 }
@@ -346,6 +429,8 @@ impl AnalyzerConfig {
         match self.tokenizer {
             Tokenizer::PisaEnglish => Tokenizer::PisaEnglish,
             Tokenizer::LuceneEnglish => Tokenizer::LuceneEnglish,
+            Tokenizer::Icu => Tokenizer::Icu,
+            Tokenizer::Lucene => Tokenizer::Lucene,
             Tokenizer::Standard if self.english_possessive_filter => Tokenizer::LuceneEnglish,
             Tokenizer::Standard => Tokenizer::Standard,
         }
@@ -388,6 +473,11 @@ pub struct TextAnalyzer {
     query_stop_words: HashSet<String>,
     /// Which tokenizer variant is active (word-splitting/apostrophe rules).
     active_tokenizer: Tokenizer,
+    /// Lucene analyzer, when [`Tokenizer::Lucene`] is active
+    lucene: Option<super::lucene::LuceneChain>,
+    /// Word segmenter of [`Tokenizer::Icu`] (loaded with its data when that
+    /// tokenizer is set, see [`super::icu::word_segmenter`])
+    icu: Option<icu_segmenter::WordSegmenterBorrowed<'static>>,
     /// Analyzer config for serialization
     config: AnalyzerConfig,
 }
@@ -403,6 +493,8 @@ impl TextAnalyzer {
             filter_mode: StopWordFilterMode::Both,
             query_stop_words: HashSet::new(),
             active_tokenizer: Tokenizer::Standard,
+            lucene: None,
+            icu: None,
             config: AnalyzerConfig::default(),
         }
     }
@@ -418,6 +510,8 @@ impl TextAnalyzer {
             filter_mode: StopWordFilterMode::Both,
             query_stop_words: HashSet::new(),
             active_tokenizer: Tokenizer::Standard,
+            lucene: None,
+            icu: None,
             config: AnalyzerConfig::default(),
         }
     }
@@ -432,6 +526,8 @@ impl TextAnalyzer {
             filter_mode: StopWordFilterMode::Both,
             query_stop_words: HashSet::new(),
             active_tokenizer: Tokenizer::Standard,
+            lucene: None,
+            icu: None,
             config: AnalyzerConfig::default(),
         }
     }
@@ -451,6 +547,8 @@ impl TextAnalyzer {
             filter_mode: StopWordFilterMode::Both,
             query_stop_words: HashSet::new(),
             active_tokenizer: Tokenizer::Standard,
+            lucene: None,
+            icu: None,
             config: AnalyzerConfig::default(),
         }
     }
@@ -462,14 +560,28 @@ impl TextAnalyzer {
             Tokenizer::LuceneEnglish
         } else {
             Tokenizer::Standard
-        });
+        })
+        .expect("non-ICU tokenizers need no data");
     }
 
     /// Set the tokenizer variant (word-splitting rules). See [`Tokenizer`].
-    pub fn set_tokenizer(&mut self, tokenizer: Tokenizer) {
+    /// Uses a Lucene language analyzer for tokenization (the matching
+    /// [`super::lucene::LuceneStemmer`] should be the analyzer's stemmer)
+    pub fn set_lucene_chain(&mut self, chain: super::lucene::LuceneChain) {
+        self.lucene = Some(chain);
+        self.set_tokenizer(Tokenizer::Lucene)
+            .expect("non-ICU tokenizers need no data");
+    }
+
+    ///
+    /// [`Tokenizer::Icu`] loads its segmentation data (downloading it if
+    /// needed, see [`super::icu::word_segmenter`]), hence the error.
+    pub fn set_tokenizer(&mut self, tokenizer: Tokenizer) -> std::io::Result<()> {
+        self.icu = icu_segmenter_for(tokenizer)?;
         self.active_tokenizer = tokenizer;
         self.config.tokenizer = tokenizer;
         self.config.english_possessive_filter = tokenizer == Tokenizer::LuceneEnglish;
+        Ok(())
     }
 
     /// Whether index-time stop word removal leaves position gaps (see
@@ -570,6 +682,17 @@ impl TextAnalyzer {
     fn raw_tokens(&self, text: &str) -> Vec<String> {
         match self.active_tokenizer {
             Tokenizer::PisaEnglish => pisa_tokenize(text),
+            Tokenizer::Lucene => self
+                .lucene
+                .as_ref()
+                .expect("Lucene tokenizer without a Lucene analyzer")
+                .tokens(text),
+            Tokenizer::Icu => {
+                icu_words(self.icu.expect("ICU tokenizer without its segmenter"), text)
+                    .into_iter()
+                    .map(|t| self.normalize_token(t))
+                    .collect()
+            }
             Tokenizer::Standard | Tokenizer::LuceneEnglish => text
                 .unicode_words()
                 .map(|t| self.normalize_token(t))
@@ -605,24 +728,12 @@ impl TextAnalyzer {
     ///
     /// Returns `(term_indices, tf_values)` suitable for indexing.
     pub fn analyze_doc(&mut self, text: &str) -> (Vec<TermIndex>, Vec<f32>) {
-        let tokens = self.tokenize(text);
-
-        // Count term frequencies
-        let mut tf_map: HashMap<String, f32> = HashMap::new();
-        for token in &tokens {
-            let stemmed = self.stemmer.stem(token);
-            if self.is_post_stem_stop_word(&stemmed) {
-                continue;
-            }
-            *tf_map.entry(stemmed).or_insert(0.0) += 1.0;
-        }
-
-        // Convert to term indices (growing vocabulary)
-        let mut term_indices = Vec::with_capacity(tf_map.len());
-        let mut tf_values = Vec::with_capacity(tf_map.len());
-        for (term, tf) in tf_map {
-            let idx = self.vocab.get_or_insert(&term);
-            term_indices.push(idx);
+        // Terms in order of first occurrence, so that the vocabulary grows
+        // deterministically (see `tokenize_and_stem`)
+        let mut term_indices = Vec::new();
+        let mut tf_values = Vec::new();
+        for (term, tf) in self.tokenize_and_stem(text) {
+            term_indices.push(self.vocab.get_or_insert(&term));
             tf_values.push(tf);
         }
 
@@ -703,19 +814,29 @@ impl TextAnalyzer {
 
     /// Tokenize and stem text without vocabulary insertion (thread-safe).
     ///
-    /// Returns a list of (stemmed_token, tf) pairs. This can be called
+    /// Returns a list of (stemmed_token, tf) pairs, in order of first
+    /// occurrence: the vocabulary, which assigns term ids in insertion
+    /// order, is then the same from one run to the next (a hash map's
+    /// iteration order differs between processes). This can be called
     /// from multiple threads since it only reads the stemmer and stop words.
     pub fn tokenize_and_stem(&self, text: &str) -> Vec<(String, f32)> {
         let tokens = self.tokenize(text);
-        let mut tf_map: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+        let mut terms: Vec<(String, f32)> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
         for token in &tokens {
             let stemmed = self.stemmer.stem(token);
             if self.is_post_stem_stop_word(&stemmed) {
                 continue;
             }
-            *tf_map.entry(stemmed).or_insert(0.0) += 1.0;
+            match index.get(&stemmed) {
+                Some(&ix) => terms[ix].1 += 1.0,
+                None => {
+                    index.insert(stemmed.clone(), terms.len());
+                    terms.push((stemmed, 1.0));
+                }
+            }
         }
-        tf_map.into_iter().collect()
+        terms
     }
 
     /// Thread-safe, position-preserving variant of [`Self::tokenize_and_stem`]
@@ -727,7 +848,8 @@ impl TextAnalyzer {
     pub fn tokenize_and_stem_positional(&self, text: &str) -> Vec<(String, Vec<u32>)> {
         let tokens = self.tokenize_indexed(text);
         let gaps = self.config.position_gaps;
-        let mut positions_map: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut terms: Vec<(String, Vec<u32>)> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
         let mut kept = 0u32;
         for (token, pos) in tokens {
             let stemmed = self.stemmer.stem(&token);
@@ -738,9 +860,15 @@ impl TextAnalyzer {
             // tokens (Terrier's block ids), not in the raw token stream.
             let pos = if gaps { pos } else { kept };
             kept += 1;
-            positions_map.entry(stemmed).or_default().push(pos);
+            match index.get(&stemmed) {
+                Some(&ix) => terms[ix].1.push(pos),
+                None => {
+                    index.insert(stemmed.clone(), terms.len());
+                    terms.push((stemmed, vec![pos]));
+                }
+            }
         }
-        positions_map.into_iter().collect()
+        terms
     }
 
     /// Get a reference to the vocabulary.
@@ -781,9 +909,7 @@ impl TextAnalyzer {
             let src = src_dir.join(filename);
             let dst = dst_dir.join(filename);
             if src.exists() {
-                if std::fs::hard_link(&src, &dst).is_err() {
-                    std::fs::copy(&src, &dst)?;
-                }
+                crate::utils::fs::link_or_copy(&src, &dst)?;
             }
         }
         Ok(())
@@ -807,6 +933,8 @@ impl TextAnalyzer {
             // `filter_mode` above.
             query_stop_words: HashSet::new(),
             active_tokenizer: config.effective_tokenizer(),
+            lucene: super::lucene::LuceneChain::from_config(&config)?,
+            icu: icu_segmenter_for(config.effective_tokenizer())?,
             config,
         })
     }
@@ -835,8 +963,26 @@ impl TextAnalyzer {
             filter_mode: StopWordFilterMode::Both,
             query_stop_words: HashSet::new(),
             active_tokenizer: config.effective_tokenizer(),
+            lucene: super::lucene::LuceneChain::from_config(&config)?,
+            icu: icu_segmenter_for(config.effective_tokenizer())?,
             config,
         })
+    }
+
+    /// Load the analyzer config, or `None` if the index has none (i.e. was
+    /// built without a text analyzer).
+    pub fn try_load_config(dir: &Path) -> Option<AnalyzerConfig> {
+        Self::try_load_config_from(&crate::storage::DirFiles::new(dir))
+    }
+
+    /// Load the analyzer config from an index's files, `None` if there is
+    /// no (readable) `analyzer.cbor`.
+    pub fn try_load_config_from(files: &dyn crate::storage::IndexFiles) -> Option<AnalyzerConfig> {
+        if !files.exists("analyzer.cbor") {
+            return None;
+        }
+        let file = files.open("analyzer.cbor").ok()?;
+        ciborium::de::from_reader(file).ok()
     }
 
     /// Load analyzer config if available, otherwise return default.
@@ -862,9 +1008,39 @@ mod tests {
     use super::*;
     use crate::vocab::stemmer::NoStemmer;
 
+    /// Term ids follow the order of first occurrence in the text, so that
+    /// two builds of the same collection share their vocabulary (it was the
+    /// iteration order of a hash map, which differs between processes)
+    #[test]
+    fn test_term_ids_follow_first_occurrence() {
+        let words: Vec<String> = (0..40).map(|i| format!("w{}x", 39 - i)).collect();
+        let text = format!("{} {}", words.join(" "), words[..5].join(" "));
+        let expected: Vec<(String, f32)> = words
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (w.clone(), if i < 5 { 2.0 } else { 1.0 }))
+            .collect();
+
+        let mut analyzer = TextAnalyzer::new(Box::new(NoStemmer));
+        assert_eq!(analyzer.tokenize_and_stem(&text), expected);
+        let positional: Vec<String> = analyzer
+            .tokenize_and_stem_positional(&text)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert_eq!(positional, words);
+
+        let (terms, values) = analyzer.analyze_doc(&text);
+        assert_eq!(terms, (0..40).collect::<Vec<TermIndex>>());
+        assert_eq!(values[..6], [2.0, 2.0, 2.0, 2.0, 2.0, 1.0]);
+        for (i, w) in words.iter().enumerate() {
+            assert_eq!(analyzer.vocab().get(w), Some(i as TermIndex));
+        }
+    }
+
     #[test]
     fn test_analyze_doc() {
-        let mut analyzer = TextAnalyzer::new(Box::new(NoStemmer));
+        let mut analyzer = TextAnalyzer::new(Box::new(crate::vocab::stemmer::NoStemmer));
         let (terms, values) = analyzer.analyze_doc("the quick brown fox the quick");
 
         // Should have 4 unique terms
@@ -882,7 +1058,7 @@ mod tests {
 
     #[test]
     fn test_possessive_filter() {
-        let mut analyzer = TextAnalyzer::new(Box::new(NoStemmer));
+        let mut analyzer = TextAnalyzer::new(Box::new(crate::vocab::stemmer::NoStemmer));
         analyzer.set_english_possessive_filter(true);
         let tokens = analyzer.tokenize("king's castle children's books it's fine");
         assert!(tokens.contains(&"king".to_string()));
@@ -894,8 +1070,8 @@ mod tests {
 
     #[test]
     fn test_pisa_tokenizer_truncates_any_apostrophe() {
-        let mut analyzer = TextAnalyzer::new(Box::new(NoStemmer));
-        analyzer.set_tokenizer(Tokenizer::PisaEnglish);
+        let mut analyzer = TextAnalyzer::new(Box::new(crate::vocab::stemmer::NoStemmer));
+        analyzer.set_tokenizer(Tokenizer::PisaEnglish).unwrap();
         let tokens =
             analyzer.tokenize("don't worry king's castle it's fine O'Brien's book y'all wasn't");
         // Truncated at the FIRST apostrophe, unlike Lucene's trailing-'s-only rule.
@@ -912,8 +1088,8 @@ mod tests {
     fn test_pisa_tokenizer_leaves_bare_apostrophe_alone() {
         // No letters after the apostrophe (or no apostrophe at all): nothing
         // to truncate, unlike a real `'s`/contraction suffix.
-        let mut analyzer = TextAnalyzer::new(Box::new(NoStemmer));
-        analyzer.set_tokenizer(Tokenizer::PisaEnglish);
+        let mut analyzer = TextAnalyzer::new(Box::new(crate::vocab::stemmer::NoStemmer));
+        analyzer.set_tokenizer(Tokenizer::PisaEnglish).unwrap();
         let tokens = analyzer.tokenize("plain word");
         assert_eq!(
             tokens,
@@ -926,8 +1102,8 @@ mod tests {
     fn test_pisa_tokenizer_splits_numbers_at_periods() {
         // PISA's Term type is [a-zA-Z0-9]+ -- a period is never part of a
         // number, unlike UAX#29 (which keeps "3.14" as one token).
-        let mut analyzer = TextAnalyzer::new(Box::new(NoStemmer));
-        analyzer.set_tokenizer(Tokenizer::PisaEnglish);
+        let mut analyzer = TextAnalyzer::new(Box::new(crate::vocab::stemmer::NoStemmer));
+        analyzer.set_tokenizer(Tokenizer::PisaEnglish).unwrap();
         let tokens = analyzer.tokenize("price is 3.14 dollars");
         assert_eq!(
             tokens,
@@ -944,8 +1120,8 @@ mod tests {
     #[test]
     fn test_pisa_tokenizer_collapses_abbreviations() {
         // Abbreviature: ([a-zA-Z]+\.){2,} -- periods stripped, one token.
-        let mut analyzer = TextAnalyzer::new(Box::new(NoStemmer));
-        analyzer.set_tokenizer(Tokenizer::PisaEnglish);
+        let mut analyzer = TextAnalyzer::new(Box::new(crate::vocab::stemmer::NoStemmer));
+        analyzer.set_tokenizer(Tokenizer::PisaEnglish).unwrap();
         let tokens = analyzer.tokenize("U.S.A. is a country");
         assert!(tokens.contains(&"usa".to_string()), "{:?}", tokens);
         assert!(!tokens.iter().any(|t| t.contains('.')));
@@ -1005,8 +1181,8 @@ mod tests {
             ("X.Y", &["x", "y"]),
         ];
 
-        let mut analyzer = TextAnalyzer::new(Box::new(NoStemmer));
-        analyzer.set_tokenizer(Tokenizer::PisaEnglish);
+        let mut analyzer = TextAnalyzer::new(Box::new(crate::vocab::stemmer::NoStemmer));
+        analyzer.set_tokenizer(Tokenizer::PisaEnglish).unwrap();
         for &(input, expected) in cases {
             let tokens = analyzer.tokenize(input);
             assert_eq!(
@@ -1019,7 +1195,7 @@ mod tests {
 
     #[test]
     fn test_possessive_filter_curly_apostrophe() {
-        let mut analyzer = TextAnalyzer::new(Box::new(NoStemmer));
+        let mut analyzer = TextAnalyzer::new(Box::new(crate::vocab::stemmer::NoStemmer));
         analyzer.set_english_possessive_filter(true);
         // U+2019 RIGHT SINGLE QUOTATION MARK (curly apostrophe)
         let tokens = analyzer.tokenize("Canada\u{2019}s Tower children\u{2019}s books");
@@ -1034,7 +1210,7 @@ mod tests {
 
     #[test]
     fn test_apostrophe_in_words() {
-        let mut analyzer = TextAnalyzer::new(Box::new(NoStemmer));
+        let mut analyzer = TextAnalyzer::new(Box::new(crate::vocab::stemmer::NoStemmer));
         let tokens = analyzer.tokenize("don't worry O'Brien");
         // Apostrophes within words are kept
         assert!(tokens.contains(&"don't".to_string()));
@@ -1043,7 +1219,7 @@ mod tests {
 
     #[test]
     fn test_periods_in_numbers() {
-        let analyzer = TextAnalyzer::new(Box::new(NoStemmer));
+        let analyzer = TextAnalyzer::new(Box::new(crate::vocab::stemmer::NoStemmer));
         let tokens = analyzer.tokenize("price is 3.14 dollars U.S.A.");
         assert!(tokens.contains(&"3.14".to_string()));
         assert!(tokens.contains(&"u.s.a".to_string()));
@@ -1078,7 +1254,7 @@ mod tests {
 
     #[test]
     fn test_analyze_query_no_growth() {
-        let mut analyzer = TextAnalyzer::new(Box::new(NoStemmer));
+        let mut analyzer = TextAnalyzer::new(Box::new(crate::vocab::stemmer::NoStemmer));
         let _ = analyzer.analyze_doc("hello world");
         let vocab_size_before = analyzer.vocab().len();
 
@@ -1345,5 +1521,73 @@ mod stop_words_family_compat_tests {
         let reloaded: AnalyzerConfig = ciborium::de::from_reader(bytes.as_slice()).unwrap();
 
         assert_eq!(reloaded.stop_words_family.as_deref(), Some("terrier"));
+    }
+
+    fn icu_analyzer() -> TextAnalyzer {
+        let mut analyzer = TextAnalyzer::new(Box::new(crate::vocab::stemmer::NoStemmer));
+        analyzer.set_tokenizer(Tokenizer::Icu).unwrap();
+        analyzer
+    }
+
+    #[test]
+    fn test_icu_segments_unspaced_scripts() {
+        let analyzer = icu_analyzer();
+        assert_eq!(
+            analyzer.tokenize("北京是中国的首都"),
+            ["北京", "是", "中国", "的", "首都"]
+        );
+        assert_eq!(
+            analyzer.tokenize("東京は日本の首都です"),
+            ["東京", "は", "日本", "の", "首都", "です"]
+        );
+        assert_eq!(
+            analyzer.tokenize("ประเทศไทยมีเมืองหลวง"),
+            ["ประเทศไทย", "มี", "เมือง", "หลวง"]
+        );
+    }
+
+    #[test]
+    fn test_icu_matches_standard_on_spaced_scripts() {
+        let icu = icu_analyzer();
+        let standard = TextAnalyzer::new(Box::new(crate::vocab::stemmer::NoStemmer));
+        for text in [
+            "The Quick brown-fox, 42 times!",
+            "मैं स्कूल जा रहा हूँ",
+            "서울은 한국의 수도입니다",
+            "ذهب الأولاد إلى المدارس",
+        ] {
+            assert_eq!(icu.tokenize(text), standard.tokenize(text), "{}", text);
+        }
+        // Mixed scripts
+        assert_eq!(icu.tokenize("Hello 北京 World"), ["hello", "北京", "world"]);
+    }
+
+    #[test]
+    fn test_default_tokenizer_for_language() {
+        assert_eq!(
+            Tokenizer::default_for_language("en"),
+            Tokenizer::LuceneEnglish
+        );
+        assert_eq!(Tokenizer::default_for_language("zh"), Tokenizer::Icu);
+        assert_eq!(Tokenizer::default_for_language("thai"), Tokenizer::Icu);
+        assert_eq!(Tokenizer::default_for_language("hi"), Tokenizer::Standard);
+        assert_eq!("icu".parse::<Tokenizer>().unwrap(), Tokenizer::Icu);
+        assert_eq!(
+            "lucene_english".parse::<Tokenizer>().unwrap(),
+            Tokenizer::LuceneEnglish
+        );
+        assert!("nope".parse::<Tokenizer>().is_err());
+    }
+
+    #[test]
+    fn test_icu_config_roundtrip() {
+        let config = AnalyzerConfig {
+            tokenizer: Tokenizer::Icu,
+            ..AnalyzerConfig::default()
+        };
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&config, &mut bytes).unwrap();
+        let reloaded: AnalyzerConfig = ciborium::de::from_reader(bytes.as_slice()).unwrap();
+        assert_eq!(reloaded.effective_tokenizer(), Tokenizer::Icu);
     }
 }

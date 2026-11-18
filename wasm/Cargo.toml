@@ -3,7 +3,7 @@ name = "impact-index-wasm"
 version = "1.7.1"
 edition = "2021"
 authors = ["Benjamin Piwowarski <benjamin@piwowarski.fr>"]
-license = "GPL-2.0-or-later"
+license = "MIT OR Apache-2.0"
 description = "WASM bindings (wasm-bindgen) for impact-index"
 repository = "https://github.com/xpmir/impact-index"
 

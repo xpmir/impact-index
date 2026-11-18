@@ -1,9 +1,9 @@
 [package]
 name = "impact-index"
-version = "1.7.1"
+version = "1.9.3"
 edition = "2021"
 authors = ["Benjamin Piwowarski <benjamin@piwowarski.fr>"]
-license = "GPL-2.0-or-later"
+license = "MIT OR Apache-2.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [workspace]
@@ -132,9 +132,25 @@ rayon = { version = "1", optional = true }
 bitpacking = "0.9"
 rust-stemmers = "1.2"
 unicode-segmentation = "1.12"
+# Word segmentation; the dictionaries (~3 MB) are not built in but loaded
+# from the official ICU4X data blob, downloaded on demand (src/vocab/icu.rs)
+icu_segmenter = { version = "~2.4", default-features = false, features = ["compiled_data", "serde"] }
+icu_provider = { version = "2", features = ["sync"] }
+icu_provider_blob = { version = "2", features = ["alloc"] }
+sha2 = "0.10"
+# Japanese / Korean morphological analysis (dictionaries loaded at runtime)
+lindera = { version = "6.2", default-features = false }
+# Downloading the Lindera dictionaries (into the OS cache directory)
+ureq = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+dirs = "5"
 protobuf = { version = "^2.27", optional = true }
 # FST for term map (same as BMP uses)
 fst = "0.4.7"
+
+# statfs, to detect network filesystems (src/utils/fs.rs)
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 
 # sucds only builds on 64-bit targets; elsewhere (WASM) compress::elias_fano

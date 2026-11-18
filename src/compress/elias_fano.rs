@@ -48,6 +48,8 @@ fn read_bool(r: &mut impl Read) -> io::Result<bool> {
 
 /// Skips `n` bytes of a reader
 fn skip(r: &mut impl Read, n: u64) -> io::Result<()> {
+    // Into a sink, not a file: no copy_file_range
+    #[allow(clippy::disallowed_methods)]
     let skipped = io::copy(&mut r.take(n), &mut io::sink())?;
     if skipped != n {
         return Err(io::ErrorKind::UnexpectedEof.into());

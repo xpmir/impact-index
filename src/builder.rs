@@ -771,12 +771,10 @@ impl<V: PostingValue> SparseBuilderIndex<V> {
     ) -> std::io::Result<Self> {
         // Auto-detect auxiliary files
         let doc_meta = crate::docmeta::DocMetadata::load_from(files).ok();
-        let analyzer_config = crate::vocab::analyzer::TextAnalyzer::load_config_from(files);
-        let analyzer_config = if analyzer_config.stemmer == "none" && !analyzer_config.stop_words {
-            None // default config = no analyzer was configured
-        } else {
-            Some(analyzer_config)
-        };
+        // No `analyzer.cbor` = no analyzer was configured (an analyzer with
+        // no stemmer nor stop words, e.g. for languages without either, is
+        // still an analyzer)
+        let analyzer_config = crate::vocab::analyzer::TextAnalyzer::try_load_config_from(files);
 
         let positions_buffer = if files.exists("positions.dat") {
             Some(files.buffer("positions.dat", in_memory)?)

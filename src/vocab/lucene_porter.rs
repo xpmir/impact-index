@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Derived from Apache Lucene (Copyright The Apache Software Foundation);
+// see NOTICE.
+
 //! Lucene-compatible Porter stemmer.
 //!
 //! Direct port of `org.apache.lucene.analysis.en.PorterStemmer` from Apache Lucene.
