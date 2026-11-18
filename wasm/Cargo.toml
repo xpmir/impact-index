@@ -1,6 +1,6 @@
 [package]
 name = "impact-index-wasm"
-version = "1.7.1"
+version = "1.9.3"
 edition = "2021"
 authors = ["Benjamin Piwowarski <benjamin@piwowarski.fr>"]
 license = "MIT OR Apache-2.0"

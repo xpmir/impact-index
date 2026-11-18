@@ -129,8 +129,8 @@ Limits
 - Not available in WASM: BM25 / text indexing, positions and structured
   queries, document contents (key-only stores work), BMP and Seismic, and
   builder checkpoints.
-- Licence: MIT OR Apache-2.0, like the rest of the library (the npm
-  package ships ``LICENSE-MIT``, ``LICENSE-APACHE`` and ``NOTICE``). The
+- Licence: MIT OR Apache-2.0, like the rest of the library (``wasm-pack``
+  copies ``LICENSE-MIT`` and ``LICENSE-APACHE`` into the package). The
   Lucene-derived analysis code, Apache-2.0 only, is not part of the WASM
   build.
 

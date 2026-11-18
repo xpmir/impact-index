@@ -1624,7 +1624,7 @@ dependencies = [
 
 [[package]]
 name = "impact-index-wasm"
-version = "1.7.1"
+version = "1.9.3"
 dependencies = [
  "console_error_panic_hook",
  "impact-index",
