@@ -25,8 +25,10 @@ jobs:
       with:
         save-if: ${{ github.ref == 'refs/heads/master' }}
     - run: cargo test --features seismic
-    # The block table decoded by term (on in the WASM build), natively
-    - run: cargo test --features lazy-pages
+    # The block table decoded by term (on in the WASM build), natively; it
+    # only changes indexes read through storage::ReaderFiles, which only
+    # these tests (and the unit tests) do
+    - run: cargo test --features lazy-pages --lib --test storage --test positions_compressed
     # Only the clippy.toml lints: file copies must go through src/utils/fs.rs
     - run: cargo clippy --all-targets --features seismic -- -A clippy::all -D clippy::disallowed_methods
 

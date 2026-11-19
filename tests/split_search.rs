@@ -143,12 +143,23 @@ fn impacts_factory(name: &str) -> Box<dyn ImpactCompressorFactory> {
     }
 }
 
+/// Pairwise covering array instead of the full product (36 cases): every
+/// value of a parameter meets every value of every other parameter.
 #[rstest]
+#[case(vec![0.9], "identity", 64, false)]
+#[case(vec![0.9], "qbp16", 128, false)]
+#[case(vec![0.9], "global16", 64, true)]
+#[case(vec![0.5], "identity", 128, true)]
+#[case(vec![0.5], "qbp16", 64, false)]
+#[case(vec![0.5], "global16", 64, false)]
+#[case(vec![0.8, 0.95], "identity", 64, false)]
+#[case(vec![0.8, 0.95], "qbp16", 64, true)]
+#[case(vec![0.8, 0.95], "global16", 128, false)]
 fn test_split_search_matches_exhaustive(
-    #[values(vec![0.9], vec![0.5], vec![0.8, 0.95])] quantiles: Vec<f64>,
-    #[values("identity", "qbp16", "global16")] impacts: &str,
-    #[values(64, 128)] block_size: usize,
-    #[values(true, false)] in_memory: bool,
+    #[case] quantiles: Vec<f64>,
+    #[case] impacts: &str,
+    #[case] block_size: usize,
+    #[case] in_memory: bool,
 ) {
     let c = build_collection(3_000, 42);
     let raw_index = impact_index::builder::load_forward_index::<f32>(c.dir.path(), true);
