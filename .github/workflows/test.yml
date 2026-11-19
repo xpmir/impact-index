@@ -23,6 +23,9 @@ jobs:
     # from master only, so that pull requests reuse it without churning it
     - uses: Swatinem/rust-cache@v2
       with:
+        # The pinned toolchain (rust-toolchain.toml) is already in the key;
+        # the runner image's own Rust varies between images
+        add-rust-environment-hash-key: false
         save-if: ${{ github.ref == 'refs/heads/master' }}
     - run: cargo test --features seismic
     # The block table decoded by term (on in the WASM build), natively; it
@@ -43,6 +46,9 @@ jobs:
     # from master only, so that pull requests reuse it without churning it
     - uses: Swatinem/rust-cache@v2
       with:
+        # The pinned toolchain (rust-toolchain.toml) is already in the key;
+        # the runner image's own Rust varies between images
+        add-rust-environment-hash-key: false
         # also restored by release-npm.yml
         shared-key: wasm
         save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -76,6 +82,9 @@ jobs:
     # from master only, so that pull requests reuse it without churning it
     - uses: Swatinem/rust-cache@v2
       with:
+        # The pinned toolchain (rust-toolchain.toml) is already in the key;
+        # the runner image's own Rust varies between images
+        add-rust-environment-hash-key: false
         save-if: ${{ github.ref == 'refs/heads/master' }}
     - uses: actions/setup-python@v6
       with:

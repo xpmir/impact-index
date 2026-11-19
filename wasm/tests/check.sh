@@ -9,7 +9,9 @@ cd "$(dirname "$0")/../.."
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-cargo run --quiet --release --example wasm_fixture -- "$tmp/fixture" "${1:-20000}" "${2:-50}"
+# Debug: the fixture takes seconds to generate, while a release build (fat
+# LTO, every native feature) takes minutes to compile
+cargo run --quiet --example wasm_fixture -- "$tmp/fixture" "${1:-20000}" "${2:-50}"
 cargo build --quiet --release -p impact-index-wasm --target wasm32-unknown-unknown
 wasm-bindgen --target nodejs --out-dir "$tmp/pkg" \
     target/wasm32-unknown-unknown/release/impact_index_wasm.wasm

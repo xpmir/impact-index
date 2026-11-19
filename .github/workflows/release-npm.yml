@@ -56,6 +56,9 @@ jobs:
       # Reuses the build cache of the wasm job of test.yml (saved on master)
       - uses: Swatinem/rust-cache@v2
         with:
+          # The pinned toolchain (rust-toolchain.toml) is already in the key;
+          # the runner image's own Rust varies between images
+          add-rust-environment-hash-key: false
           shared-key: wasm
           save-if: false
       # No registry-url: setup-node would then set a placeholder
